@@ -1,3 +1,4 @@
+import inspect
 from pyspark.sql import Row
 from datetime import datetime, UTC
 from typing import Optional, List, Dict
@@ -6,44 +7,59 @@ import logging
 from pyspark.sql import functions as F
 
 from pyspark.sql.dataframe import DataFrame
-from portada_data_layer.delta_data_layer import PathConfigDeltaDataLayer, BaseDeltaDataLayer
+from portada_data_layer.delta_data_layer import PathConfigDeltaDataLayer, BaseDeltaDataLayer, DeltaDataLayer
 from functools import wraps
 
 logger = logging.getLogger("delta_data_layer.data_lake_metadata_manager")
 
-def disable_log_storage(func):
+
+def __set_enable_storage_log(func, is_enable, data_layer_key: str, *args, **kwargs):
+    sig = inspect.signature(func)
+    bound = sig.bind(*args, **kwargs)
+    bound.apply_defaults()
+    if data_layer_key in bound.arguments:
+        data_layer = bound.arguments[data_layer_key]
+    else:
+        raise Exception(f"Parameter {data_layer_key} is needed")
+    previous_log_storage = data_layer.log_storage
+    data_layer.log_storage = is_enable
+    try:
+        resultat = func(data_layer, *args, **kwargs)
+        return resultat
+    finally:
+        # Restore the previous context after executing the method
+        data_layer.log_storage = previous_log_storage
+
+def disable_storage_log(data_layer_key: str):
+    def decorator(func):
+        """
+        decorator to disable storage logging
+        """
+        @wraps(func)
+        def wrapper(data_layer:DeltaDataLayer, *args, **kwargs):
+            return __set_enable_storage_log(func, False, data_layer_key=data_layer_key, *args, **kwargs)
+        return wrapper
+    return decorator
+
+def disable_storage_log_for_data_layer_class(func):
     """
     decorator to disable storage logging
     """
     @wraps(func)
-    def wrapper(self, *args, **kwargs):
-        previous_log_storage=self._log_storage
-        self._log_storage=True
-        try:
-            resultat = func(self, *args, **kwargs)
-            return resultat
-        finally:
-            # Restore the previous context after executing the method
-            self._log_storage = previous_log_storage
+    def wrapper(*args, **kwargs):
+        return __set_enable_storage_log(func, False, data_layer_key="self", *args, **kwargs)
     return wrapper
 
-def enable_log_storage(func):
+def enable_storage_log_for_data_layer_class(func):
     """
     decorator to enable storage logging
     """
     @wraps(func)
-    def wrapper(self, *args, **kwargs):
-        previous_log_storage=self._log_storage
-        self._log_storage=True
-        try:
-            resultat = func(self, *args, **kwargs)
-            return resultat
-        finally:
-            # Restore the previous context after executing the method
-            self._log_storage = previous_log_storage
+    def wrapper(*args, **kwargs):
+        return __set_enable_storage_log(func, True, data_layer_key="self", *args, **kwargs)
     return wrapper
 
-def log_process_context(func):
+def process_log_context_for_data_layer_class(func):
     """Updates the context attribute with the hierarchical name of the process."""
     @wraps(func)
     def wrapper(self, *args, **kwargs):
@@ -61,7 +77,7 @@ def log_process_context(func):
             self.process_context = previous_context
     return wrapper
 
-def log_process(func):
+def process_log_for_data_layer_class(func):
     """
     Decorator that automatically logs storage process execution using DataLakeMetadataManager.log_process.
     """
@@ -306,7 +322,7 @@ class DataLakeMetadataManager(PathConfigDeltaDataLayer):
         Read and unify JSON logs from HDFS, optionally filtering by log_type.
         """
         # if not table_path:
-        #     table_path = self.
+        #     table_path = data_layer.
         path_pattern =self._resolve_path("/metadata/*")
         df = self.spark.read.json(path_pattern)
 

@@ -169,6 +169,10 @@ class DeltaDataLayerBuilder(AbstractDeltaDataLayerBuilder):
         delta_layer = DeltaDataLayer(builder=self)
         return delta_layer
 
+    def built_configuration(self):
+        return ConfigDeltaDataLayer(builder=self)
+
+
 
 # ==============================================================
 # CLASS: PathConfigDeltaDataLayer
@@ -471,7 +475,7 @@ class DeltaDataLayer(BaseDeltaDataLayer):
 
     def __init__(self, builder: AbstractDeltaDataLayerBuilder = None, cfg_json: dict = None):
         super().__init__(builder=builder, cfg_json=cfg_json)
-        self._log_storage=False
+        self.log_storage=False
         self.source_path=None
 
     def write_json(self, *table_path, df: DataFrame | TracedDataFrame, mode: str ="overwrite", process_level_dir: str = None, has_extension=False):
@@ -507,7 +511,7 @@ class DeltaDataLayer(BaseDeltaDataLayer):
         path = self._resolve_path(*table_path, process_level_dir=process_level_dir, has_extension=has_extension)
         logger.info(f"Writing Delta → {path}")
         original_df.coalesce(1).write.mode(mode).json(path)
-        if self._log_storage:
+        if self.log_storage:
             if hasattr(self, "metadata"):
                 metadata = self.metadata
             else:
@@ -555,7 +559,7 @@ class DeltaDataLayer(BaseDeltaDataLayer):
         logger.info(f"Writing Delta → {path}")
         original_df.write.format("delta").mode(mode).save(path)
         version = self.get_delta_table(path).history(1).collect()[0]['version']
-        if self._log_storage:
+        if self.log_storage:
             if hasattr(self, "metadata"):
                 metadata = self.metadata
             else:
@@ -710,7 +714,7 @@ class FileSystemTaskExecutor(BaseDeltaDataLayer):
         """Copy a local file to the specified destination in the Hadoop FS. and return the complete path were it was copied."""
         dest_path = self._resolve_path(*container_dest)
         dest_path = os.path.join(dest_path, file_name_dest)
-        # sc = self.spark.sparkContext
+        # sc = data_layer.spark.sparkContext
         src = self._jvm.Path(src_path)
         jvm_dest_path = self._jvm.Path(dest_path)
         self._fs.copyFromLocalFile(False, True, src, jvm_dest_path)
@@ -724,7 +728,7 @@ class FileSystemTaskExecutor(BaseDeltaDataLayer):
         :param path: path to check as string
         :return: True o False if path exists
         """
-        # sc = self.spark.sparkContext
+        # sc = data_layer.spark.sparkContext
         hadoop_conf = self._sc._jsc.hadoopConfiguration()
         fs = self._jvm.org.apache.hadoop.fs.FileSystem.get(
             self._jvm.org.apache.hadoop.fs.Path(path).toUri(), hadoop_conf

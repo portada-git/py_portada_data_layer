@@ -8,7 +8,7 @@ class TracedDataFrame:
 
     # --- Forwarding per accedir directament a les funcions del DataFrame ---
     def __getattr__(self, name):
-        # Permet cridar self.select(), self.filter(), etc.
+        # Permet cridar data_layer.select(), data_layer.filter(), etc.
         attr = getattr(self.df, name)
         if callable(attr):
             def wrapper(*args, **kwargs):

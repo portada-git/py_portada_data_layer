@@ -1,6 +1,6 @@
 import json
 from pyspark.sql.types import StringType
-from portada_data_layer.data_lake_metadata_manager import DataLakeMetadataManager, enable_log_storage, log_process, log_process_context
+from portada_data_layer.data_lake_metadata_manager import DataLakeMetadataManager, enable_storage_log_for_data_layer_class, process_log_for_data_layer_class, process_log_context_for_data_layer_class
 from portada_data_layer.delta_data_layer import DeltaDataLayerBuilder, DeltaDataLayer, FileSystemTaskExecutor
 from portada_data_layer.traced_data_frame import TracedDataFrame
 from pyspark.sql import Row, functions as F, DataFrame
@@ -150,8 +150,8 @@ class BoatFactDataLayer(DeltaDataLayer):
     # =====================================================
     # Ingestion process of entries
     # =====================================================
-    @log_process_context
-    @enable_log_storage
+    @process_log_context_for_data_layer_class
+    @enable_storage_log_for_data_layer_class
     def ingest(self, *container_path, local_path: str):
         """
         Process a JSON input file:
@@ -178,8 +178,8 @@ class BoatFactDataLayer(DeltaDataLayer):
         self._current_process_level+=1
         logger.info("Ingestion process completed successfully.")
 
-    @log_process_context
-    @log_process
+    @process_log_context_for_data_layer_class
+    @process_log_for_data_layer_class
     def copy_ingested_raw_entries(self, *container_path, local_path: str, return_dest_path=False):
         # Lectura del fitxer JSON original
         try:
@@ -206,8 +206,8 @@ class BoatFactDataLayer(DeltaDataLayer):
             return data, dest_path
         return data
 
-    @log_process_context
-    @log_process
+    @process_log_context_for_data_layer_class
+    @process_log_for_data_layer_class
     def save_raw_entries(self, *container_path, df=None, data: dict | list =None):
         """
         Save an array of ship entries (JSON) adding or updating them in files organized by:  date_path / publication_name / y / m / d / publication_edition
@@ -312,7 +312,7 @@ class BoatFactDataLayer(DeltaDataLayer):
         base_dir = os.path.join(base_path, publication_name or "*", y or "*", m or "*", d or "*", edition or "*")
         path = os.path.join(base_dir, "*.json")
         # try:
-        #     df = self.spark.read.json(path)
+        #     df = data_layer.spark.read.json(path)
         # except Exception as e:
         #     if "[PATH_NOT_FOUND]" in str(e):
         #         df = None
