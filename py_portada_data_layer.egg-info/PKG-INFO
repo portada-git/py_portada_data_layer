@@ -1,0 +1,22 @@
+Metadata-Version: 2.4
+Name: py_portada_data_layer
+Version: 0.0.1
+Summary: Data layer for portada project for ETL process
+Home-page: https://github.com/portada-git/py_portada_data_layer
+Author: PortADa team
+Author-email: jcbportada@gmail.com
+License: MIT
+Requires-Python: >=3.12
+License-File: LICENSE
+Requires-Dist: pyspark==3.5.3
+Requires-Dist: delta-spark==3.2.1
+Requires-Dist: hdfs==2.7.0
+Requires-Dist: py4j
+Dynamic: author
+Dynamic: author-email
+Dynamic: home-page
+Dynamic: license
+Dynamic: license-file
+Dynamic: requires-dist
+Dynamic: requires-python
+Dynamic: summary
