@@ -45,7 +45,7 @@ def __process_log_context(func, data_layer_key: str, *args, **kwargs):
     )
     data_layer.process_context_name = new_context
     try:
-        resultat = func(data_layer, *args, **kwargs)
+        resultat = func(*args, **kwargs)
         return resultat
     finally:
         # Restore the previous context after executing the method
@@ -66,7 +66,7 @@ def __process_log(func, data_layer_key: str, *args, **kwargs):
     estat = "OK"
     try:
         data_layer.clean_log_process_info()
-        resultat = func(data_layer, *args, **kwargs)
+        resultat = func(*args, **kwargs)
         # If the method returns a DataFrame or similar, you may be able to infer num_records:
         if isinstance(resultat, DataFrame):
             num_records = resultat.count()
@@ -131,7 +131,7 @@ def disable_storage_log_for_method(func):
     """
     @wraps(func)
     def wrapper(*args, **kwargs):
-        return __set_enable_storage_log(func, False, "data_layer", *args, **kwargs)
+        return __set_enable_storage_log(func, False, "self", *args, **kwargs)
     return wrapper
 
 
@@ -153,7 +153,7 @@ def enable_storage_log_for_method(func):
     """
     @wraps(func)
     def wrapper(*args, **kwargs):
-        return __set_enable_storage_log(func, True, "data_layer", *args, **kwargs)
+        return __set_enable_storage_log(func, True, "self", *args, **kwargs)
     return wrapper
 
 
@@ -180,7 +180,7 @@ def process_log_context_for_method(func):
     """Updates the context attribute with the hierarchical name of the process."""
     @wraps(func)
     def wrapper(*args, **kwargs):
-        return __process_log_context(func, "data_layer", *args, **kwargs)
+        return __process_log_context(func, "self", *args, **kwargs)
     return wrapper
 
 

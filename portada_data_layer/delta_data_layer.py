@@ -396,22 +396,22 @@ class ConfigDeltaDataLayer(PathConfigDeltaDataLayer):
             table_path = args
         if process_level_dir is None:
             process_level_dir=self._process_level_dirs_[self._current_process_level]
-        table_path = '.'.join(map(str, table_path)).split('.')
-        if has_extension:
-            extension = table_path[-1]
-            del table_path[-1]
+        if len(table_path)==1 and re.match(r"\w+://.*", table_path[0]):
+            ret = table_path[0]
         else:
-            extension = ""
-        table_path = '/'.join(map(str, table_path))
-        if re.match(r"\w+://.*", table_path):
-            ret = table_path
-        else:
+            table_path = '.'.join(map(str, table_path)).split('.')
+            if has_extension:
+                extension = table_path[-1]
+                del table_path[-1]
+            else:
+                extension = ""
+            table_path = '/'.join(map(str, table_path))
             if process_level_dir:
                 ret = f"{self.protocol}{self.base_path}/{self._project_data_name}/{process_level_dir}/{table_path}"
             else:
                 ret = f"{self.protocol}{self.base_path}/{self._project_data_name}/{table_path}"
-        if extension:
-            ret = f"{ret}.{extension}"
+            if extension:
+                ret = f"{ret}.{extension}"
         return ret
 
     def register_udfs(self, name, func, return_type):
@@ -509,12 +509,15 @@ class BaseDeltaDataLayer(ConfigDeltaDataLayer):
         fs_ex = FileSystemTaskExecutor(self.get_configuration())
         return fs_ex.subdirs_list(base_path=path)
 
-    def path_exists(self, path: str):
+    def path_exists(self, *container_path: str, process_level_dir=None, has_extension=False):
         """
         Checks if a file or directory exists for any protocol supported by Hadoop.
-        :param path: path to check as string
+        :param container_path: path to check as string
+        :param has_extension:
+        :param process_level_dir:
         :return: True o False if path exists
         """
+        path = self._resolve_path(*container_path, process_level_dir=process_level_dir, has_extension=has_extension)
         fs_ex = FileSystemTaskExecutor(self.get_configuration())
         return fs_ex.path_exists(path)
 
