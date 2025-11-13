@@ -266,8 +266,8 @@ class BoatFactDataLayer(DeltaDataLayer):
         #Get value from boat fact data model format
         uuid_udf = F.udf(lambda: str(uuid.uuid4()))
         df = df.withColumn("entry_id", uuid_udf())
-        df = df.withColumn("publication_name_value", self.get_value_of_udf(F.col("publication_name")))
-        df = df.withColumn("publication_edition_value", self.get_value_of_udf(F.col("publication_edition")))
+        df = df.withColumn("publication_name_value", F.lower(self.get_value_of_udf(F.col("publication_name"))))
+        df = df.withColumn("publication_edition_value", F.lower(self.get_value_of_udf(F.col("publication_edition"))))
         df = df.withColumn("parsed_text_value", self.get_value_of_udf(F.col("parsed_text")))
         df = df.withColumn("publication_date_millis_value", self.get_value_of_udf(F.col("publication_date")))
         df = df.withColumn("publication_date_value", (F.col("publication_date_millis_value") / 1000).cast("timestamp"))
@@ -339,7 +339,12 @@ class BoatFactDataLayer(DeltaDataLayer):
             m = f"{m:02d}"
         if isinstance(d, int):
             d = f"{d:02d}"
-        base_dir = os.path.join(base_path, publication_name or "*", y or "*", m or "*", d or "*", edition or "*")
+        base_dir = os.path.join(base_path,
+                                publication_name.lower() if publication_name else "*",
+                                y or "*",
+                                m or "*",
+                                d or "*",
+                                edition.lower() if edition else "*")
         path = os.path.join(base_dir, "*.json")
         # try:
         #     df = data_layer.spark.read.json(path)
