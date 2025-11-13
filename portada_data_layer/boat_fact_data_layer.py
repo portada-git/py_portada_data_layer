@@ -177,8 +177,6 @@ class BoatFactDataLayer(DeltaDataLayer):
         except Exception as e:
             logger.error(f"Error during classification/deduplication: {e}")
             raise
-
-        self._current_process_level+=1
         logger.info("Ingestion process completed successfully.")
 
     @process_log_context_for_method
@@ -209,7 +207,8 @@ class BoatFactDataLayer(DeltaDataLayer):
         :param container_path: to build the destination_path
         :param local_path: where the local file is
         :param return_dest_path: This parameter is a flag to set if the built destination_path is returned
-        :return: None or destination_path
+        :return: the copied data if return_dest_path is false. If return_dest_path is true, a tuple with the copied data
+        and the destination_path value is returned
         """
         # Lectura del fitxer JSON original
         try:
@@ -226,8 +225,9 @@ class BoatFactDataLayer(DeltaDataLayer):
             dest_path = fs_exec.copy_from_local(*container_path,
                                                 file_name_dest=fs_exec.date_random_file_name_generator("json"),
                                                 src_path=local_path, remove_local=True)
+            dp = self._resolve_relative_path(dest_path)
             metadata = DataLakeMetadataManager(self.get_configuration())
-            metadata.log_storage(data_layer=self, source_path=local_path, target_path=dest_path)
+            metadata.log_storage(data_layer=self, source_path=local_path, target_path=dp)
             logger.info(f"File copied to Hadoop file system in container: {container_path} ({local_path} -> {dest_path})")
         except Exception as e:
             logger.error(f"Error copying original file: {e}")
@@ -249,7 +249,7 @@ class BoatFactDataLayer(DeltaDataLayer):
         if df is None:
             if isinstance(data, dict):
                 data_json_array = data["data_json_array"]
-                source_path = data["source_path"]
+                source_path = self._resolve_relative_path(data["source_path"])
             else:
                 data_json_array = data
                 source_path = "UNKNOWN"

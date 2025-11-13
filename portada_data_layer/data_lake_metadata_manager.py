@@ -5,8 +5,9 @@ from typing import Optional, List, Dict
 import uuid
 import logging
 from pyspark.sql import functions as F
-
 from pyspark.sql.dataframe import DataFrame
+from pyspark.sql.types import StructField, StringType, StructType
+
 from portada_data_layer.delta_data_layer import PathConfigDeltaDataLayer, BaseDeltaDataLayer, DeltaDataLayer
 from functools import wraps
 
@@ -65,7 +66,7 @@ def __process_log(func, data_layer_key: str, *args, **kwargs):
     num_records = -1
     estat = "OK"
     try:
-        data_layer.clean_log_process_info()
+        data_layer._clean_log_process_info()
         resultat = func(*args, **kwargs)
         # If the method returns a DataFrame or similar, you may be able to infer num_records:
         if isinstance(resultat, DataFrame):
@@ -316,8 +317,8 @@ class DataLakeMetadataManager(PathConfigDeltaDataLayer):
             edition=edition,
             duplicates=num_dups,
             duplicate_ids=ids,
-            duplicates_path=dup_base,
-            source_path=from_table_full_path,
+            duplicates_path=self._resolve_relative_path(dup_base),
+            source_path=self._resolve_relative_path(from_table_full_path),
         )
 
         self._write_log([entry], "duplicates_log")
@@ -430,24 +431,24 @@ class DataLakeMetadataManager(PathConfigDeltaDataLayer):
         # ------------------------------------------------------------------
         # Cas especial: duplicates_log + include_duplicates = True
         # ------------------------------------------------------------------
-        duplicates_map = {}
+        duplicates_df = self.spark.createDataFrame([], StructType([StructField("log_id", StringType(), False)]))
 
         for row in df_log.collect():
             log_id="unknown"
             try:
                 log_id = row["log_id"]
-                dup_path = row.get("duplicates_path")
+                dup_path = row["duplicates_path"]
 
                 if dup_path and dup_path.strip():
-                    dup_df = self.spark.read.format("delta").load(dup_path)
-                    duplicates_map[log_id] = dup_df
+                    dup_path = self._resolve_path(dup_path, contains_project_name=True)
+                    dup_df = self.spark.read.json(dup_path)
+                    # dup_df = self.spark.read.format("delta").load(dup_path)
+                    dup_df = dup_df.withColumn("log_id", F.lit(log_id))
+                    duplicates_df = duplicates_df.unionByName(dup_df, allowMissingColumns=True)
             except Exception as e:
                 logger.error(f"Error loading duplicates for log_id={log_id}: {e}")
 
-        return {
-            "log": df_log,
-            "duplicates": duplicates_map
-        }
+        return df_log, duplicates_df
 
     # ----------------------------------------------------------------------
     # 🔹 LLEGIR METADADES DE DELTA LAKE

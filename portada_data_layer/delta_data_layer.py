@@ -131,7 +131,7 @@ class AbstractDeltaDataLayerBuilder:
         return self
 
     def base_path(self, base_path: str):
-        """Defines the base path where the Delta data is located."""
+        """Defines the base *container_path where the Delta data is located."""
         self._base_path = base_path.strip().rstrip("/")
         return self
 
@@ -180,10 +180,10 @@ class DeltaDataLayerBuilder(AbstractDeltaDataLayerBuilder):
 # ==============================================================
 class PathConfigDeltaDataLayer:
     """
-    Configuration class which dynamically determine the path where the data will be stored based on the configuration:
+    Configuration class which dynamically determine the *container_path where the data will be stored based on the configuration:
         - The protocol indicates the file system used, as well as the host and listening port when necessary. For
         example, hdfs://protadaproject.eu:9000 or simply file://
-        - The base_path is the root path where the rest of the directories and files of the Data Lake will be located.
+        - The base_path is the root *container_path where the rest of the directories and files of the Data Lake will be located.
         - The project name encapsulate all the project data as a directory. For example, "portadaproject", thus allowing
         the same data lake to be shared among different projects.
     """
@@ -246,24 +246,53 @@ class PathConfigDeltaDataLayer:
     def project_name(self, value: str):
         self._project_data_name = value
 
-    def _resolve_path(self, *args, has_extension=False) -> str:
+    def _resolve_relative_path(self, *args, has_extension=False, contains_project_name=False) -> str:
         if len(args)==1 and (type(args[0]) == tuple or type(args[0]) == list):
             table_path = args[0]
         else:
             table_path = args
-        table_path = '.'.join(map(str, table_path)).split('.')
-        if has_extension:
-            extension = table_path[-1]
-            del table_path[-1]
+        if len(table_path) == 1 and re.match(r"\w+://.*", table_path[0]):
+            p = re.compile(f"{self.protocol}{self.base_path}/(.*)")
+            ret = re.sub(p,"\\g<1>", table_path[0], 0)
         else:
-            extension = ""
-        table_path = '/'.join(map(str, table_path))
-        if re.match(r"\w+://.*", table_path):
-            ret = table_path
+            table_path = '.'.join(map(str, table_path)).split('.')
+            if has_extension:
+                extension = table_path[-1]
+                del table_path[-1]
+            else:
+                extension = ""
+            table_path = '/'.join(map(str, table_path))
+            if contains_project_name:
+                project_name = ""
+            else:
+                project_name = f"{self._project_data_name}/"
+            ret = f"{project_name}{table_path}"
+            if extension:
+                ret = f"{ret}.{extension}"
+        return ret
+
+    def _resolve_path(self, *args, has_extension=False, contains_project_name=False) -> str:
+        if len(args)==1 and (type(args[0]) == tuple or type(args[0]) == list):
+            table_path = args[0]
         else:
-            ret = f"{self.protocol}{self.base_path}/{self._project_data_name}/{table_path}"
-        if extension:
-            ret = f"{ret}.{extension}"
+            table_path = args
+        if len(table_path) == 1 and re.match(r"\w+://.*", table_path[0]):
+            ret = table_path[0]
+        else:
+            table_path = '.'.join(map(str, table_path)).split('.')
+            if has_extension:
+                extension = table_path[-1]
+                del table_path[-1]
+            else:
+                extension = ""
+            table_path = '/'.join(map(str, table_path))
+            if contains_project_name:
+                project_name = ""
+            else:
+                project_name = f"{self._project_data_name}/"
+            ret = f"{self.protocol}{self.base_path}/{project_name}{table_path}"
+            if extension:
+                ret = f"{ret}.{extension}"
         return ret
 
     def get_configuration(self):
@@ -288,10 +317,10 @@ class PathConfigDeltaDataLayer:
 # ==============================================================
 class ConfigDeltaDataLayer(PathConfigDeltaDataLayer):
     """
-        Configuration class which dynamically determine the path where the data will be stored based on the configuration:
+        Configuration class which dynamically determine the *container_path where the data will be stored based on the configuration:
             - The protocol indicates the file system used, as well as the host and listening port when necessary. For
             example, hdfs://protadaproject.eu:9000 or simply file://
-            - The base_path is the root path where the rest of the directories and files of the Data Lake will be located.
+            - The base_path is the root *container_path where the rest of the directories and files of the Data Lake will be located.
             - The project name encapsulate all the project data as a directory. For example, "portadaproject", thus allowing
             the same data lake to be shared among different projects.
             - The stage or level of the processed data. This allows for the differentiation of all data at the same
@@ -389,13 +418,46 @@ class ConfigDeltaDataLayer(PathConfigDeltaDataLayer):
         table_path = '.'.join(map(str, table_path))
         return table_path
 
-    def _resolve_path(self, *args, process_level_dir=None, has_extension=False) -> str:
+    def _resolve_relative_path(self, *args, process_level_dir=None, has_extension=False, contains_project_name=False, contains_process_level=False) -> str:
+        if len(args)==1 and (type(args[0]) == tuple or type(args[0]) == list):
+            table_path = args[0]
+        else:
+            table_path = args
+        if process_level_dir is None:
+            process_level_dir = self._process_level_dirs_[self._current_process_level]
+        else:
+            process_level_dir = f"{process_level_dir.rstrip("/")}/"
+        if len(table_path) == 1 and re.match(r"\w+://.*", table_path[0]):
+            p = re.compile(f"{self.protocol}{self.base_path}/(.*)")
+            ret = re.sub(p,"\\g<1>", table_path[0], 0)
+        else:
+            table_path = '.'.join(map(str, table_path)).split('.')
+            if has_extension:
+                extension = table_path[-1]
+                del table_path[-1]
+            else:
+                extension = ""
+            table_path = '/'.join(map(str, table_path))
+            if contains_project_name:
+                project_name = ""
+            else:
+                project_name = f"{self._project_data_name}/"
+            if contains_process_level:
+                process_level_dir = ""
+            ret = f"{project_name}{process_level_dir}{table_path}"
+            if extension:
+                ret = f"{ret}.{extension}"
+        return ret
+
+    def _resolve_path(self, *args, process_level_dir=None, has_extension=False, contains_project_name=False, contains_process_level=False) -> str:
         if len(args)==1 and (type(args[0]) == tuple or type(args[0]) == list):
             table_path = args[0]
         else:
             table_path = args
         if process_level_dir is None:
             process_level_dir=self._process_level_dirs_[self._current_process_level]
+        else:
+            process_level_dir = f"{process_level_dir.rstrip("/")}/"
         if len(table_path)==1 and re.match(r"\w+://.*", table_path[0]):
             ret = table_path[0]
         else:
@@ -406,10 +468,13 @@ class ConfigDeltaDataLayer(PathConfigDeltaDataLayer):
             else:
                 extension = ""
             table_path = '/'.join(map(str, table_path))
-            if process_level_dir:
-                ret = f"{self.protocol}{self.base_path}/{self._project_data_name}/{process_level_dir}/{table_path}"
+            if contains_project_name:
+                project_name = ""
             else:
-                ret = f"{self.protocol}{self.base_path}/{self._project_data_name}/{table_path}"
+                project_name = f"{self._project_data_name}/"
+            if contains_process_level:
+                process_level_dir = ""
+            ret = f"{self.protocol}{self.base_path}/{project_name}{process_level_dir}{table_path}"
             if extension:
                 ret = f"{ret}.{extension}"
         return ret
@@ -499,63 +564,73 @@ class BaseDeltaDataLayer(ConfigDeltaDataLayer):
     def log_process_info(self, value):
         self._a_log_process_info.append(value)
 
-    def clean_log_process_info(self):
+    def _clean_log_process_info(self):
         del self._a_log_process_info[-1]
         if len(self._a_log_process_info)==0:
             self._a_log_process_info = [{}]
 
-    def subdirs_list(self, path):
-        """Returns subdirectories within an HDFS path (without using os.listdir)."""
+    def subdirs_list(self, *container_path, process_level_dir=None):
+        """Returns subdirectories within an HDFS *container_path (without using os.listdir)."""
+        path = self._resolve_path(*container_path, process_level_dir=process_level_dir)
         fs_ex = FileSystemTaskExecutor(self.get_configuration())
         return fs_ex.subdirs_list(base_path=path)
 
-    def path_exists(self, *container_path: str, process_level_dir=None, has_extension=False):
+    def path_exists(self, *container_path, process_level_dir=None, has_extension=False):
         """
         Checks if a file or directory exists for any protocol supported by Hadoop.
-        :param container_path: path to check as string
-        :param has_extension:
-        :param process_level_dir:
-        :return: True o False if path exists
+        :param container_path: container_path to check as string or list of strings
+        :param has_extension: This parameter, in case the container_path is not absolute, allows you to indicate that it contains
+         a file with an extension so that the absolute container_path can be calculated correctly.
+        :param process_level_dir: Allows you to specify a directory other than the one corresponding to the level at
+        which the data process is located at the time of execution if container_path is not an absolute *container_path.
+        :return: True o False if *container_path exists
         """
         path = self._resolve_path(*container_path, process_level_dir=process_level_dir, has_extension=has_extension)
         fs_ex = FileSystemTaskExecutor(self.get_configuration())
         return fs_ex.path_exists(path)
 
-    def is_delta_table_type(self, path: str):
+    def is_delta_table_type(self,  *container_path, process_level_dir=None):
         """
         Checks if a file or directory exists for any protocol supported by Hadoop.
-        :param path: path to check as string
-        :return: True o False if path exists
+        :param container_path: *container_path to check as string
+        :param process_level_dir: Allows you to specify a directory other than the one corresponding to the level at
+        which the data process is located at the time of execution if container_path is not an absolute *container_path.
+        :return: True o False if *container_path exists
         """
+        path = self._resolve_path(*container_path, process_level_dir=process_level_dir)
         fs_ex = FileSystemTaskExecutor(self.get_configuration())
         return fs_ex.is_delta_table_type(path)
 
-    def is_json_type(self, path: str):
+    def is_json_type(self, *container_path, process_level_dir=None):
         """
         Checks if a file exists for any protocol supported by Hadoop and is a json type saved by spark.
-        :param path: path to check as string
-        :return: True o False if path exists
+        :param container_path: container_path to check
+        :return: True o False if container_path exists and is a container for a json file
         """
         fs_ex = FileSystemTaskExecutor(self.get_configuration())
-        return fs_ex.is_json_type(path)
+        return fs_ex.is_json_type(*container_path)
 
-    def delta_file_exist(self, *f_path):
+    def delta_file_exist(self, *container_path, process_level_dir=None):
         """
-        Checks if the param f_path point to an existing delta storage.
-        :param f_path: path to check as string for any protocol supported by Hadoop
-        :return: True o False if path exists and pointed to a delta storage
+        Checks if the param container_path point to an existing delta storage.
+        :param container_path: *container_path to check as string for any protocol supported by Hadoop
+        :param process_level_dir: Allows you to specify a directory other than the one corresponding to the level at
+        which the data process is located at the time of execution if container_path is not an absolute *container_path.
+        :return: True o False if *container_path exists and pointed to a delta storage
         """
-        path = self._resolve_path(*f_path)
+        path = self._resolve_path(*container_path, process_level_dir=process_level_dir)
         fs_ex = FileSystemTaskExecutor(self.get_configuration())
-        return fs_ex.path_exists(path) and fs_ex.is_delta_table_type(path)
+        return fs_ex.is_delta_table_type(path)
 
-    def json_file_exist(self, *f_path):
+    def json_file_exist(self, *container_path, process_level_dir=None):
         """
-       Checks if the param f_path point to an existing json storage.
-       :param f_path: path to check as string for any protocol supported by Hadoop
-       :return: True o False if path exists and pointed to a json storage
-       """
-        path = self._resolve_path(*f_path)
+        Checks if the param container_path point to an existing json storage.
+        :param container_path: *container_path to check as string for any protocol supported by Hadoop
+        :param process_level_dir: Allows you to specify a directory other than the one corresponding to the level at
+        which the data process is located at the time of execution if container_path is not an absolute *container_path.
+        :return: True o False if *container_path exists and pointed to a json storage
+        """
+        path = self._resolve_path(*container_path, process_level_dir=process_level_dir)
         fs_ex = FileSystemTaskExecutor(self.get_configuration())
         return fs_ex.path_exists(path) and fs_ex.is_json_type(path)
 
@@ -578,7 +653,7 @@ class DeltaDataLayer(BaseDeltaDataLayer):
         """
         Write the dataframe df to json file addressed by table_path.
         table_path can be any of the following forms:
-            1. tuple or list. Examples: write_delta(("portada", "ships"), df) or write_delta(["portada", "ships"], df). In these cases, the table "ships" will be saved in <delta_data_base_path>/portada. The table path will be <delta_data_base_path>/portada/ships
+            1. tuple or list. Examples: write_delta(("portada", "ships"), df) or write_delta(["portada", "ships"], df). In these cases, the table "ships" will be saved in <delta_data_base_path>/portada. The table *container_path will be <delta_data_base_path>/portada/ships
             2. Only the table name or a sequence of strings. Examples:
                  - write_delta("ships", df). This case will be resolved as <delta_data_base_path>/ships
                  - write_delta("portada","ships", df) will be resolved as <delta_data_base_path>/portada/ships
@@ -605,6 +680,7 @@ class DeltaDataLayer(BaseDeltaDataLayer):
             original_df = df
 
         path = self._resolve_path(*table_path, process_level_dir=process_level_dir, has_extension=has_extension)
+        name = self._resolve_relative_path(path)
         logger.info(f"Writing Delta → {path}")
         original_df.coalesce(1).write.mode(mode).json(path)
         if self.log_storage:
@@ -618,16 +694,16 @@ class DeltaDataLayer(BaseDeltaDataLayer):
                 num_records=original_df.count(),
                 source_path = source_path,
                 source_version= source_version,
-                target_path=path,
+                target_path=name,
                 target_version=-1,
             )
-        return TracedDataFrame(original_df, path, -1)
+        return TracedDataFrame(original_df, name, -1)
 
     def write_delta(self, *table_path, df: DataFrame | TracedDataFrame, mode: str = "overwrite"):
         """
         Write the dataframe df to delta table addressed by table_path.
         table_path can be any of the following forms:
-            1. tuple or list. Examples: write_delta(("portada", "ships"), df) or write_delta(["portada", "ships"], df). In these cases, the table "ships" will be saved in <delta_data_base_path>/portada. The table path will be <delta_data_base_path>/portada/ships
+            1. tuple or list. Examples: write_delta(("portada", "ships"), df) or write_delta(["portada", "ships"], df). In these cases, the table "ships" will be saved in <delta_data_base_path>/portada. The table *container_path will be <delta_data_base_path>/portada/ships
             2. Only the table name or a sequence of strings. Examples:
                  - write_delta("ships", df). This case will be resolved as <delta_data_base_path>/ships
                  - write_delta("portada","ships", df) will be resolved as <delta_data_base_path>/portada/ships
@@ -652,9 +728,10 @@ class DeltaDataLayer(BaseDeltaDataLayer):
             original_df = df
 
         path = self._resolve_path(*table_path)
+        name = self._resolve_relative_path(path)
         logger.info(f"Writing Delta → {path}")
         original_df.write.format("delta").mode(mode).save(path)
-        version = self.get_delta_table(path).history(1).collect()[0]['version']
+        version = self.get_delta_metatable(path).history(1).collect()[0]['version']
         if self.log_storage:
             if hasattr(self, "metadata"):
                 metadata = self.metadata
@@ -666,17 +743,17 @@ class DeltaDataLayer(BaseDeltaDataLayer):
                 num_records=original_df.count(),
                 source_path = source_path,
                 source_version= source_version,
-                target_path=path,
+                target_path=name,
                 target_version=version,
             )
-        return TracedDataFrame(original_df, path, version)
+        return TracedDataFrame(original_df, name, version)
 
 
     def read_json(self, *table_path, process_level_dir=None, has_extension=False) -> TracedDataFrame:
         """
        Read a delta table as a dataframe which is returned.
-       table_path is the path of the table to read and can be any of the following forms:
-           1. dict or list. Examples: read_delta("portada", "ships") or read_delta(["portada", "ships"]). The table path will be resolved as <delta_data_base_path>/portada/ships
+       table_path is the *container_path of the table to read and can be any of the following forms:
+           1. dict or list. Examples: read_delta("portada", "ships") or read_delta(["portada", "ships"]). The table *container_path will be resolved as <delta_data_base_path>/portada/ships
            2. Only the table name or a sequence of strings. Examples:
                - read_delta("ships"). This case will be resolved as <delta_data_base_path>/ships
                - read_delta("portada", "ships") will be resolved as <delta_data_base_path>/portada/ships
@@ -689,6 +766,7 @@ class DeltaDataLayer(BaseDeltaDataLayer):
        :return: DataFrame type with the content of delta table
        """
         path = self._resolve_path(*table_path, process_level_dir=process_level_dir, has_extension=has_extension)
+        name = self._resolve_relative_path(path)
         logger.info(f"Reading Json ← {path}")
         try:
             df = self.spark.read.json(path)
@@ -697,40 +775,42 @@ class DeltaDataLayer(BaseDeltaDataLayer):
                 df = None
             else:
                 raise e
-        return None if df is None else TracedDataFrame(df, path, -1)
+        return None if df is None else TracedDataFrame(df, name, -1)
 
-    def read_delta(self, *table_path) -> TracedDataFrame:
+    def read_delta(self, *table_path, process_level_dir=None) -> TracedDataFrame:
         """
        Read a delta table as a dataframe which is returned.
-       table_path is the path of the table to read and can be any of the following forms:
-           1. dict or list. Examples: read_delta("portada", "ships") or read_delta(["portada", "ships"]). The table path will be resolved as <delta_data_base_path>/portada/ships
+       table_path is the *container_path of the table to read and can be any of the following forms:
+           1. dict or list. Examples: read_delta("portada", "ships") or read_delta(["portada", "ships"]). The table *container_path will be resolved as <delta_data_base_path>/portada/ships
            2. Only the table name or a sequence of strings. Examples:
                - read_delta("ships"). This case will be resolved as <delta_data_base_path>/ships
                - read_delta("portada", "ships") will be resolved as <delta_data_base_path>/portada/ships
            3. String, sequence of strings, dict or list with items including dots as separator. Examples:
                - read_delta("portada.masters") will be resolved as <delta_data_base_path>/portada/masters
                - read_delta(("bronze", "portada.masters")) will be resolved as <delta_data_base_path>/bronze/portada/masters
+        :param process_level_dir:
        :param table_path:
-       :return: DataFrame type with the content of delta table
+       :return: TracedDataFrame type with the content of delta table
        """
-        path = self._resolve_path(*table_path)
+        path = self._resolve_path(*table_path, process_level_dir=process_level_dir)
+        name = self._resolve_relative_path(path)
         logger.info(f"Reading Delta ← {path}")
         try:
             df = self.spark.read.format("delta").load(path)
-            version = self.get_delta_table(path).history(1).collect()[0]['version']
+            version = self.get_delta_metatable(path).history(1).collect()[0]['version']
         except Exception as e:
             if "[PATH_NOT_FOUND]" in str(e):
                 df = None
                 version = -1
             else:
                 raise e
-        return None if df is None else TracedDataFrame(df, path, version)
+        return None if df is None else TracedDataFrame(df, name, version)
 
-    def get_delta_table(self, *table_path) -> DeltaTable:
+    def get_delta_metatable(self, *table_path) -> DeltaTable:
         """
        Load and return a delta table.
-       table_path is the path of the table to read and can be any of the following forms:
-           1. dict or list. Examples: read_delta("portada", "ships") or read_delta(["portada", "ships"]). The table path will be resolved as <delta_data_base_path>/portada/ships
+       table_path is the *container_path of the table to read and can be any of the following forms:
+           1. dict or list. Examples: read_delta("portada", "ships") or read_delta(["portada", "ships"]). The table *container_path will be resolved as <delta_data_base_path>/portada/ships
            2. Only the table name or a sequence of strings. Examples:
                - read_delta("ships"). This case will be resolved as <delta_data_base_path>/ships
                - read_delta("portada", "ships") will be resolved as <delta_data_base_path>/portada/ships
@@ -744,15 +824,16 @@ class DeltaDataLayer(BaseDeltaDataLayer):
         logger.info(f"Loading DeltaTable ← {path}")
         return DeltaTable.forPath(self.spark, path)
 
-    def sql(self, query: str) -> DataFrame:
+    def sql(self, query: str) -> TracedDataFrame:
         """
         Returns a :class:`DataFrame` representing the result of the given query in SQL language.
         """
         logger.info(f"Executing SQL: {query}")
-        return self.spark.sql(query)
+        df = self.spark.sql(query)
+        return df if isinstance(df, TracedDataFrame) else TracedDataFrame(df, source_name=query)
 
     @staticmethod
-    def register_temp_table(df: DataFrame | TracedDataFrame, name: str):
+    def register_temp_table(df: DataFrame | TracedDataFrame, name: str= None):
         """
         Creates or replaces a local temporary view with the df `DataFrame`.
                 The lifetime of this temporary table is tied to the :class:`SparkSession`
@@ -760,11 +841,14 @@ class DeltaDataLayer(BaseDeltaDataLayer):
         :param df: DataFrame where create or replace the temporal view
         :param name: Name of the view
         """
-        # if isinstance(df, TracedDataFrame):
-        #     original_df = df.toSparkDataFrame()
-        # else:
-        #     original_df = df
-        # original_df.createOrReplaceTempView(name)
+        if not name:
+            if isinstance(df, TracedDataFrame):
+                if df.source_version==-1:
+                    name = f"{df.source_name}"
+                else:
+                    name = f"{df.source_name}_{df.source_version}"
+            else:
+                raise Exception("For spark Dataframes, the name parameter is absolutely needed")
         df.createOrReplaceTempView(name)
         logger.info(f"Temporary view named '{name}' was registered.")
 
@@ -812,7 +896,7 @@ class FileSystemTaskExecutor(BaseDeltaDataLayer):
         return f"{datetime.now().strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex}{extension}"
 
     def copy_from_local(self, *container_dest, file_name_dest: str, src_path: str, remove_local=False):
-        """Copy a local file to the specified destination in the Hadoop FS. and return the complete path were it was copied."""
+        """Copy a local file to the specified destination in the Hadoop FS. and return the complete *container_path were it was copied."""
         dest_path = self._resolve_path(*container_dest)
         dest_path = os.path.join(dest_path, file_name_dest)
         # sc = data_layer.spark.sparkContext
@@ -826,8 +910,8 @@ class FileSystemTaskExecutor(BaseDeltaDataLayer):
     def path_exists(self, path: str):
         """
         Checks if a file or directory exists for any protocol supported by Hadoop.
-        :param path: path to check as string
-        :return: True o False if path exists
+        :param *container_path: *container_path to check as string
+        :return: True o False if *container_path exists
         """
         # sc = data_layer.spark.sparkContext
         hadoop_conf = self._sc._jsc.hadoopConfiguration()
@@ -839,22 +923,22 @@ class FileSystemTaskExecutor(BaseDeltaDataLayer):
     def is_delta_table_type(self, path:str):
         """
         Checks if a file or directory exists for any protocol supported by Hadoop.
-        :param path: path to check as string
-        :return: True o False if path exists
+        :param *container_path: *container_path to check as string
+        :return: True o False if *container_path exists
         """
         return self.path_exists(f"{path}/_delta_log")
 
     def is_json_type(self, path:str):
         """
         Checks if a file exists for any protocol supported by Hadoop and is a json type saved by spark.
-        :param path: path to check as string
-        :return: True o False if path exists
+        :param *container_path: *container_path to check as string
+        :return: True o False if *container_path exists
         """
         return self.path_exists(f"{path}/_SUCCESS")
 
     def subdirs_list(self, base_path: str):
         """
-        Returns subdirectories within an HDFS path (without using os.listdir).
+        Returns subdirectories within an HDFS *container_path (without using os.listdir).
         """
         fs = self._jvm.org.apache.hadoop.fs.FileSystem.get(
             self._jsc.hadoopConfiguration()
