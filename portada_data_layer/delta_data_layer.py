@@ -1,5 +1,6 @@
 from delta import configure_spark_with_delta_pip
 from pyspark.sql import SparkSession, DataFrame
+from pyspark.sql import functions as F
 from delta.tables import DeltaTable
 from py4j.java_gateway import java_import
 from datetime import datetime
@@ -178,6 +179,14 @@ class DeltaDataLayerBuilder(AbstractDeltaDataLayerBuilder):
 # CLASS: PathConfigDeltaDataLayer
 # ==============================================================
 class PathConfigDeltaDataLayer:
+    """
+    Configuration class which dynamically determine the path where the data will be stored based on the configuration:
+        - The protocol indicates the file system used, as well as the host and listening port when necessary. For
+        example, hdfs://protadaproject.eu:9000 or simply file://
+        - The base_path is the root path where the rest of the directories and files of the Data Lake will be located.
+        - The project name encapsulate all the project data as a directory. For example, "portadaproject", thus allowing
+        the same data lake to be shared among different projects.
+    """
 
     def __init__(self, cfg_json: dict = None):
         if cfg_json is not None:
@@ -207,6 +216,7 @@ class PathConfigDeltaDataLayer:
 
     @property
     def spark_builder(self):
+        """ Builder to build a DeltaDataLayer object"""
         return self._spark_builder
 
     @spark_builder.setter
@@ -257,6 +267,11 @@ class PathConfigDeltaDataLayer:
         return ret
 
     def get_configuration(self):
+        """
+        Get a json object with the attributes of this object. You can use this json to build other object sharing the
+        same values
+        :return: configuration as json format
+        """
         return {
             "_spark_builder": self._spark_builder,
             "_base_path": self._base_path,
@@ -272,7 +287,18 @@ class PathConfigDeltaDataLayer:
 # CLASS: ConfigDeltaDataLayer
 # ==============================================================
 class ConfigDeltaDataLayer(PathConfigDeltaDataLayer):
-
+    """
+        Configuration class which dynamically determine the path where the data will be stored based on the configuration:
+            - The protocol indicates the file system used, as well as the host and listening port when necessary. For
+            example, hdfs://protadaproject.eu:9000 or simply file://
+            - The base_path is the root path where the rest of the directories and files of the Data Lake will be located.
+            - The project name encapsulate all the project data as a directory. For example, "portadaproject", thus allowing
+            the same data lake to be shared among different projects.
+            - The stage or level of the processed data. This allows for the differentiation of all data at the same
+            level according to the established procedures in ETL processes. Generally, the names used are 'bronze' for
+            raw data, 'silver' for the transition from raw data to clean data or data prepared for processing, and 'gold'
+            for the transition from clean data to cured data ready for use.
+        """
     def __init__(self, builder: AbstractDeltaDataLayerBuilder = None, cfg_json: dict = None):
         self._process_context=""
         self._process_level_dirs_ = [AbstractDeltaDataLayerBuilder.DEFAULT_RAW_SUBDIR,
@@ -302,30 +328,54 @@ class ConfigDeltaDataLayer(PathConfigDeltaDataLayer):
 
     @property
     def current_process_level(self):
+        """
+        Level or stage to process the data in this layer. The property is a number which ranges between 0 and 2.
+        :return: the current stage of data (0: bronze, 1: silver, 2: gold)
+        """
         return self._current_process_level
 
     @property
-    def layer_names(self):
+    def level_names(self):
+        """
+        List of level names for the 3 stages of data.
+        :return: the list
+        """
         return self._process_level_dirs_
 
     @property
     def curated_subdir(self):
+        """
+        Name for the last level or stage of the data
+        :return:
+        """
         return self._process_level_dirs_[DeltaDataLayerBuilder.CURATED_PROCESS_LEVEL]
 
     @property
     def raw_subdir(self):
+        """
+        Name for the first level or stage of the data
+        :return:
+        """
         return self._process_level_dirs_[DeltaDataLayerBuilder.RAW_PROCESS_LEVEL]
 
     @property
     def clean_subdir(self):
+        """
+        Name for the middle level or stage of the data
+        :return:
+        """
         return self._process_level_dirs_[DeltaDataLayerBuilder.CLEAN_PROCESS_LEVEL]
 
     @property
-    def process_context(self):
+    def process_context_name(self):
+        """
+        Name of the context understood as the concatenation of processes executed so far in the processing of data.
+        :return:
+        """
         return self._process_context
 
-    @process_context.setter
-    def process_context(self, value):
+    @process_context_name.setter
+    def process_context_name(self, value):
         if value is None:
             value = ""
         self._process_context = str(value)
@@ -364,9 +414,34 @@ class ConfigDeltaDataLayer(PathConfigDeltaDataLayer):
             ret = f"{ret}.{extension}"
         return ret
 
-
+    def register_udfs(self, name, func, return_type):
+        """
+        Register a function as "User defined Function" to process sequentially, the values of a column of a dataframe.
+        The function must have the following signature: func(value) -> return value of return_type type. You will be
+        able to use this kind of function when you need to change a column od a Dataframe. For example:
+            df.withColumn("new_column", data_layer.some_udf_function(F.col("existing_column_name")))
+        You will have been able to use that if previously you have register here the function "some_udf_function". To
+        register a function you must code:
+           def function_to_process_a_single_value(value):
+               do something with value, for example
+               return value * 2
+           layer.register_udfs("some_udf_function", function_to_process_a_single_value, IntegralType())
+        :param name: The name to get the udf function as attribute of data_layer
+        :param func: function to register and convert to UDF format function.
+        :param return_type: A return type compatible as column typer for dataframes of spark.sql.DataFrame
+        :return:
+        """
+        @F.udf(returnType=return_type)
+        def udf(value):
+            return func(value)
+        setattr(self, name, udf)
 
     def get_configuration(self):
+        """
+       Get a json object with the attributes of this object. You can use this json to build other object sharing the
+       same values
+       :return: configuration as json format
+       """
         return {
             "_spark_builder": self._spark_builder,
             "_base_path": self._base_path,
@@ -379,15 +454,19 @@ class ConfigDeltaDataLayer(PathConfigDeltaDataLayer):
         }
 
     def is_initialized(self):
+        """
+        Return true if the current spark session is initialized or False otherwise.
+        :return:
+        """
         return not (self.spark is None or self.spark.sparkContext._jsc is None or self.spark.sparkContext._jvm is None)
 
-    def start_spark(self):
+    def start_session(self):
         """Initialize Spark with the builder configuration."""
         if not self.is_initialized():
             self.spark = configure_spark_with_delta_pip(self._spark_builder).getOrCreate()
         logger.info("Spark is initialized ")
 
-    def stop(self):
+    def stop_session(self):
         """
         Stop this SparkSession. Therefore, any action performed with this session will result in an error.
         """
@@ -410,6 +489,10 @@ class BaseDeltaDataLayer(ConfigDeltaDataLayer):
 
     @property
     def log_process_info(self):
+        """
+        Info value stored for log_process
+        :return:
+        """
         return self._a_log_process_info[-1]
 
     @log_process_info.setter
@@ -454,11 +537,21 @@ class BaseDeltaDataLayer(ConfigDeltaDataLayer):
         return fs_ex.is_json_type(path)
 
     def delta_file_exist(self, *f_path):
+        """
+        Checks if the param f_path point to an existing delta storage.
+        :param f_path: path to check as string for any protocol supported by Hadoop
+        :return: True o False if path exists and pointed to a delta storage
+        """
         path = self._resolve_path(*f_path)
         fs_ex = FileSystemTaskExecutor(self.get_configuration())
         return fs_ex.path_exists(path) and fs_ex.is_delta_table_type(path)
 
     def json_file_exist(self, *f_path):
+        """
+       Checks if the param f_path point to an existing json storage.
+       :param f_path: path to check as string for any protocol supported by Hadoop
+       :return: True o False if path exists and pointed to a json storage
+       """
         path = self._resolve_path(*f_path)
         fs_ex = FileSystemTaskExecutor(self.get_configuration())
         return fs_ex.path_exists(path) and fs_ex.is_json_type(path)
@@ -502,7 +595,7 @@ class DeltaDataLayer(BaseDeltaDataLayer):
         if isinstance(df, TracedDataFrame):
             source_path = df.source_name
             source_version = df.source_version
-            original_df = df.df
+            original_df = df.toSparkDataFrame()
         else:
             source_path = "NEW"
             source_version = -1
@@ -549,7 +642,7 @@ class DeltaDataLayer(BaseDeltaDataLayer):
         if isinstance(df, TracedDataFrame):
             source_path = df.source_name
             source_version = df.source_version
-            original_df = df.df
+            original_df = df.toSparkDataFrame()
         else:
             source_path = "NEW"
             source_version = -1
@@ -665,7 +758,7 @@ class DeltaDataLayer(BaseDeltaDataLayer):
         :param name: Name of the view
         """
         # if isinstance(df, TracedDataFrame):
-        #     original_df = df.df
+        #     original_df = df.toSparkDataFrame()
         # else:
         #     original_df = df
         # original_df.createOrReplaceTempView(name)
@@ -691,8 +784,8 @@ class FileSystemTaskExecutor(BaseDeltaDataLayer):
         if self.is_initialized():
             self._fs = self._init_fs()
 
-    def start_spark(self):
-        super().start_spark()
+    def start_session(self):
+        super().start_session()
         self._fs = self._init_fs()
 
     def _init_fs(self):
@@ -706,6 +799,11 @@ class FileSystemTaskExecutor(BaseDeltaDataLayer):
 
     @staticmethod
     def date_random_file_name_generator(extension: str = ""):
+        """
+        Generate a random name for a file and add to the end the extension if the attribute has value
+        :param extension: extension value to add to the end of random name generated
+        :return:
+        """
         if extension:
             extension = f".{extension}"
         return f"{datetime.now().strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex}{extension}"
@@ -736,9 +834,19 @@ class FileSystemTaskExecutor(BaseDeltaDataLayer):
         return fs.exists(self._jvm.org.apache.hadoop.fs.Path(path))
 
     def is_delta_table_type(self, path:str):
+        """
+        Checks if a file or directory exists for any protocol supported by Hadoop.
+        :param path: path to check as string
+        :return: True o False if path exists
+        """
         return self.path_exists(f"{path}/_delta_log")
 
     def is_json_type(self, path:str):
+        """
+        Checks if a file exists for any protocol supported by Hadoop and is a json type saved by spark.
+        :param path: path to check as string
+        :return: True o False if path exists
+        """
         return self.path_exists(f"{path}/_SUCCESS")
 
     def subdirs_list(self, base_path: str):
@@ -759,7 +867,12 @@ class FileSystemTaskExecutor(BaseDeltaDataLayer):
         return subdirs
 
 # ==============================================================
-# CLASS: PipeProcess
+# CLASS: AbstractSparkPortadaProcess
 # ==============================================================
-class PipeProcess(ConfigDeltaDataLayer):
+class AbstractSparkPortadaProcess(ConfigDeltaDataLayer):
+    """
+    Abstract class to extend a new class with the specific functionality to process a TracedDataframe, for example
+    """
     pass
+
+

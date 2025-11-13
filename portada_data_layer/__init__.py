@@ -1,4 +1,4 @@
-from .data_lake_metadata_manager import process_log_context_for_data_layer_class, process_log_for_data_layer_class
+from .data_lake_metadata_manager import process_log_context_for_method, process_log_for_method
 from .delta_data_layer import DeltaDataLayerBuilder, DeltaDataLayer, FileSystemTaskExecutor
 from .boat_fact_data_layer import BoatFactDataLayerBuilder, BoatFactDataLayer
 from .traced_data_frame import TracedDataFrame

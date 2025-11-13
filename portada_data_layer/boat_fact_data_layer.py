@@ -1,6 +1,6 @@
 import json
 from pyspark.sql.types import StringType
-from portada_data_layer.data_lake_metadata_manager import DataLakeMetadataManager, enable_storage_log_for_data_layer_class, process_log_for_data_layer_class, process_log_context_for_data_layer_class
+from portada_data_layer.data_lake_metadata_manager import DataLakeMetadataManager, enable_storage_log_for_method, process_log_for_method, process_log_context_for_method
 from portada_data_layer.delta_data_layer import DeltaDataLayerBuilder, DeltaDataLayer, FileSystemTaskExecutor
 from portada_data_layer.traced_data_frame import TracedDataFrame
 from pyspark.sql import Row, functions as F, DataFrame
@@ -127,31 +127,34 @@ class BoatFactDataLayerBuilder(DeltaDataLayerBuilder):
 class BoatFactDataLayer(DeltaDataLayer):
     def __init__(self, builder: BoatFactDataLayerBuilder = None):
         super().__init__(builder=builder)
+        self.get_value_of_udf=None
+        self.get_obtaining_method_for_udf=None
         self._register_udfs()
         self._current_process_level=0
 
     def _register_udfs(self):
         """Register UDF to extract values from structured fields as boat fact data model."""
-        @F.udf(returnType=StringType())
+        # @F.udf(returnType=StringType())
         def get_value_of(value):
             if isinstance(value, Row):
                 value = value.asDict(recursive=True)
             return BoatFactDataModel.get_value_of(value)
+        # data_layer.get_value_of_udf = get_value_of
+        self.register_udfs("get_value_of_udf", get_value_of, StringType())
 
-        @F.udf(returnType=StringType())
+        # @F.udf(returnType=StringType())
         def get_obtaining_method_for(value):
             if isinstance(value, Row):
                 value = value.asDict(recursive=True)
             return BoatFactDataModel.get_obtaining_method_for(value)
-
-        self.get_value_of_udf = get_value_of
-        self.get_obtaining_method_for_udf = get_value_of
+        # data_layer.get_obtaining_method_for_udf = get_obtaining_method_for
+        self.register_udfs("get_obtaining_method_for_udf", get_obtaining_method_for, StringType())
 
     # =====================================================
     # Ingestion process of entries
     # =====================================================
-    @process_log_context_for_data_layer_class
-    @enable_storage_log_for_data_layer_class
+    @process_log_context_for_method
+    @enable_storage_log_for_method
     def ingest(self, *container_path, local_path: str):
         """
         Process a JSON input file:
@@ -178,9 +181,36 @@ class BoatFactDataLayer(DeltaDataLayer):
         self._current_process_level+=1
         logger.info("Ingestion process completed successfully.")
 
-    @process_log_context_for_data_layer_class
-    @process_log_for_data_layer_class
+    @process_log_context_for_method
+    @process_log_for_method
     def copy_ingested_raw_entries(self, *container_path, local_path: str, return_dest_path=False):
+        """
+        Copy a file pointed by a local_path to a destination_path. The destination path is built using container_path.
+        the methodology  used to buid destination_path is the following:
+           1. If container_path is a string containing a protocol ('file://', 'hdfs://...', ...) its value is used as
+           absolute path for destination_path.
+
+           2. If container_path is a dict or a list. Examples: copy_ingested_raw_entries(("portada", "ships"), local_path="ships.json")
+           or copy_ingested_raw_entries(["portada", "ships.json"], local_path="ships.json"). The destination_path will be resolved as
+           <delta_data_base_path_for_project_and_raw_stage>/portada
+
+           3.  If container_path is only single string or a sequence of strings. Examples:
+               - copy_ingested_raw_entries("ships", local_path="ships.json"). This case will be resolved as
+               <delta_data_base_path_for_project_and_raw_stage>/ships
+               - copy_ingested_raw_entries("portada", "ships", local_path="ships.json") will be resolved as
+               <delta_data_base_path_for_project_and_raw_stage>/portada/ships
+
+           4. String, sequence of strings, dict or list with items including dots as separator. Examples:
+               - copy_ingested_raw_entries("portada.masters", local_path="ships.json") will be resolved as
+               <delta_data_base_path_for_project_and_raw_stage>/portada/masters
+               - copy_ingested_raw_entries(("first_folder", "portada.masters"), local_path="ships.json") will be
+               resolved as <delta_data_base_path_for_project_and_raw_stage>/first_folder/portada/masters
+
+        :param container_path: to build the destination_path
+        :param local_path: where the local file is
+        :param return_dest_path: This parameter is a flag to set if the built destination_path is returned
+        :return: None or destination_path
+        """
         # Lectura del fitxer JSON original
         try:
             with open(local_path) as f:
@@ -206,8 +236,8 @@ class BoatFactDataLayer(DeltaDataLayer):
             return data, dest_path
         return data
 
-    @process_log_context_for_data_layer_class
-    @process_log_for_data_layer_class
+    @process_log_context_for_method
+    @process_log_for_method
     def save_raw_entries(self, *container_path, df=None, data: dict | list =None):
         """
         Save an array of ship entries (JSON) adding or updating them in files organized by:  date_path / publication_name / y / m / d / publication_edition

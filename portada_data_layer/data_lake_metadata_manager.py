@@ -24,11 +24,94 @@ def __set_enable_storage_log(func, is_enable, data_layer_key: str, *args, **kwar
     previous_log_storage = data_layer.log_storage
     data_layer.log_storage = is_enable
     try:
-        resultat = func(data_layer, *args, **kwargs)
+        resultat = func(*args, **kwargs)
         return resultat
     finally:
         # Restore the previous context after executing the method
         data_layer.log_storage = previous_log_storage
+
+def __process_log_context(func, data_layer_key: str, *args, **kwargs):
+    sig = inspect.signature(func)
+    bound = sig.bind(*args, **kwargs)
+    bound.apply_defaults()
+    if data_layer_key in bound.arguments:
+        data_layer = bound.arguments[data_layer_key]
+    else:
+        raise Exception(f"Parameter {data_layer_key} is needed")
+    func_name = func.__name__
+    previous_context = data_layer.process_context_name
+    new_context = (
+        func_name if not previous_context else f"{previous_context}.{func_name}"
+    )
+    data_layer.process_context_name = new_context
+    try:
+        resultat = func(data_layer, *args, **kwargs)
+        return resultat
+    finally:
+        # Restore the previous context after executing the method
+        data_layer.process_context_name = previous_context
+
+
+def __process_log(func, data_layer_key: str, *args, **kwargs):
+    sig = inspect.signature(func)
+    bound = sig.bind(*args, **kwargs)
+    bound.apply_defaults()
+    if data_layer_key in bound.arguments:
+        data_layer = bound.arguments[data_layer_key]
+    else:
+        raise Exception(f"Parameter {data_layer_key} is needed")
+    inici = datetime.now(UTC)
+    resultat = None
+    num_records = -1
+    estat = "OK"
+    try:
+        data_layer.clean_log_process_info()
+        resultat = func(data_layer, *args, **kwargs)
+        # If the method returns a DataFrame or similar, you may be able to infer num_records:
+        if isinstance(resultat, DataFrame):
+            num_records = resultat.count()
+        elif isinstance(resultat, (list, tuple)):
+            num_records = len(resultat)
+    except Exception as e:
+        estat = f"ERROR: {e}"
+        raise
+    finally:
+        final = datetime.now(UTC)
+        durada = (final - inici).total_seconds()
+        process_name = data_layer.process_context_name
+
+        # Get additional information from the class attribute
+        extra_info = data_layer.log_process_info
+
+        # Combine explicit values with those in the context
+        if "num_records" in extra_info:
+            num_records = extra_info.get("num_records")
+            del extra_info["num_records"]
+
+        # Invoke the metadata manager
+        metadata_manager = None
+        if hasattr(data_layer, "metadata_manager"):
+            metadata_manager = data_layer.metadata_manager
+        if not metadata_manager:
+            metadata_manager = DataLakeMetadataManager(data_layer.get_configuration())
+
+        extra_info_clean = {
+            k: (str(v))
+            for k, v in {
+                "duration": durada,
+                "start_time": inici.isoformat(),
+                "end_time": final.isoformat(),
+                **extra_info,
+            }.items()
+        }
+        metadata_manager.log_process(
+            data_layer=data_layer,
+            status=estat,
+            num_records=num_records,
+            extra_info=extra_info_clean,
+        )
+    return resultat
+
 
 def disable_storage_log(data_layer_key: str):
     def decorator(func):
@@ -37,103 +120,89 @@ def disable_storage_log(data_layer_key: str):
         """
         @wraps(func)
         def wrapper(data_layer:DeltaDataLayer, *args, **kwargs):
-            return __set_enable_storage_log(func, False, data_layer_key=data_layer_key, *args, **kwargs)
+            return __set_enable_storage_log(func, False, data_layer_key, *args, **kwargs)
         return wrapper
     return decorator
 
-def disable_storage_log_for_data_layer_class(func):
+
+def disable_storage_log_for_method(func):
     """
     decorator to disable storage logging
     """
     @wraps(func)
     def wrapper(*args, **kwargs):
-        return __set_enable_storage_log(func, False, data_layer_key="self", *args, **kwargs)
+        return __set_enable_storage_log(func, False, "data_layer", *args, **kwargs)
     return wrapper
 
-def enable_storage_log_for_data_layer_class(func):
+
+def enable_storage_log(data_layer_key: str):
+    def decorator(func):
+        """
+        decorator to disable storage logging
+        """
+        @wraps(func)
+        def wrapper(data_layer:DeltaDataLayer, *args, **kwargs):
+            return __set_enable_storage_log(func, True, data_layer_key, *args, **kwargs)
+        return wrapper
+    return decorator
+
+
+def enable_storage_log_for_method(func):
     """
     decorator to enable storage logging
     """
     @wraps(func)
     def wrapper(*args, **kwargs):
-        return __set_enable_storage_log(func, True, data_layer_key="self", *args, **kwargs)
+        return __set_enable_storage_log(func, True, "data_layer", *args, **kwargs)
     return wrapper
 
-def process_log_context_for_data_layer_class(func):
+
+def enable_storage_log_for_class(cls):
+    original_init = cls.__init__
+    def new_init(self, *args, **kwargs):
+        original_init(self, *args, **kwargs)
+        self.log_storage = True
+
+    cls.__init__ = new_init
+    return cls
+
+def process_log_context(data_layer_key: str):
+    def decorator(func):
+        """Updates the context attribute with the hierarchical name of the process."""
+        @wraps(func)
+        def wrapper(*args, **kwargs):
+            return __process_log_context(func, data_layer_key, *args, **kwargs)
+        return wrapper
+    return decorator
+
+
+def process_log_context_for_method(func):
     """Updates the context attribute with the hierarchical name of the process."""
     @wraps(func)
-    def wrapper(self, *args, **kwargs):
-        func_name = func.__name__
-        previous_context = self.process_context
-        new_context = (
-            func_name if not previous_context else f"{previous_context}.{func_name}"
-        )
-        self.process_context = new_context
-        try:
-            resultat = func(self, *args, **kwargs)
-            return resultat
-        finally:
-            # Restore the previous context after executing the method
-            self.process_context = previous_context
+    def wrapper(*args, **kwargs):
+        return __process_log_context(func, "data_layer", *args, **kwargs)
     return wrapper
 
-def process_log_for_data_layer_class(func):
+
+def process_log_for(data_layer_key: str):
+    def decorator(func):
+       """
+       Decorator that automatically logs storage process execution using DataLakeMetadataManager.log_process.
+       """
+       @wraps(func)
+       def wrapper(*args, **kwargs):
+            return __process_log(func, data_layer_key, *args, **kwargs)
+       return wrapper
+    return decorator
+
+
+def process_log_for_method(func):
     """
     Decorator that automatically logs storage process execution using DataLakeMetadataManager.log_process.
     """
     @wraps(func)
-    def wrapper(self, *args, **kwargs):
-        inici = datetime.now(UTC)
-        resultat = None
-        num_records = -1
-        estat = "OK"
-        try:
-            self.clean_log_process_info()
-            resultat = func(self, *args, **kwargs)
-            # If the method returns a DataFrame or similar, you may be able to infer num_records:
-            if isinstance(resultat, DataFrame):
-                num_records = resultat.count()
-            elif isinstance(resultat, (list, tuple)):
-                num_records = len(resultat)
-        except Exception as e:
-            estat = f"ERROR: {e}"
-            raise
-        finally:
-            final = datetime.now(UTC)
-            durada = (final - inici).total_seconds()
-            process_name = self.process_context
-
-            # Get additional information from the class attribute
-            extra_info = self.log_process_info
-
-            # Combine explicit values with those in the context
-            if "num_records" in extra_info:
-                num_records = extra_info.get("num_records")
-                del extra_info["num_records"]
-
-            # Invoke the metadata manager
-            metadata_manager = None
-            if hasattr(self, "metadata_manager"):
-                metadata_manager = self.metadata_manager
-            if not metadata_manager:
-                metadata_manager = DataLakeMetadataManager(self.get_configuration())
-
-            extra_info_clean = {
-                k: (str(v))
-                for k, v in {
-                    "duration": durada,
-                    "start_time": inici.isoformat(),
-                    "end_time": final.isoformat(),
-                    **extra_info,
-                }.items()
-            }
-            metadata_manager.log_process(
-                data_layer=self,
-                status=estat,
-                num_records=num_records,
-                extra_info=extra_info_clean,
-            )
-        return resultat
+    def wrapper(*args, **kwargs):
+        return __process_log(func, "self", *args, **kwargs)
     return wrapper
 
 class DataLakeMetadataManager(PathConfigDeltaDataLayer):
@@ -167,11 +236,11 @@ class DataLakeMetadataManager(PathConfigDeltaDataLayer):
         target_path: str = None,
         target_version: int = -1,
     ):
-        """Registra una execució de procés (ingesta, neteja, etc.)."""
+        """Records a storage data process."""
         entry = Row(
             log_id=str(uuid.uuid4()),
             timestamp=datetime.now(UTC).isoformat(),
-            process=data_layer.process_context,
+            process=data_layer.process_context_name,
             stage=data_layer.current_process_level,
             num_records=num_records,
             source_path=source_path,
@@ -192,11 +261,11 @@ class DataLakeMetadataManager(PathConfigDeltaDataLayer):
         num_records: int = -1,
         extra_info: Optional[Dict] = None,
     ):
-        """Registra una execució de procés (ingesta, neteja, etc.)."""
+        """Records a process execution (ingest, cleanup, etc.)."""
         entry = Row(
             log_id=str(uuid.uuid4()),
             timestamp=datetime.now(UTC).isoformat(),
-            process=data_layer.process_context,
+            process=data_layer.process_context_name,
             stage=data_layer.current_process_level,
             status=status,
             num_records=num_records,
@@ -219,11 +288,10 @@ class DataLakeMetadataManager(PathConfigDeltaDataLayer):
             from_table_full_path: Optional[str] = None,
     ):
         """
-        Registra la detecció de duplicats.
-        Desa els registres duplicats com a taula Delta a part,
-        i crea una entrada resum al log principal amb la seva ubicació.
+        Logs duplicate detection.
+        Saves duplicate records as a separate Delta table,
+        and creates a summary entry in the main log with their location.
         """
-
         # Nom de subdirectori basat en data i publicació
         safe_pub = publication.replace(" ", "_").lower()
         dup_base = f"metadata/duplicates_records/{safe_pub}/{date}/{edition}"
@@ -240,7 +308,7 @@ class DataLakeMetadataManager(PathConfigDeltaDataLayer):
         entry = Row(
             log_id=str(uuid.uuid4()),
             timestamp=datetime.now(UTC).isoformat(),
-            process=data_layer.process_context,
+            process=data_layer.process_context_name,
             stage=data_layer.current_process_level,
             action=action,
             publication=publication,
@@ -267,7 +335,7 @@ class DataLakeMetadataManager(PathConfigDeltaDataLayer):
         process: Optional[str] = None,
         extra_info: Optional[dict] = None,
     ):
-        """Registra l'origen i transformacions d'un camp concret."""
+        """Records the origin and transformations of a specific field."""
         entry = Row(
             log_id=str(uuid.uuid4()),
             timestamp=datetime.now(UTC).isoformat(),
@@ -292,7 +360,7 @@ class DataLakeMetadataManager(PathConfigDeltaDataLayer):
         record: Optional[Dict] = None,
         exception_type: Optional[str] = None,
     ):
-        """Registra un error o registre problemàtic."""
+        """Record an error or problematic record."""
         entry = Row(
             log_id=str(uuid.uuid4()),
             timestamp=datetime.now(UTC).isoformat(),
@@ -309,7 +377,7 @@ class DataLakeMetadataManager(PathConfigDeltaDataLayer):
     # 🔹 ESCRIPTURA GENERAL
     # ----------------------------------------------------------------------
     def _write_log(self, rows: List[Row], log_type: str):
-        """Escriptura comuna de logs al Data Lake."""
+        """Common logging to the Data Lake."""
         df = self.spark.createDataFrame(rows)
         target_path = self._resolve_path("metadata", log_type)
         df.write.mode("append").format(self.format).save(target_path)
@@ -347,9 +415,9 @@ class DataLakeMetadataManager(PathConfigDeltaDataLayer):
     # ----------------------------------------------------------------------
     def read_log(self, log_type: str | dict, include_duplicates: bool = False):
         """
-        Llegeix un log (process_log, duplicates_log, etc.).
-        Si log_type == "duplicates_log" i include_duplicates=True,
-        també carrega els registres duplicats associats de les taules Delta referenciades.
+        Reads a log (process_log, duplicates_log, etc.).
+        If log_type == "duplicates_log" and include_duplicates=True,
+        also loads the associated duplicate records from the referenced Delta tables.
         """
 
         path =  self._resolve_path("metadata", log_type)
@@ -365,6 +433,7 @@ class DataLakeMetadataManager(PathConfigDeltaDataLayer):
         duplicates_map = {}
 
         for row in df_log.collect():
+            log_id="unknown"
             try:
                 log_id = row["log_id"]
                 dup_path = row.get("duplicates_path")
@@ -385,10 +454,10 @@ class DataLakeMetadataManager(PathConfigDeltaDataLayer):
     # ----------------------------------------------------------------------
     def read_delta_metadata(self, delta_path: str):
         """
-        Llegeix les metadades internes d'una taula Delta Lake.
-        Retorna un diccionari amb:
-          - "detail": esquema i propietats de la taula
-          - "history": historial d'operacions (fins a 20 últimes per defecte)
+        Reads the internal metadata of a Delta Lake table.
+        Returns a dictionary with:
+        - "detail": table schema and properties
+        - "history": operation history (up to last 20 by default)
         """
         try:
             detail_df = self.spark.sql(f"DESCRIBE DETAIL delta.`{delta_path}`")
