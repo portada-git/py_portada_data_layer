@@ -1,4 +1,7 @@
+import datetime
 import json
+from importlib.util import source_hash
+
 from pyspark.sql.types import StringType
 from portada_data_layer.data_lake_metadata_manager import DataLakeMetadataManager, enable_storage_log_for_method, process_log_for_method, process_log_context_for_method
 from portada_data_layer.delta_data_layer import DeltaDataLayerBuilder, DeltaDataLayer, FileSystemTaskExecutor
@@ -246,6 +249,7 @@ class BoatFactDataLayer(DeltaDataLayer):
         if not df and data is None:
             raise ValueError("A DataFrame or JSON list must be passed.")
 
+        source_version = -1
         if df is None:
             if isinstance(data, dict):
                 data_json_array = data["data_json_array"]
@@ -257,6 +261,11 @@ class BoatFactDataLayer(DeltaDataLayer):
                 df=self.spark.read.json(self.spark.sparkContext.parallelize([json.dumps(obj) for obj in data_json_array])),
                 source_name=source_path,
             )
+        elif isinstance(df, TracedDataFrame):
+            source_path = df.source_name
+            source_version = df.source_version
+        else:
+            source_path = "UNKNOWN"
 
         if not self.is_initialized():
             error_msg = "BoatFactDataLayer instance is not initializer. start_spark() method must be called first."
@@ -318,7 +327,9 @@ class BoatFactDataLayer(DeltaDataLayer):
                         date=f"{year_:04d}_{month_:02d}_{day_:02d}",
                         edition=edition,
                         duplicates_df=duplicated_df,
-                        from_table_full_path=full_path
+                        source_path= source_path,
+                        source_version=source_version,
+                        target_path=full_path
                     )
                     self.write_json(full_path, df=merged_df, mode="overwrite")
                     # merged_df.coalesce(1).write.mode("overwrite").json(full_path)
@@ -329,7 +340,6 @@ class BoatFactDataLayer(DeltaDataLayer):
                 # subset.coalesce(1).write.mode("overwrite").json(full_path)
 
         logger.info(f"{regs} entries was saved")
-
 
     def read_raw_entries(self, *container_path, publication_name: str = None, y: int | str = None, m: int | str = None, d: int | str = None, edition: str = None):
         base_path = f"{self._resolve_path(*container_path, process_level_dir=self.raw_subdir)}"
@@ -357,8 +367,60 @@ class BoatFactDataLayer(DeltaDataLayer):
         logger.info(f"{0 if df is None else df.count()} entries was read")
         return df
 
-    def flatten_fields(self, *container_path, df: DataFrame):
-        pass
+    def get_missing_dates_from_a_newspaper(self, *container_path, publication_name:str, start_date: str=None, end_date: str=None):
+        publication_name = publication_name.lower()
+        p = list(container_path)
+        p.append(publication_name)
+        p0 = p.copy()
+        p1 = p.copy()
+        if self.path_exists(p0):
+            years = self.subdirs_list(p0)
+            years = sorted(years)
+            if len(years)>0:
+                year0 = years[0]
+                year1 = years[-1]
+                p0.append(year0)
+                p1.append(year1)
+                months = self.subdirs_list(p0)
+                month0 = months[0]
+                months = self.subdirs_list(p1)
+                month1 = months[-1]
+                p0.append(month0)
+                p1.append(month1)
+                days = self.subdirs_list(p0)
+                day0 = days[0]
+                days = self.subdirs_list(p1)
+                day1 = days[-1]
 
-    def clean_fields(self, *container_path, df: DataFrame):
-        pass
+                if start_date is None:
+                    start_date = datetime.date(int(year0), int(month0), int(day0))
+                else:
+                    start_date = datetime.datetime.strptime(start_date, "%Y-%m-%d").date()
+                if end_date is None:
+                    end_date = datetime.date(int(year1), int(month1), int(day1))
+                else:
+                    end_date = datetime.datetime.strptime(end_date, "%Y-%m-%d").date()
+                current_date = start_date
+                ret = []
+                while current_date <= end_date:
+                    dp = list(container_path)
+                    dp.append(publication_name)
+                    dp.append(f"{current_date.year:04d}")
+                    dp.append(f"{current_date.month:02d}")
+                    dp.append(f"{current_date.day:02d}")
+                    if not self.path_exists(dp):
+                        ret.append(current_date.strftime("%Y-%m-%d"))
+                    current_date = current_date + datetime.timedelta(days=1)
+                return ret
+            else:
+                raise Exception(f"The container {'/'.join(p0)} is empty.")
+        else:
+            raise Exception(f"The container {'/'.join(p0)} doesn't exist.")
+
+
+
+    # def flatten_fields(self, *container_path, df: DataFrame):
+    #     pass
+    #
+    # def clean_fields(self, *container_path, df: DataFrame):
+    #     pass

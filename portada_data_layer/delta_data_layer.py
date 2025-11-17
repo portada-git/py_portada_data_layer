@@ -456,8 +456,8 @@ class ConfigDeltaDataLayer(PathConfigDeltaDataLayer):
             table_path = args
         if process_level_dir is None:
             process_level_dir=self._process_level_dirs_[self._current_process_level]
-        else:
-            process_level_dir = f"{process_level_dir.rstrip("/")}/"
+
+        process_level_dir = f"{process_level_dir.rstrip("/")}/"
         if len(table_path)==1 and re.match(r"\w+://.*", table_path[0]):
             ret = table_path[0]
         else:
@@ -851,6 +851,7 @@ class DeltaDataLayer(BaseDeltaDataLayer):
                 raise Exception("For spark Dataframes, the name parameter is absolutely needed")
         df.createOrReplaceTempView(name)
         logger.info(f"Temporary view named '{name}' was registered.")
+
 
 # def run_pipe(pipe_process_struct):
 

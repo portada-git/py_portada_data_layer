@@ -243,11 +243,11 @@ class DataLakeMetadataManager(PathConfigDeltaDataLayer):
             timestamp=datetime.now(UTC).isoformat(),
             process=data_layer.process_context_name,
             stage=data_layer.current_process_level,
-            num_records=num_records,
             source_path=source_path,
             source_version=source_version,
             target_path=target_path,
             target_version=target_version,
+            num_records=num_records,
         )
 
         self._write_log([entry], "storage_log")
@@ -286,7 +286,11 @@ class DataLakeMetadataManager(PathConfigDeltaDataLayer):
             date: str,
             edition: str,
             duplicates_df,  # <--- ara rep el DataFrame complet amb els duplicats
-            from_table_full_path: Optional[str] = None,
+            source_path: Optional[str] = None, #és el fitxer font
+            source_version: Optional[int] = -1,
+            target_path: Optional[str] = None, #és el fitxer amb el qual es compara el sourc_epath.
+            target_version: Optional[int] = -1,
+
     ):
         """
         Logs duplicate detection.
@@ -311,6 +315,10 @@ class DataLakeMetadataManager(PathConfigDeltaDataLayer):
             timestamp=datetime.now(UTC).isoformat(),
             process=data_layer.process_context_name,
             stage=data_layer.current_process_level,
+            source_path=self._resolve_relative_path(source_path),
+            source_version=source_version,
+            target_path=self._resolve_relative_path(target_path),
+            target_version = target_version,
             action=action,
             publication=publication,
             date=date,
@@ -318,7 +326,6 @@ class DataLakeMetadataManager(PathConfigDeltaDataLayer):
             duplicates=num_dups,
             duplicate_ids=ids,
             duplicates_path=self._resolve_relative_path(dup_base),
-            source_path=self._resolve_relative_path(from_table_full_path),
         )
 
         self._write_log([entry], "duplicates_log")
@@ -328,23 +335,27 @@ class DataLakeMetadataManager(PathConfigDeltaDataLayer):
     # ----------------------------------------------------------------------
     def log_field_lineage(
         self,
+        data_layer: BaseDeltaDataLayer,
         entry_id: str,
-        table_path: str,
         field_name: str,
         final_value: str,
         previous_values: Optional[List[str]] = None,
-        process: Optional[str] = None,
+        source_path: Optional[str] = None,
+        source_version: Optional[int] = None,
         extra_info: Optional[dict] = None,
     ):
         """Records the origin and transformations of a specific field."""
         entry = Row(
             log_id=str(uuid.uuid4()),
             timestamp=datetime.now(UTC).isoformat(),
+            process=data_layer.process_context_name,
+            stage=data_layer.current_process_level,
+            source_path=self._resolve_relative_path(source_path) if source_path else "",
+            source_version=source_version or -1,
             entry_id=entry_id,
             field_name=field_name,
             final_value=final_value,
             previous_values=previous_values or [],
-            process=process,
             extra_info= extra_info or {}
         )
 
@@ -442,13 +453,17 @@ class DataLakeMetadataManager(PathConfigDeltaDataLayer):
                 if dup_path and dup_path.strip():
                     dup_path = self._resolve_path(dup_path, contains_project_name=True)
                     dup_df = self.spark.read.json(dup_path)
-                    # dup_df = self.spark.read.format("delta").load(dup_path)
                     dup_df = dup_df.withColumn("log_id", F.lit(log_id))
                     duplicates_df = duplicates_df.unionByName(dup_df, allowMissingColumns=True)
             except Exception as e:
                 logger.error(f"Error loading duplicates for log_id={log_id}: {e}")
 
         return df_log, duplicates_df
+
+    def get_duplicates_from_path(self, dup_path):
+        dup_path = self._resolve_path(dup_path, contains_project_name=True)
+        dup_df = self.spark.read.json(dup_path)
+        return dup_df
 
     # ----------------------------------------------------------------------
     # 🔹 LLEGIR METADADES DE DELTA LAKE
@@ -475,3 +490,4 @@ class DataLakeMetadataManager(PathConfigDeltaDataLayer):
         except Exception as e:
             logger.error(f"Error reading Delta metadata from {delta_path}: {e}")
             return None
+
