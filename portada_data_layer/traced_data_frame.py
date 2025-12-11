@@ -40,13 +40,16 @@ class TracedDataFrame:
     purposes it acts like a dataframe, but it contains the source_name_path and the source version where is data is stored
     """
     # def __init__(self, df: DataFrame, source_name: str, source_version: int = -1, name=None, large_name=None,transformations=None):
-    def __init__(self, df: DataFrame, source_name: str, source_version: int=-1, name=None, **kwargs):
+    def __init__(self, df: DataFrame, source_name: str, source_version: int=-1, save_lineage_on_store=False, name=None, **kwargs):
         self._df = df
         self._name = name
         self._large_name = kwargs["large_name"] if "large_name" in kwargs else None
         self.source_name = source_name
         self.source_version = source_version
         self.transformations = list(kwargs["transformations"]) if "transformations" in kwargs else []
+        self.save_lineage_on_store = save_lineage_on_store
+        self._transformer_name = kwargs["transformer_name"] if "transformer_name" in kwargs else ""
+        self._transformer_description = kwargs["transformer_description"] if "transformer_description" in kwargs else ""
 
     # --- Forwarding per accedir directament a les funcions del DataFrame ---
     def __getattr__(self, name):
@@ -107,7 +110,7 @@ class TracedDataFrame:
             n = f"{self.source_name}{v}"
         tn = ""
         for i, t in enumerate(self.transformations):
-            if depth and depth < i:
+            if depth is not None and depth <= i:
                 break
             tn = f"{tn}.{t["operation"]}({t["arguments"]})"
         if not n.startswith("DF"):
@@ -119,7 +122,10 @@ class TracedDataFrame:
         return self._df
 
     def update_result(self, old_df, new_df, op_name, args, kwargs):
-        new_df = TracedDataFrame(new_df, self.source_name, self.source_version, name=self._name, large_name=self._large_name, transformations=self.transformations)
+        new_df = TracedDataFrame(new_df, self.source_name, self.source_version, name=self._name,
+                                 large_name=self._large_name, transformations=self.transformations,
+                                 save_lineage_on_store=self.save_lineage_on_store, transformer_name=self._transformer_name,
+                                 transformer_description=self._transformer_description,)
 
         old_cols = set(old_df.columns)
         new_cols = set(new_df.columns)
@@ -128,9 +134,11 @@ class TracedDataFrame:
         removed = old_cols - new_cols
         common = new_cols.intersection(old_cols)
         dataframes =  self._get_dataframe_list_from_arg(args, kwargs)
-        io_columns = self._get_columns_list_from_arg(args, kwargs)
+        io_columns = self._get_columns_list_from_arg(old_cols.union(new_cols), args, kwargs)
 
         transformation = {
+            "transformer_process": self._transformer_name,
+            "transformer_description": self._transformer_description,
             "operation": op_name,
             "source_dataframes": list(dataframes),
             "involved_columns": list(io_columns),
@@ -161,8 +169,7 @@ class TracedDataFrame:
             process(arg)
         return ret
 
-    @staticmethod
-    def _get_columns_list_from_arg(args, kwargs):
+    def _get_columns_list_from_arg(self, acols, args, kwargs):
         cols = set()
         def process(arg):
             from pyspark.sql import Column
@@ -170,20 +177,24 @@ class TracedDataFrame:
             # 1. Column (expressió)
             if isinstance(arg, Column):
                 try:
-                    refs = arg._jc.references().toList()
-                    cols.update([r.toString() for r in refs])
+                    refs_scala_seq = arg._jc.expr().references().toList()
+                    num_refs = refs_scala_seq.size()
+                    refs =[str(refs_scala_seq.apply(i).toString().replace("'","")) for i in range(num_refs)]
+                    cols.update([r for r in refs if r in acols])
                 except:
                     pass
                 return
 
             # 2. string simple → nom de columna
             if isinstance(arg, str):
-                if arg.isidentifier():
+                if arg.isidentifier() and arg in acols:
                     cols.add(arg)
                 else:
                     tmp_col = expr(arg)
-                    refs = tmp_col._jc.references().toList()
-                    cols.update([r.toString() for r in refs])
+                    refs_scala_seq = tmp_col._jc.expr().references().toList()
+                    num_refs = refs_scala_seq.size()
+                    refs =[str(refs_scala_seq.apply(i).toString().replace("'","")) for i in range(num_refs)]
+                    cols.update([r for r in refs if r in acols])
                 return
 
             # 3. llista/tuple → processar recursivament
@@ -195,7 +206,7 @@ class TracedDataFrame:
             # 4. diccionaris (fill/replace/etc.)
             if isinstance(arg, dict):
                 for key in arg.keys():
-                    if isinstance(key, str):
+                    if isinstance(key, str) and key.isidentifier() and key in acols:
                         cols.add(key)
                 return
 

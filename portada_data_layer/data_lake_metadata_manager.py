@@ -79,36 +79,46 @@ def __is_block_transformer(func, data_layer_key: str, *args, ** kwargs):
         data_layer._transformer_block_name = previous_block_transformer
 
 
-def __is_data_transformer(func, data_layer_key: str, dataframe_key: str = "df", description="",
-                          field_lineage: LineageCheckingType = LineageCheckingType.NO_CHECKING, *args, **kwargs):
+def __is_data_transformer(func, data_layer_key: str=None, dataframe_key: str = "df", description="", *args, **kwargs):
     sig = inspect.signature(func)
     bound = sig.bind(*args, **kwargs)
     bound.apply_defaults()
     if data_layer_key in bound.arguments:
         data_layer = bound.arguments[data_layer_key]
     else:
-        raise Exception(f"Parameter {data_layer_key} is needed")
+        data_layer = None
+
     if dataframe_key in bound.arguments:
-        dataframes = [bound.arguments[dataframe_key] if isinstance(bound.arguments[dataframe_key], TracedDataFrame) else TracedDataFrame(bound.arguments[dataframe_key], "UNKNOWN")]
+        dataframe = bound.arguments[dataframe_key] if isinstance(bound.arguments[dataframe_key], TracedDataFrame) else TracedDataFrame(bound.arguments[dataframe_key], "UNKNOWN")
+        dataframes = [dataframe]
     else:
+        dataframe = None
         dataframes = []
+
     inici = datetime.now(UTC)
     resultat = None
     num_records = -1
     estat = "OK"
     func_name = func.__name__
-    previous_context = data_layer._transformer_process_name
+    previous_context = data_layer._transformer_process_name if data_layer else ""
+    previous_transformer_name = dataframe._transformer_name if dataframe else ""
+
     new_context = (
         func_name if not previous_context else f"{previous_context}.{func_name}"
     )
-    data_layer._transformer_process_name = new_context
+    if data_layer:
+        data_layer._transformer_process_name = new_context
+    if dataframe:
+        dataframe._transformer_name = new_context
+        dataframe._transformer_description = description
     try:
-        data_layer.clean_log_process_info()
+        if data_layer:
+            data_layer.clean_log_process_info()
 
         resultat = func(*args, **kwargs)
 
         if isinstance(resultat, DataFrame):
-            dataframes = [TracedDataFrame(resultat, "UNKNOWN")]
+            dataframes = [TracedDataFrame(resultat, "UNKNOWN", previous_transformer_name)]
             num_records = resultat.count()
         if isinstance(resultat, TracedDataFrame):
             dataframes = [resultat]
@@ -123,7 +133,7 @@ def __is_data_transformer(func, data_layer_key: str, dataframe_key: str = "df", 
         durada = (final - inici).total_seconds()
 
         # Get additional information from the class attribute
-        extra_info = data_layer.log_process_info
+        extra_info = data_layer.log_process_info if data_layer else {}
 
         # Combine explicit values with those in the context
         if "num_records" in extra_info:
@@ -132,7 +142,7 @@ def __is_data_transformer(func, data_layer_key: str, dataframe_key: str = "df", 
 
         # Invoke the metadata manager
         metadata_manager = None
-        if hasattr(data_layer, "metadata_manager"):
+        if data_layer and hasattr(data_layer, "metadata_manager"):
             metadata_manager = data_layer.metadata_manager
         if not metadata_manager:
             metadata_manager = DataLakeMetadataManager(data_layer.get_configuration())
@@ -144,53 +154,69 @@ def __is_data_transformer(func, data_layer_key: str, dataframe_key: str = "df", 
             }.items()
         }
 
-        data_lineage_list = None
-        if field_lineage != LineageCheckingType.NO_CHECKING:
-            for dataframe in dataframes:
-                data_lineage_list = []
-                for t in dataframe.transformations:
-                    change_types = []
-                    if len(t["source_dataframes"]) > 1:
-                        change_types.append("new_dataframe")
-                    if len(t["added_columns"]) > 0:
-                        change_types.append("add_columns")
-                    if len(t["removed_columns"]) > 0:
-                        change_types.append("remove_columns")
-                    if t["operation"] in TRANSFORMING_METHODS:
-                        change_types.append("modify_columns")
-                    data_lineage = {
-                        "dataframe_name": dataframe.name,
-                        "change_types": change_types,
-                        "change_action":t["operation"],
-                        "arguments": t["arguments"],
-                        "involved_dataframes": [{"name":tr.name, "large_name":tr.large_name} for tr in t["source_dataframes"]],
-                        "involved_columns": t["involved_columns"],
-                    }
-                    if field_lineage == LineageCheckingType.FIELD_AND_VALUE:
-                        # guardar el dataframe per forçar una versió
-                        p, v = metadata_manager._write_dataframe(df=dataframe)
-                        saved_values = {
-                            "container_path": p,
-                            "version_path": v
-                        }
-                        data_lineage["saved_values"] = saved_values
-                    data_lineage_list.append(data_lineage)
-        metadata_manager.log_process(
-            data_layer=data_layer,
-            description=description,
-            status=estat,
-            start_time=str(inici),
-            end_time=str(final),
-            duration=durada,
-            num_records=num_records,
-            data_lineage_list= data_lineage_list,
-            extra_info=extra_info_clean,
-        )
+        # data_lineage_list = None
+        # if field_lineage != LineageCheckingType.NO_CHECKING:
+        #     for dataframe in dataframes:
+        #         data_lineage_list = []
+        #         for t in dataframe.transformations:
+        #             change_types = []
+        #             if len(t["source_dataframes"]) > 1:
+        #                 change_types.append("new_dataframe")
+        #             if len(t["added_columns"]) > 0:
+        #                 change_types.append("add_columns")
+        #             if len(t["removed_columns"]) > 0:
+        #                 change_types.append("remove_columns")
+        #             if t["operation"] in TRANSFORMING_METHODS:
+        #                 change_types.append("modify_columns")
+        #             data_lineage = {
+        #                 "dataframe_name": dataframe.name,
+        #                 "change_types": change_types,
+        #                 "change_action":t["operation"],
+        #                 "arguments": t["arguments"],
+        #                 "involved_dataframes": [{"name":tr.name, "large_name":tr.large_name} for tr in t["source_dataframes"]],
+        #                 "involved_columns": t["involved_columns"],
+        #             }
+        #             if field_lineage == LineageCheckingType.FIELD_AND_VALUE:
+        #                 # guardar el dataframe per forçar una versió
+        #                 p, v = metadata_manager._write_dataframe(df=dataframe)
+        #                 saved_values = {
+        #                     "container_path": p,
+        #                     "version_path": v
+        #                 }
+        #                 data_lineage["saved_values"] = saved_values
+        #             data_lineage_list.append(data_lineage)
+        if data_layer:
+            metadata_manager.log_process(
+                data_layer=data_layer,
+                description=description,
+                status=estat,
+                start_time=str(inici),
+                end_time=str(final),
+                duration=durada,
+                num_records=num_records,
+                extra_info=extra_info_clean,
+            )
+        else:
+            metadata_manager.log_process(
+                process=new_context,
+                description=description,
+                status=estat,
+                start_time=str(inici),
+                end_time=str(final),
+                duration=durada,
+                num_records=num_records,
+                extra_info=extra_info_clean,
+            )
         return resultat
     finally:
         # Restore the previous context after executing the method
-        data_layer.clean_log_process_info(True)
-        data_layer._transformer_process_name = previous_context
+        if data_layer:
+            data_layer.clean_log_process_info(True)
+            data_layer._transformer_process_name = previous_context
+
+        for dataframe in dataframes:
+            dataframe._transformer_name = previous_transformer_name
+            dataframe._transformer_description = ""
 
 
 # def __process_log_context(func, data_layer_key: str, *args, **kwargs):
@@ -374,28 +400,26 @@ def block_transformer_method(func):
 
 
 
-def data_transformer(data_layer_key: str, dataframe_key: str = "df", description: str = "",
-                     field_lineage: LineageCheckingType = LineageCheckingType.NO_CHECKING):
+def data_transformer(data_layer_key: str, dataframe_key: str = "df", description: str = ""):
     def decorator(func):
         """
        Decorator that automatically logs storage process execution using DataLakeMetadataManager.log_process.
        """
         def wrapper(*args, **kwargs):
-            return __is_data_transformer(func, data_layer_key, dataframe_key, description, field_lineage, *args, **kwargs)
+            return __is_data_transformer(func, data_layer_key, dataframe_key, description, *args, **kwargs)
 
         return wrapper
 
     return decorator
 
 
-def data_transformer_method(dataframe_key: str = "df", description: str = "",
-                            field_lineage: LineageCheckingType = LineageCheckingType.NO_CHECKING):
+def data_transformer_method(dataframe_key: str = "df", description: str = ""):
     def decorator(func):
         """
        Decorator that automatically logs storage process execution using DataLakeMetadataManager.log_process.
        """
         def wrapper(*args, **kwargs):
-            return __is_data_transformer(func, "self", dataframe_key, description, field_lineage, *args, **kwargs)
+            return __is_data_transformer(func, "self", dataframe_key, description, *args, **kwargs)
 
         return wrapper
 
@@ -471,55 +495,6 @@ def disable_field_lineage_log_for_class(cls):
 
     cls.__init__ = new_init
     return cls
-
-# def process_log_context(data_layer_key: str):
-#     def decorator(func):
-#         """Updates the context attribute with the hierarchical name of the process."""
-#
-#         @wraps(func)
-#         def wrapper(*args, **kwargs):
-#             return __process_log_context(func, data_layer_key, *args, **kwargs)
-#
-#         return wrapper
-#
-#     return decorator
-#
-#
-# def process_log_context_for_method(func):
-#     """Updates the context attribute with the hierarchical name of the process."""
-#
-#     @wraps(func)
-#     def wrapper(*args, **kwargs):
-#         return __process_log_context(func, "self", *args, **kwargs)
-#
-#     return wrapper
-
-
-# def process_log_for(data_layer_key: str):
-#     def decorator(func):
-#         """
-#        Decorator that automatically logs storage process execution using DataLakeMetadataManager.log_process.
-#        """
-#
-#         @wraps(func)
-#         def wrapper(*args, **kwargs):
-#             return __process_log(func, data_layer_key, *args, **kwargs)
-#
-#         return wrapper
-#
-#     return decorator
-#
-#
-# def process_log_for_method(func):
-#     """
-#     Decorator that automatically logs storage process execution using DataLakeMetadataManager.log_process.
-#     """
-#
-#     @wraps(func)
-#     def wrapper(*args, **kwargs):
-#         return __process_log(func, "self", *args, **kwargs)
-#
-#     return wrapper
 
 
 class DataLakeMetadataManager(PathConfigDeltaDataLayer):
@@ -598,30 +573,29 @@ class DataLakeMetadataManager(PathConfigDeltaDataLayer):
     # ----------------------------------------------------------------------
     def log_process(
             self,
-            data_layer: BaseDeltaDataLayer,
             description: str,
             status: str,
             start_time,
             end_time,
             duration,
             num_records: int = -1,
-            data_lineage_list: Optional[Dict] = None,
+            data_layer: BaseDeltaDataLayer= None,
             extra_info: Optional[Dict] = None,
+            process: str = None,
     ):
         """Records a process execution (ingest, cleanup, etc.)."""
         log_id = str(uuid.uuid4())
         entry = Row(
             log_id=log_id,
             timestamp=datetime.now(UTC).isoformat(),
-            process=data_layer.transformer_name,
-            stage=data_layer.current_process_level,
+            process=data_layer.transformer_name if data_layer else process,
+            stage=data_layer.current_process_level if data_layer else -1,
             description=description,
             status=status,
             start_time=start_time,
             end_time=end_time,
             duration=duration,
             num_records=num_records,
-            data_lineage_list=data_lineage_list or [],
             extra_info=extra_info or {},
         )
         schema = StructType([
@@ -635,18 +609,6 @@ class DataLakeMetadataManager(PathConfigDeltaDataLayer):
             StructField("end_time", StringType(), False),
             StructField("duration", FloatType(), False),
             StructField("num_records", LongType(), True),
-            StructField("data_lineage_list", ArrayType(StructType([
-                StructField("dataframe_name", StringType(), True),
-                StructField("change_types", ArrayType(StringType())),
-                StructField("change_action", StringType(), True),
-                StructField("arguments", ArrayType(StringType())),
-                StructField("involved_dataframes", ArrayType(StructType([StructField("name", StringType(), False), StructField("large_name", StringType(), False)]))),
-                StructField("involved_columns", ArrayType(StringType())),
-                StructField("saved_values", StructType([
-                    StructField("container_path", StringType(), True),
-                    StructField("version_path", StringType(), True),
-                ]), True)
-            ])), True),
             StructField("extra_info", MapType(StringType(), StringType()), True)
         ])
         self._write_log([entry], "process_log", schema=schema, partitionBy=["process"])
@@ -667,7 +629,6 @@ class DataLakeMetadataManager(PathConfigDeltaDataLayer):
             source_version: Optional[int] = -1,
             target_path: Optional[str] = None,  # és el fitxer amb el qual es compara el sourc_epath.
             target_version: Optional[int] = -1,
-
     ):
         """
         Logs duplicate detection.
@@ -737,7 +698,8 @@ class DataLakeMetadataManager(PathConfigDeltaDataLayer):
                 log_id= str(uuid.uuid4()),
                 timestamp= datetime.now(UTC).isoformat(),
                 stored_log_id= stored_log_id,
-                process= data_layer.transformer_name,
+                transformer_name= dataframe._transformer_name if dataframe._transformer_name else data_layer.transformer_name,
+                transformer_description= dataframe._transformer_description,
                 stage= data_layer.current_process_level,
                 dataframe_name= df_name,
                 source_path= self._resolve_relative_path(dataframe.source_name),
@@ -756,7 +718,8 @@ class DataLakeMetadataManager(PathConfigDeltaDataLayer):
             StructField("log_id", StringType(), False),
             StructField("timestamp", StringType(), False),
             StructField("stored_log_id", StringType(), True),
-            StructField("process", StringType(), True),
+            StructField("transformer_name", StringType(), True),
+            StructField("transformer_description", StringType(), True),
             StructField("stage", StringType(), True),
             StructField("dataframe_name", StringType(), True),
             StructField("source_path", StringType(), True),
@@ -770,7 +733,7 @@ class DataLakeMetadataManager(PathConfigDeltaDataLayer):
             StructField("added_columns", ArrayType(StringType())),
             StructField("removed_columns", ArrayType(StringType())),
         ])
-        self._write_log(entries, "field_lineage", schema=schema, partitionBy=("stored_log_id",))
+        self._write_log(entries, "field_lineage_log", schema=schema, partitionBy=("stored_log_id",))
 
     # ----------------------------------------------------------------------
     # 🔹 ERROR LOG

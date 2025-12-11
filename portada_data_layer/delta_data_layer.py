@@ -571,42 +571,43 @@ class DeltaDataLayer(BaseDeltaDataLayer):
         super().__init__(builder=builder, cfg_json=cfg_json)
         self.log_storage=False
         self.source_path=None
+        self._save_lineage_on_store=False
 
-    def _get_lineage(self, stored_log_id:str, process_name:str, stage:int, target_path, target_version, df:TracedDataFrame):
-        data_lineage_list = []
-        transformations = df.transformations
-
-        for i, t in enumerate(transformations):
-            change_types = []
-            if len(t["source_dataframes"]) > 1:
-                change_types.append("new_dataframe")
-            if len(t["added_columns"]) > 0:
-                change_types.append("add_columns")
-            if len(t["removed_columns"]) > 0:
-                change_types.append("remove_columns")
-            if t["operation"] in TRANSFORMING_METHODS:
-                change_types.append("modify_columns")
-            df_name = df.get_partial_large_name(i)
-            data_lineage = {
-                "log_id": str(uuid.uuid4()),
-                "timestamp": datetime.now(UTC).isoformat(),
-                "stored_log_id": stored_log_id,
-                "process": process_name,
-                "stage": stage,
-                "dataframe_name": df_name,
-                "source_path": self._resolve_relative_path(df.source_name),
-                "source_version": df.source_version,
-                "target_path": target_path,
-                "target_version": target_version,
-                "change_types": change_types,
-                "change_action": t["operation"],
-                "arguments": t["arguments"],
-                "involved_dataframes": [{"name": tr.name, "large_name": tr.large_name} for tr in
-                                        t["source_dataframes"]],
-                "involved_columns": t["involved_columns"],
-            }
-            data_lineage_list.append(data_lineage)
-        return data_lineage_list
+    # def _get_lineage(self, stored_log_id:str, process_name:str, stage:int, target_path, target_version, df:TracedDataFrame):
+    #     data_lineage_list = []
+    #     transformations = df.transformations
+    #
+    #     for i, t in enumerate(transformations):
+    #         change_types = []
+    #         if len(t["source_dataframes"]) > 1:
+    #             change_types.append("new_dataframe")
+    #         if len(t["added_columns"]) > 0:
+    #             change_types.append("add_columns")
+    #         if len(t["removed_columns"]) > 0:
+    #             change_types.append("remove_columns")
+    #         if t["operation"] in TRANSFORMING_METHODS:
+    #             change_types.append("modify_columns")
+    #         df_name = df.get_partial_large_name(i)
+    #         data_lineage = {
+    #             "log_id": str(uuid.uuid4()),
+    #             "timestamp": datetime.now(UTC).isoformat(),
+    #             "stored_log_id": stored_log_id,
+    #             "process": process_name,
+    #             "stage": stage,
+    #             "dataframe_name": df_name,
+    #             "source_path": self._resolve_relative_path(df.source_name),
+    #             "source_version": df.source_version,
+    #             "target_path": target_path,
+    #             "target_version": target_version,
+    #             "change_types": change_types,
+    #             "change_action": t["operation"],
+    #             "arguments": t["arguments"],
+    #             "involved_dataframes": [{"name": tr.name, "large_name": tr.large_name} for tr in
+    #                                     t["source_dataframes"]],
+    #             "involved_columns": t["involved_columns"],
+    #         }
+    #         data_lineage_list.append(data_lineage)
+    #     return data_lineage_list
 
     def write_json(self, *table_path, df: DataFrame | TracedDataFrame, mode: str ="overwrite", process_level_dir: str = None, has_extension=False):
         """
@@ -635,21 +636,19 @@ class DeltaDataLayer(BaseDeltaDataLayer):
             df_name = df.name
             df_large_name = df.large_name
             original_df = df.toSparkDataFrame()
-            transformations = df.transformations
         else:
             source_path = "UNKNOWN"
             source_version = -1
             original_df = df
             df_name = "UNKNOWN"
             df_large_name = "UNKNOWN"
-            transformations = []
             df = TracedDataFrame(df, source_name=source_path, source_version=source_version)
 
         path = self._resolve_path(*table_path, process_level_dir=process_level_dir, has_extension=has_extension)
         target_path = self._resolve_relative_path(path)
         logger.info(f"Writing Delta → {path}")
         original_df.coalesce(1).write.mode(mode).json(path)
-        if self.log_storage:
+        if self.log_storage or self._save_lineage_on_store or df.save_lineage_on_store:
             if hasattr(self, "metadata"):
                 metadata = self.metadata
             else:
@@ -672,7 +671,7 @@ class DeltaDataLayer(BaseDeltaDataLayer):
                 target_path=target_path,
                 target_version=-1,
             )
-            if self._save_lineage_on_store:
+            if self._save_lineage_on_store or df.save_lineage_on_store:
                 metadata.log_field_lineage(
                     data_layer=self,
                     dataframe=df,
@@ -709,21 +708,20 @@ class DeltaDataLayer(BaseDeltaDataLayer):
             df_name = df.name
             df_large_name = df.large_name
             original_df = df.toSparkDataFrame()
-            transformations = df.transformations
         else:
             source_path = "UNKNOWN"
             source_version = -1
             original_df = df
             df_name = "UNKNOWN"
             df_large_name = "UNKNOWN"
-            transformations = []
+            df = TracedDataFrame(df, source_name=source_path, source_version=source_version)
 
         path = self._resolve_path(*table_path)
         target_path = self._resolve_relative_path(path)
         logger.info(f"Writing Delta → {path}")
         original_df.write.format("delta").mode(mode).save(path)
         version = self.get_delta_metatable(path).history(1).collect()[0]['version']
-        if self.log_storage or self._save_lineage_on_store:
+        if self.log_storage or self._save_lineage_on_store or df.save_lineage_on_store:
             if hasattr(self, "metadata"):
                 metadata = self.metadata
             else:
@@ -735,12 +733,7 @@ class DeltaDataLayer(BaseDeltaDataLayer):
             else:
                 prev_tr_name = None
 
-            if self._save_lineage_on_store:
-                data_lineage_list = self._get_lineage(df_name, df_large_name, transformations)
-            else:
-                data_lineage_list = []
-
-            metadata.log_storage(
+            l_id = metadata.log_storage(
                 data_layer=self,
                 num_records=original_df.count(),
                 mode=mode,
@@ -750,8 +743,14 @@ class DeltaDataLayer(BaseDeltaDataLayer):
                 source_version= source_version,
                 target_path=target_path,
                 target_version=version,
-                data_lineage_list=data_lineage_list,
             )
+            if self._save_lineage_on_store or df.save_lineage_on_store:
+                metadata.log_field_lineage(
+                    data_layer=self,
+                    dataframe=df,
+                    stored_log_id=l_id
+                )
+
             if prev_tr_name is not None:
                 self._transformer_process_name = prev_tr_name
 

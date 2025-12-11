@@ -23,7 +23,7 @@ class PortadaCleaning(DeltaDataLayer):
         self._allowed_paths = self._collect_allowed_paths(json_schema)
         return self
 
-    @data_transformer_method(field_lineage=LineageCheckingType.FIELD_AND_VALUE)
+    @data_transformer_method(description="prune unbelonging model fields ")
     def prune_unaccepted_fields(self, df: DataFrame | TracedDataFrame):
         if self._schema is None:
             raise ValueError("Cal cridar use_schema() abans.")
