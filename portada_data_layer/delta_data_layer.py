@@ -1,3 +1,5 @@
+import inspect
+
 from delta import configure_spark_with_delta_pip
 from pyspark.sql import SparkSession, DataFrame
 from pyspark.sql import functions as F
@@ -6,179 +8,18 @@ from py4j.java_gateway import java_import
 from datetime import datetime
 import uuid
 import os
-import json
 import logging
 import re
 
-from portada_data_layer.traced_data_frame import TracedDataFrame
+from portada_data_layer.portada_delta_common import PortadaDeltaConstants
+from portada_data_layer.traced_data_frame import TracedDataFrame, TRANSFORMING_METHODS
 
 logger = logging.getLogger("delta_data_layer")
-
-
-# ==============================================================
-# BUILDER: AbstractDeltaDataLayerBuilder
-# ==============================================================
-
-class AbstractDeltaDataLayerBuilder:
-    """
-    Builder to configure Spark + Delta Lake with a fluid and flexible API.
-    Example:
-        builder = (
-            DeltaDataLayerBuilder()
-            .protocol("hdfs://localhost:9000")
-            .table_path("/datalake/bronze")
-            .app_name("MyDeltaApp")
-            .config("spark.sql.shuffle.partitions", "8")
-        )
-        layer = builder.build()
-        layer.open_spark()
-        ...
-        layer.close()
-    """
-    DEFAULT_BASE_PATH = "~/.delta_lake/data"
-    DEFAULT_RAW_SUBDIR = "bronze"
-    DEFAULT_CLEAN_SUBDIR = "silver"
-    DEFAULT_CURATED_SUBDIR = "gold"
-    DEFAULT_PROJECT_DATA_NAME = "default"
-    RAW_PROCESS_LEVEL = 0
-    CLEAN_PROCESS_LEVEL = 1
-    CURATED_PROCESS_LEVEL = 2
-
-    def __init__(self, json_config=None):
-        self._process_level = -1
-        fc = "config/cfg.json"
-        if json_config is None:
-            if os.path.exists(fc):
-                with open(fc) as json_cfg_file:
-                    json_config = json.load(json_cfg_file)
-            else:
-                json_config = {}
-
-        self._protocol = "file://"
-        self._base_path = DeltaDataLayerBuilder.DEFAULT_BASE_PATH
-        self._project_data_name = DeltaDataLayerBuilder.DEFAULT_PROJECT_DATA_NAME
-        self._app_name = "DeltaLayerLib"
-        self._master = "local[*]"
-        self._configs = {}
-        self._raw_subdir = DeltaDataLayerBuilder.DEFAULT_RAW_SUBDIR
-        self._clean_subdir = DeltaDataLayerBuilder.DEFAULT_CLEAN_SUBDIR
-        self._curated_subdir = DeltaDataLayerBuilder.DEFAULT_CURATED_SUBDIR
-
-        if "configs" in json_config:
-            for c in json_config["configs"]:
-                k = c.keys()[0]
-                self._configs[k](c[k])
-
-        for key, value in json_config:
-            if key == "configs":
-                continue
-            self.config(key, value)
-
-
-    def get_spark_builder(self) -> SparkSession.Builder:
-        """Creates and returns a configured SparkSession.Builder."""
-        builder = (
-            SparkSession.builder.appName(self._app_name).master(self._master)
-            .config("spark.sql.extensions", "io.delta.sql.DeltaSparkSessionExtension")
-            .config("spark.sql.catalog.spark_catalog", "org.apache.spark.sql.delta.catalog.DeltaCatalog")
-        )
-        if self._protocol.startswith("hdfs://"):
-            builder = (
-                builder
-                .config("spark.hadoop.fs.defaultFS", self._protocol)
-                .config("spark.hadoop.fs.hdfs.impl", "org.apache.hadoop.hdfs.DistributedFileSystem")
-            )
-
-        for k, v in self._configs.items():
-            builder = builder.config(k, v)
-
-        return builder
-
-    def build(self) -> "DeltaDataLayer":
-        """Constructs and returns a DeltaDataLayer initialized with this constructor."""
-        pass
-
-    def config(self, key: str, value: str):
-        """
-        Add a generic configuration using key and value. This method supports all keys to configure spark, which must
-        start with 'spark.'. Also supports attributes as "protocol", "app_name", "master" or "table_path".
-        """
-        if key.startswith("spark."):
-            self._configs[key] = value
-        else:
-            setattr(self, f"_{key}", value)
-        return self
-
-    def protocol(self, protocol: str):
-        """Define the protocol: file://, hdfs://, s3a://, etc."""
-        protocol = protocol.strip()
-        self._protocol = protocol if protocol.endswith("://") else protocol + "://"
-        return self
-
-    def raw_subdir(self, raw_subdir: str):
-        """Define the name of raw_subdir."""
-        self._raw_subdir = raw_subdir.strip().rstrip("/")
-        return self
-
-    def clean_subdir(self, clean_subdir: str):
-        """Define the name of clean subdirectory."""
-        self._clean_subdir = clean_subdir.strip().rstrip("/")
-        return self
-
-    def curated_subdir(self, curated_subdir: str):
-        """Define the name of clean subdirectory."""
-        self._curated_subdir = curated_subdir.strip().rstrip("/")
-        return self
-
-    def base_path(self, base_path: str):
-        """Defines the base *container_path where the Delta data is located."""
-        self._base_path = base_path.strip().rstrip("/")
-        return self
-
-    def project_name(self, project_data_name: str):
-        """Defines the name of the project data, which will be the name of the folder where the project's Delta data is hosted."""
-        self._project_data_name = project_data_name.strip()
-        return self
-
-    def app_name(self, app_name: str):
-        self._app_name = app_name.strip()
-        return self
-
-    def master(self, master: str):
-        self._master = master.strip()
-        return self
-
-    def process_level(self, process_level: int | str):
-        if isinstance(process_level, str):
-            process_level = self.process_levels().index(process_level)
-            if process_level==4:
-                process_level = -1
-        if -1 <= process_level <= 2:
-            self._process_level = process_level
-
-    def process_levels(self):
-        return self.DEFAULT_RAW_SUBDIR, self.DEFAULT_CLEAN_SUBDIR, self.DEFAULT_CURATED_SUBDIR, ""
-
-
-# ==============================================================
-# BUILDER: DeltaDataLayerBuilder
-# ==============================================================
-class DeltaDataLayerBuilder(AbstractDeltaDataLayerBuilder):
-
-    def build(self) -> "DeltaDataLayer":
-        """Constructs and returns a DeltaDataLayer initialized with this constructor."""
-        delta_layer = DeltaDataLayer(builder=self)
-        return delta_layer
-
-    def built_configuration(self):
-        return ConfigDeltaDataLayer(builder=self)
-
-
 
 # ==============================================================
 # CLASS: PathConfigDeltaDataLayer
 # ==============================================================
-class PathConfigDeltaDataLayer:
+class PathConfigDeltaDataLayer(PortadaDeltaConstants):
     """
     Configuration class which dynamically determine the *container_path where the data will be stored based on the configuration:
         - The protocol indicates the file system used, as well as the host and listening port when necessary. For
@@ -191,17 +32,18 @@ class PathConfigDeltaDataLayer:
     def __init__(self, cfg_json: dict = None):
         if cfg_json is not None:
             self._spark_builder = cfg_json["_spark_builder"] if "_spark_builder" in cfg_json else SparkSession.builder
-            self._base_path = cfg_json["_base_path"] if "_base_path" in cfg_json else os.path.abspath(AbstractDeltaDataLayerBuilder.DEFAULT_BASE_PATH)
+            self._base_path = cfg_json["_base_path"] if "_base_path" in cfg_json else os.path.abspath(
+                self.DEFAULT_BASE_PATH)
             self._protocol = cfg_json["_protocol"] if "_protocol" in cfg_json else "file://"
             self._project_data_name = cfg_json[
-                "_project_data_name"] if "_project_data_name" in cfg_json else AbstractDeltaDataLayerBuilder.DEFAULT_PROJECT_DATA_NAME
+                "_project_data_name"] if "_project_data_name" in cfg_json else self.DEFAULT_PROJECT_DATA_NAME
             self.spark = cfg_json["spark"] if "spark" in cfg_json else None
         else:
             self._spark_builder = SparkSession.builder
             self.spark = None
-            self._base_path = os.path.abspath(AbstractDeltaDataLayerBuilder.DEFAULT_BASE_PATH)
+            self._base_path = os.path.abspath(self.DEFAULT_BASE_PATH)
             self._protocol = "file://"
-            self._project_data_name = AbstractDeltaDataLayerBuilder.DEFAULT_PROJECT_DATA_NAME
+            self._project_data_name = self.DEFAULT_PROJECT_DATA_NAME
 
     @property
     def protocol(self):
@@ -220,15 +62,17 @@ class PathConfigDeltaDataLayer:
         return self._spark_builder
 
     @spark_builder.setter
-    def spark_builder(self, some_builder: SparkSession.Builder | DeltaDataLayerBuilder):
-        if isinstance(some_builder, DeltaDataLayerBuilder):
-            self._spark_builder = some_builder.get_spark_builder()
-        elif isinstance(some_builder, SparkSession.Builder):
+    def spark_builder(self, some_builder):
+
+        if isinstance(some_builder, SparkSession.Builder):
             self._spark_builder = some_builder
         else:
-            erro_message = "Incompatible builder. Only builders of type 'DeltaDataLayerBuilder' or 'SparkSession.Builder' are accepted."
-            logger.error(erro_message)
-            raise Exception(erro_message)
+            try:
+                self._spark_builder = some_builder.get_spark_builder()
+            except AttributeError as e:
+                erro_message = "Incompatible builder. Only builders of type 'DeltaDataLayerBuilder' or 'SparkSession.Builder' are accepted."
+                logger.error(erro_message)
+                raise Exception(erro_message)
 
     @property
     def base_path(self):
@@ -328,29 +172,32 @@ class ConfigDeltaDataLayer(PathConfigDeltaDataLayer):
             raw data, 'silver' for the transition from raw data to clean data or data prepared for processing, and 'gold'
             for the transition from clean data to cured data ready for use.
         """
-    def __init__(self, builder: AbstractDeltaDataLayerBuilder = None, cfg_json: dict = None):
-        self._process_context=""
-        self._process_level_dirs_ = [AbstractDeltaDataLayerBuilder.DEFAULT_RAW_SUBDIR,
-                                     AbstractDeltaDataLayerBuilder.DEFAULT_CURATED_SUBDIR,
-                                     AbstractDeltaDataLayerBuilder.DEFAULT_PROJECT_DATA_NAME,
+    def __init__(self, builder = None, cfg_json: dict = None):
+        self._save_lineage_on_store=False
+        self._transformer_process_name= ""
+        self._transformer_block_name=""
+        self._process_level_dirs_ = [self.DEFAULT_RAW_SUBDIR,
+                                     self.DEFAULT_CURATED_SUBDIR,
+                                     self.DEFAULT_PROJECT_DATA_NAME,
                                      ""]
         super().__init__(cfg_json)
         if builder is not None:
             self._spark_builder = builder.get_spark_builder()
             self._base_path = builder._base_path
             self._protocol = builder._protocol
-            self._process_level_dirs_[AbstractDeltaDataLayerBuilder.RAW_PROCESS_LEVEL] = builder._raw_subdir
-            self._process_level_dirs_[AbstractDeltaDataLayerBuilder.CLEAN_PROCESS_LEVEL] = builder._clean_subdir
-            self._process_level_dirs_[AbstractDeltaDataLayerBuilder.CURATED_PROCESS_LEVEL] = builder._curated_subdir
+            self._process_level_dirs_[self.RAW_PROCESS_LEVEL] = builder._raw_subdir
+            self._process_level_dirs_[self.CLEAN_PROCESS_LEVEL] = builder._clean_subdir
+            self._process_level_dirs_[self.CURATED_PROCESS_LEVEL] = builder._curated_subdir
             self._project_data_name = builder._project_data_name
             self._current_process_level = builder._process_level
         elif cfg_json is not None:
-            self._process_level_dirs_ = cfg_json["_process_level_dirs_"] if "_process_level_dirs_" in cfg_json else [AbstractDeltaDataLayerBuilder.DEFAULT_RAW_SUBDIR,
-                                                                                                                    AbstractDeltaDataLayerBuilder.DEFAULT_CURATED_SUBDIR,
-                                                                                                                    AbstractDeltaDataLayerBuilder.DEFAULT_PROJECT_DATA_NAME,
+            self._process_level_dirs_ = cfg_json["_process_level_dirs_"] if "_process_level_dirs_" in cfg_json else [
+                self.DEFAULT_RAW_SUBDIR,
+                self.DEFAULT_CURATED_SUBDIR,
+                self.DEFAULT_PROJECT_DATA_NAME,
                                                                                                                     ""]
             self._current_process_level= cfg_json["_current_process_level"] if "_current_process_level" in cfg_json else -1
-            self._process_context = cfg_json["_process_context"] if "_process_context" in cfg_json else ""
+            self._transformer_process_name = cfg_json["_transformer_process_name"] if "_transformer_process_name" in cfg_json else ""
             self.spark = cfg_json["spark"] if "spark" in cfg_json else None
         else:
             self._current_process_level=-1
@@ -377,7 +224,7 @@ class ConfigDeltaDataLayer(PathConfigDeltaDataLayer):
         Name for the last level or stage of the data
         :return:
         """
-        return self._process_level_dirs_[DeltaDataLayerBuilder.CURATED_PROCESS_LEVEL]
+        return self._process_level_dirs_[self.CURATED_PROCESS_LEVEL]
 
     @property
     def raw_subdir(self):
@@ -385,7 +232,7 @@ class ConfigDeltaDataLayer(PathConfigDeltaDataLayer):
         Name for the first level or stage of the data
         :return:
         """
-        return self._process_level_dirs_[DeltaDataLayerBuilder.RAW_PROCESS_LEVEL]
+        return self._process_level_dirs_[self.RAW_PROCESS_LEVEL]
 
     @property
     def clean_subdir(self):
@@ -393,21 +240,23 @@ class ConfigDeltaDataLayer(PathConfigDeltaDataLayer):
         Name for the middle level or stage of the data
         :return:
         """
-        return self._process_level_dirs_[DeltaDataLayerBuilder.CLEAN_PROCESS_LEVEL]
+        return self._process_level_dirs_[self.CLEAN_PROCESS_LEVEL]
 
     @property
-    def process_context_name(self):
+    def transformer_name(self):
         """
         Name of the context understood as the concatenation of processes executed so far in the processing of data.
         :return:
         """
-        return self._process_context
+        if self._transformer_block_name:
+            pre = f"{self._transformer_block_name}."
+        else:
+            pre = ""
+        return f"{pre}{self._transformer_process_name}"
 
-    @process_context_name.setter
-    def process_context_name(self, value):
-        if value is None:
-            value = ""
-        self._process_context = str(value)
+    @property
+    def save_lineage_on_store(self):
+        return self._save_lineage_on_store
 
     @staticmethod
     def _flatten_table_name(*table_name):
@@ -427,6 +276,7 @@ class ConfigDeltaDataLayer(PathConfigDeltaDataLayer):
             process_level_dir = self._process_level_dirs_[self._current_process_level]
         else:
             process_level_dir = f"{process_level_dir.rstrip("/")}/"
+
         if len(table_path) == 1 and re.match(r"\w+://.*", table_path[0]):
             p = re.compile(f"{self.protocol}{self.base_path}/(.*)")
             ret = re.sub(p,"\\g<1>", table_path[0], 0)
@@ -456,8 +306,8 @@ class ConfigDeltaDataLayer(PathConfigDeltaDataLayer):
             table_path = args
         if process_level_dir is None:
             process_level_dir=self._process_level_dirs_[self._current_process_level]
-
-        process_level_dir = f"{process_level_dir.rstrip("/")}/"
+        if process_level_dir:
+            process_level_dir = f"{process_level_dir.rstrip("/")}/"
         if len(table_path)==1 and re.match(r"\w+://.*", table_path[0]):
             ret = table_path[0]
         else:
@@ -514,7 +364,7 @@ class ConfigDeltaDataLayer(PathConfigDeltaDataLayer):
             "_process_level_dirs_": self._process_level_dirs_,
             "_project_data_name": self._project_data_name,
             "_current_process_level": self._current_process_level,
-            "_process_context":self._process_context,
+            "_transformer_process_name":self._transformer_process_name,
             "spark": self.spark,
         }
 
@@ -548,9 +398,9 @@ class BaseDeltaDataLayer(ConfigDeltaDataLayer):
    Base Delta Data Layer with Spark configurable via Builder.
    """
 
-    def __init__(self, builder: AbstractDeltaDataLayerBuilder = None, cfg_json: dict = None):
+    def __init__(self, builder = None, cfg_json: dict = None):
         super().__init__(builder=builder, cfg_json=cfg_json)
-        self._a_log_process_info=[{}]
+        self._a_log_process_info=None
 
     @property
     def log_process_info(self):
@@ -558,16 +408,21 @@ class BaseDeltaDataLayer(ConfigDeltaDataLayer):
         Info value stored for log_process
         :return:
         """
+        if len(self._a_log_process_info):
+            self._a_log_process_info.append({})
         return self._a_log_process_info[-1]
 
-    @log_process_info.setter
-    def log_process_info(self, value):
-        self._a_log_process_info.append(value)
+    # @log_process_info.setter
+    # def log_process_info(self, value: dict):
+    #     self._a_log_process_info.append(value)
 
-    def _clean_log_process_info(self):
-        del self._a_log_process_info[-1]
-        if len(self._a_log_process_info)==0:
+    def clean_log_process_info(self, removing_last=False):
+        if removing_last and self._a_log_process_info is not None and len(self._a_log_process_info)>0:
+            del self._a_log_process_info[-1]
+        if self._a_log_process_info is None:
             self._a_log_process_info = [{}]
+        else:
+            self._a_log_process_info.append({})
 
     def subdirs_list(self, *container_path, process_level_dir=None):
         """Returns subdirectories within an HDFS *container_path (without using os.listdir)."""
@@ -634,6 +489,74 @@ class BaseDeltaDataLayer(ConfigDeltaDataLayer):
         fs_ex = FileSystemTaskExecutor(self.get_configuration())
         return fs_ex.path_exists(path) and fs_ex.is_json_type(path)
 
+    def create_data_frame(self, data, schema=None, sampling_ratio=None, verify_schema=True):
+        """
+        Creates a :class:`DataFrame` from an :class:`RDD`, a list, a :class:`pandas.DataFrame`
+        or a :class:`numpy.ndarray`.
+
+        Parameters
+        ----------
+        data : :class:`RDD` or iterable
+            an RDD of any kind of SQL data representation (:class:`Row`,
+            :class:`tuple`, ``int``, ``boolean``, etc.), or :class:`list`,
+            :class:`pandas.DataFrame` or :class:`numpy.ndarray`.
+        schema : :class:`pyspark.sql.types.DataType`, str or list, optional
+            a :class:`pyspark.sql.types.DataType` or a datatype string or a list of
+            column names, default is None. The data type string format equals to
+            :class:`pyspark.sql.types.DataType.simpleString`, except that top level struct type can
+            omit the ``struct<>``.
+
+            When ``schema`` is a list of column names, the type of each column
+            will be inferred from ``data``.
+
+            When ``schema`` is ``None``, it will try to infer the schema (column names and types)
+            from ``data``, which should be an RDD of either :class:`Row`,
+            :class:`namedtuple`, or :class:`dict`.
+
+            When ``schema`` is :class:`pyspark.sql.types.DataType` or a datatype string, it must
+            match the real data, or an exception will be thrown at runtime. If the given schema is
+            not :class:`pyspark.sql.types.StructType`, it will be wrapped into a
+            :class:`pyspark.sql.types.StructType` as its only field, and the field name will be
+            "value". Each record will also be wrapped into a tuple, which can be converted to row
+            later.
+        sampling_ratio : float, optional
+            the sample ratio of rows used for inferring. The first few rows will be used
+            if ``samplingRatio`` is ``None``.
+        verify_schema : bool, optional
+            verify data types of every row against schema. Enabled by default.
+
+        Returns
+        -------
+        :class:`DataFrame`
+        """
+        if self._transformer_process_name:
+            n = f"created_by_{self._transformer_process_name}"
+        else:
+            n = "CREATED_BY_UNKNOWN"
+        return TracedDataFrame(self.spark.createDataFrame(data=data, schema=schema, samplingRatio=sampling_ratio, verifySchema=verify_schema), source_name=n)
+
+    def data_frame_from_range(self, start, end=None, step=1, num_partitions=None):
+        """
+        Create a :class:`DataFrame` with single :class:`pyspark.sql.types.LongType` column named
+        ``id``, containing elements in a range from ``start`` to ``end`` (exclusive) with
+        step value ``step``.
+
+        Parameters
+        ----------
+        start : int
+            the start value
+        end : int, optional
+            the end value (exclusive)
+        step : int, optional
+            the incremental step (default: 1)
+        num_partitions : int, optional
+            the number of partitions of the DataFrame
+
+        Returns
+        -------
+        :class:`DataFrame`
+        """
+        return TracedDataFrame(self.spark.range(start=start, end=end, step=step, numPartitions=num_partitions), source_name="FROM_MEMORY")
 
 # ==============================================================
 # CLASS: DeltaDataLayer
@@ -644,10 +567,46 @@ class DeltaDataLayer(BaseDeltaDataLayer):
     Delta Data Layer with Spark configurable via DeltaDataLayerBuilder.
     """
 
-    def __init__(self, builder: AbstractDeltaDataLayerBuilder = None, cfg_json: dict = None):
+    def __init__(self, builder = None, cfg_json: dict = None):
         super().__init__(builder=builder, cfg_json=cfg_json)
         self.log_storage=False
         self.source_path=None
+
+    def _get_lineage(self, stored_log_id:str, process_name:str, stage:int, target_path, target_version, df:TracedDataFrame):
+        data_lineage_list = []
+        transformations = df.transformations
+
+        for i, t in enumerate(transformations):
+            change_types = []
+            if len(t["source_dataframes"]) > 1:
+                change_types.append("new_dataframe")
+            if len(t["added_columns"]) > 0:
+                change_types.append("add_columns")
+            if len(t["removed_columns"]) > 0:
+                change_types.append("remove_columns")
+            if t["operation"] in TRANSFORMING_METHODS:
+                change_types.append("modify_columns")
+            df_name = df.get_partial_large_name(i)
+            data_lineage = {
+                "log_id": str(uuid.uuid4()),
+                "timestamp": datetime.now(UTC).isoformat(),
+                "stored_log_id": stored_log_id,
+                "process": process_name,
+                "stage": stage,
+                "dataframe_name": df_name,
+                "source_path": self._resolve_relative_path(df.source_name),
+                "source_version": df.source_version,
+                "target_path": target_path,
+                "target_version": target_version,
+                "change_types": change_types,
+                "change_action": t["operation"],
+                "arguments": t["arguments"],
+                "involved_dataframes": [{"name": tr.name, "large_name": tr.large_name} for tr in
+                                        t["source_dataframes"]],
+                "involved_columns": t["involved_columns"],
+            }
+            data_lineage_list.append(data_lineage)
+        return data_lineage_list
 
     def write_json(self, *table_path, df: DataFrame | TracedDataFrame, mode: str ="overwrite", process_level_dir: str = None, has_extension=False):
         """
@@ -673,14 +632,21 @@ class DeltaDataLayer(BaseDeltaDataLayer):
         if isinstance(df, TracedDataFrame):
             source_path = df.source_name
             source_version = df.source_version
+            df_name = df.name
+            df_large_name = df.large_name
             original_df = df.toSparkDataFrame()
+            transformations = df.transformations
         else:
-            source_path = "NEW"
+            source_path = "UNKNOWN"
             source_version = -1
             original_df = df
+            df_name = "UNKNOWN"
+            df_large_name = "UNKNOWN"
+            transformations = []
+            df = TracedDataFrame(df, source_name=source_path, source_version=source_version)
 
         path = self._resolve_path(*table_path, process_level_dir=process_level_dir, has_extension=has_extension)
-        name = self._resolve_relative_path(path)
+        target_path = self._resolve_relative_path(path)
         logger.info(f"Writing Delta → {path}")
         original_df.coalesce(1).write.mode(mode).json(path)
         if self.log_storage:
@@ -689,15 +655,34 @@ class DeltaDataLayer(BaseDeltaDataLayer):
             else:
                 from portada_data_layer.data_lake_metadata_manager import DataLakeMetadataManager
                 metadata=DataLakeMetadataManager(self.get_configuration())
-            metadata.log_storage(
+            if not self._transformer_process_name:
+                prev_tr_name = self._transformer_process_name
+                self._transformer_process_name = inspect.currentframe().f_back.f_code.co_name
+            else:
+                prev_tr_name = None
+
+            l_id = metadata.log_storage(
                 data_layer=self,
                 num_records=original_df.count(),
+                mode = mode,
+                new=not self.path_exists(path),
+                df_large_name=df_large_name,
                 source_path = source_path,
                 source_version= source_version,
-                target_path=name,
+                target_path=target_path,
                 target_version=-1,
             )
-        return TracedDataFrame(original_df, name, -1)
+            if self._save_lineage_on_store:
+                metadata.log_field_lineage(
+                    data_layer=self,
+                    dataframe=df,
+                    stored_log_id=l_id
+                )
+
+            if prev_tr_name is not None:
+                self._transformer_process_name = prev_tr_name
+
+        return TracedDataFrame(original_df, target_path, -1)
 
     def write_delta(self, *table_path, df: DataFrame | TracedDataFrame, mode: str = "overwrite"):
         """
@@ -721,32 +706,56 @@ class DeltaDataLayer(BaseDeltaDataLayer):
         if isinstance(df, TracedDataFrame):
             source_path = df.source_name
             source_version = df.source_version
+            df_name = df.name
+            df_large_name = df.large_name
             original_df = df.toSparkDataFrame()
+            transformations = df.transformations
         else:
-            source_path = "NEW"
+            source_path = "UNKNOWN"
             source_version = -1
             original_df = df
+            df_name = "UNKNOWN"
+            df_large_name = "UNKNOWN"
+            transformations = []
 
         path = self._resolve_path(*table_path)
-        name = self._resolve_relative_path(path)
+        target_path = self._resolve_relative_path(path)
         logger.info(f"Writing Delta → {path}")
         original_df.write.format("delta").mode(mode).save(path)
         version = self.get_delta_metatable(path).history(1).collect()[0]['version']
-        if self.log_storage:
+        if self.log_storage or self._save_lineage_on_store:
             if hasattr(self, "metadata"):
                 metadata = self.metadata
             else:
                 from portada_data_layer.data_lake_metadata_manager import DataLakeMetadataManager
                 metadata=DataLakeMetadataManager(self.get_configuration())
+            if not self._transformer_process_name:
+                prev_tr_name = self._transformer_process_name
+                self._transformer_process_name = inspect.currentframe().f_back.f_code.co_name
+            else:
+                prev_tr_name = None
+
+            if self._save_lineage_on_store:
+                data_lineage_list = self._get_lineage(df_name, df_large_name, transformations)
+            else:
+                data_lineage_list = []
+
             metadata.log_storage(
                 data_layer=self,
                 num_records=original_df.count(),
+                mode=mode,
+                new= not self.path_exists(path),
+                df_large_name=df_large_name,
                 source_path = source_path,
                 source_version= source_version,
-                target_path=name,
+                target_path=target_path,
                 target_version=version,
+                data_lineage_list=data_lineage_list,
             )
-        return TracedDataFrame(original_df, name, version)
+            if prev_tr_name is not None:
+                self._transformer_process_name = prev_tr_name
+
+        return TracedDataFrame(original_df, target_path, version)
 
 
     def read_json(self, *table_path, process_level_dir=None, has_extension=False) -> TracedDataFrame:

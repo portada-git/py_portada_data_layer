@@ -1,163 +1,33 @@
 import datetime
 import json
-from importlib.util import source_hash
-
 from pyspark.sql.types import StringType
-from portada_data_layer.data_lake_metadata_manager import DataLakeMetadataManager, enable_storage_log_for_method, process_log_for_method, process_log_context_for_method
-from portada_data_layer.delta_data_layer import DeltaDataLayerBuilder, DeltaDataLayer, FileSystemTaskExecutor
+
+from portada_data_layer.boat_fact_model import BoatFactDataModel
+from portada_data_layer.data_lake_metadata_manager import DataLakeMetadataManager, enable_storage_log_for_class, \
+    block_transformer_method, data_transformer_method, LineageCheckingType, enable_field_lineage_log_for_class
+from portada_data_layer.delta_data_layer import DeltaDataLayer, FileSystemTaskExecutor
+# from portada_data_layer import PortadaBuilder
 from portada_data_layer.traced_data_frame import TracedDataFrame
-from pyspark.sql import Row, functions as F, DataFrame
+from pyspark.sql import Row, functions as F
 from pyspark.sql.functions import col, year, month, dayofmonth
 import os
 import uuid
 import logging
 
-logger = logging.getLogger("delta_data_layer.boat_fact_data_layer")
-
-class BoatFactDataModel(dict):
-    CALCULATED_VALUE_FIELD = "calculated_value"
-    DEFAULT_VALUE_FIELD = "default_value"
-    ORIGINAL_VALUE_FIELD = "original_value"
-    STACKED_VALUE = "stacked_value"
-
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-
-    def __setitem__(self, key, value):
-        if self.__is_json_structured_filed(key):
-            if BoatFactDataModel.STACKED_VALUE in super().__getitem__(key):
-                super().__getitem__(key).__getitem__(BoatFactDataModel.STACKED_VALUE).append(value)
-            else:
-                super().__setitem__(key, {BoatFactDataModel.STACKED_VALUE: [value]})
-        else:
-            super().__setitem__(key, value)
-
-    def __getitem__(self, key):
-        if self.__is_json_structured_filed(key):
-            if BoatFactDataModel.STACKED_VALUE in super().__getitem__(key):
-                return super().__getitem__(key).__getitem__(BoatFactDataModel.STACKED_VALUE)[-1]
-            elif BoatFactDataModel.CALCULATED_VALUE_FIELD in super().__getitem__(key):
-                return  super().__getitem__(key).__getitem__(BoatFactDataModel.CALCULATED_VALUE_FIELD)
-            elif BoatFactDataModel.ORIGINAL_VALUE_FIELD in super().__getitem__(key):
-                return  super().__getitem__(key).__getitem__(BoatFactDataModel.ORIGINAL_VALUE_FIELD)
-            elif BoatFactDataModel.DEFAULT_VALUE_FIELD in super().__getitem__(key):
-                return super().__getitem__(key).__getitem__(BoatFactDataModel.DEFAULT_VALUE_FIELD)
-            else:
-                return ""
-        return super().__getitem__(key)
-
-    def get(self, key, default=None):
-        if key in self:
-            return self.__getitem__(key)
-        else:
-            return default
+logger = logging.getLogger("portada_data.delta_data_layer.boat_fact_ingestion")
 
 
-    def __is_json_structured_filed(self, key):
-        return key in self and BoatFactDataModel.is_structured_value(super().__getitem__(key))
-
-    @staticmethod
-    def is_structured_value(value):
-        return (isinstance(value, dict) and
-                (BoatFactDataModel.DEFAULT_VALUE_FIELD in value or
-                 BoatFactDataModel.ORIGINAL_VALUE_FIELD in value or
-                 BoatFactDataModel.CALCULATED_VALUE_FIELD in value or
-                 BoatFactDataModel.STACKED_VALUE in value))
-
-    @staticmethod
-    def get_value_of(value):
-        if value is None:
-            ret = ""
-        elif BoatFactDataModel.is_structured_value(value):
-            if BoatFactDataModel.STACKED_VALUE in value:
-                ret = value[BoatFactDataModel.STACKED_VALUE][-1] if value[BoatFactDataModel.STACKED_VALUE] else None
-            elif BoatFactDataModel.CALCULATED_VALUE_FIELD in value:
-                ret = value[BoatFactDataModel.CALCULATED_VALUE_FIELD]
-            elif BoatFactDataModel.ORIGINAL_VALUE_FIELD in value:
-                ret = value[BoatFactDataModel.ORIGINAL_VALUE_FIELD]
-            elif BoatFactDataModel.DEFAULT_VALUE_FIELD in value:
-                ret = value[BoatFactDataModel.DEFAULT_VALUE_FIELD]
-            else:
-                ret = ""
-        else:
-            ret = value
-        return str(ret)
-
-    @staticmethod
-    def get_obtaining_method_for(value):
-        if value is None:
-            ret = None
-        elif BoatFactDataModel.is_structured_value(value):
-            if BoatFactDataModel.STACKED_VALUE in value:
-                ret = f"{BoatFactDataModel.STACKED_VALUE}_{len(value[BoatFactDataModel.STACKED_VALUE])-1}"
-            elif BoatFactDataModel.CALCULATED_VALUE_FIELD in value:
-                ret = BoatFactDataModel.CALCULATED_VALUE_FIELD
-            elif BoatFactDataModel.ORIGINAL_VALUE_FIELD in value:
-                ret = BoatFactDataModel.ORIGINAL_VALUE_FIELD
-            elif BoatFactDataModel.DEFAULT_VALUE_FIELD in value:
-                ret = BoatFactDataModel.DEFAULT_VALUE_FIELD
-            else:
-                ret = "unknown_obtaining_method"
-        else:
-            ret = BoatFactDataModel.ORIGINAL_VALUE_FIELD
-        return str(ret)
-
-class BoatFactDataLayerBuilder(DeltaDataLayerBuilder):
-    def __init__(self, json_config=None):
-        super().__init__(json_config=json_config)
-
-    """
-    Builder to configure Spark + Delta Lake with a fluid and flexible API.
-    Example:
-        data_layer_builder = (
-            BoatFactDataLayerBuilder()
-            .protocol("hdfs://localhost:9000")
-            .table_path("/datalake/bronze")
-            .app_name("MyDeltaApp")
-            .config("spark.sql.shuffle.partitions", "8")
-        )
-        layer = data_layer_builder.build()
-        layer.open_spark()
-        ...
-        layer.close()
-    """
-
-    def build(self) -> "BoatFactDataLayer":
-        """Constructs and returns a DeltaDataLayer initialized with this constructor."""
-        delta_layer = BoatFactDataLayer(builder=self)
-        return delta_layer
-
-class BoatFactDataLayer(DeltaDataLayer):
-    def __init__(self, builder: BoatFactDataLayerBuilder = None):
+@enable_storage_log_for_class
+@enable_field_lineage_log_for_class
+class PortadaIngestion(DeltaDataLayer):
+    def __init__(self, builder=None):
         super().__init__(builder=builder)
-        self.get_value_of_udf=None
-        self.get_obtaining_method_for_udf=None
-        self._register_udfs()
-        self._current_process_level=0
-
-    def _register_udfs(self):
-        """Register UDF to extract values from structured fields as boat fact data model."""
-        # @F.udf(returnType=StringType())
-        def get_value_of(value):
-            if isinstance(value, Row):
-                value = value.asDict(recursive=True)
-            return BoatFactDataModel.get_value_of(value)
-        # data_layer.get_value_of_udf = get_value_of
-        self.register_udfs("get_value_of_udf", get_value_of, StringType())
-
-        # @F.udf(returnType=StringType())
-        def get_obtaining_method_for(value):
-            if isinstance(value, Row):
-                value = value.asDict(recursive=True)
-            return BoatFactDataModel.get_obtaining_method_for(value)
-        # data_layer.get_obtaining_method_for_udf = get_obtaining_method_for
-        self.register_udfs("get_obtaining_method_for_udf", get_obtaining_method_for, StringType())
+        self._current_process_level = 0
 
     # =====================================================
     # Ingestion process of entries
     # =====================================================
-    @process_log_context_for_method
-    @enable_storage_log_for_method
+    @block_transformer_method
     def ingest(self, *container_path, local_path: str):
         """
         Process a JSON input file:
@@ -171,20 +41,19 @@ class BoatFactDataLayer(DeltaDataLayer):
         logger.info(f"Starting ingestion process for {local_path}")
 
         #Copy original file from local to data lake and get data
-        data, dest_path = self.copy_ingested_raw_entries(*container_path, local_path=local_path, return_dest_path=True)
+        data, dest_path = self.copy_ingested_raw_data(*container_path, local_path=local_path, return_dest_path=True)
 
         # Classificació i desduplicació
         try:
-            self.save_raw_entries(*container_path, data={"source_path":dest_path,"data_json_array":data})
+            self.save_raw_data(*container_path, data={"source_path": dest_path, "data_json_array": data})
             logger.info("Classification/Deduplication process completed successfully.")
         except Exception as e:
             logger.error(f"Error during classification/deduplication: {e}")
             raise
         logger.info("Ingestion process completed successfully.")
 
-    @process_log_context_for_method
-    @process_log_for_method
-    def copy_ingested_raw_entries(self, *container_path, local_path: str, return_dest_path=False):
+    @data_transformer_method(description="Copy the original file to the FileSystem (HDFS/S3/file)")
+    def copy_ingested_raw_data(self, *container_path, local_path: str, return_dest_path=False):
         """
         Copy a file pointed by a local_path to a destination_path. The destination path is built using container_path.
         the methodology  used to buid destination_path is the following:
@@ -217,21 +86,26 @@ class BoatFactDataLayer(DeltaDataLayer):
         try:
             with open(local_path) as f:
                 data = json.load(f)
-            logger.info(f"Read {len(data)} entries from loca file.")
+        except json.decoder.JSONDecodeError as e:
+            with open(local_path) as f:
+                data = f.read()
         except Exception as e:
             logger.error(f"Error reading file {local_path}: {e}")
             raise
+        logger.info(f"Read {len(data)} entries from loca file.")
 
         #Copia del fitxer original (bronze)
         fs_exec = FileSystemTaskExecutor(self.get_configuration())
         try:
+            file_extension = os.path.splitext(local_path)[1][1:]
             dest_path = fs_exec.copy_from_local(*container_path,
-                                                file_name_dest=fs_exec.date_random_file_name_generator("json"),
+                                                file_name_dest=fs_exec.date_random_file_name_generator(file_extension),
                                                 src_path=local_path, remove_local=True)
             dp = self._resolve_relative_path(dest_path)
             metadata = DataLakeMetadataManager(self.get_configuration())
-            metadata.log_storage(data_layer=self, source_path=local_path, target_path=dp)
-            logger.info(f"File copied to Hadoop file system in container: {container_path} ({local_path} -> {dest_path})")
+            metadata.log_storage(data_layer=self, source_path=local_path, target_path=dp, mode="overwrite", new=True)
+            logger.info(
+                f"File copied to Hadoop file system in container: {container_path} ({local_path} -> {dest_path})")
         except Exception as e:
             logger.error(f"Error copying original file: {e}")
             raise
@@ -239,13 +113,54 @@ class BoatFactDataLayer(DeltaDataLayer):
             return data, dest_path
         return data
 
-    @process_log_context_for_method
-    @process_log_for_method
-    def save_raw_entries(self, *container_path, df=None, data: dict | list =None):
+    def save_raw_data(self, *container_path, df=None, data: dict | list = None):
+        pass
+
+    def read_raw_data(self, *container_path, **kwargs):
+        pass
+
+
+class NewsExtractionIngestion(PortadaIngestion):
+    def __init__(self, builder=None):
+        super().__init__(builder=builder)
+        self.get_value_of_udf = None
+        self.get_obtaining_method_for_udf = None
+        self._register_udfs()
+
+    def _register_udfs(self):
+        """Register UDF to extract values from structured fields as boat fact data model."""
+
+        # @F.udf(returnType=StringType())
+        def get_value_of(value):
+            if isinstance(value, Row):
+                value = value.asDict(recursive=True)
+            return BoatFactDataModel.get_value_of(value)
+
+        # data_layer.get_value_of_udf = get_value_of
+        self.register_udfs("get_value_of_udf", get_value_of, StringType())
+
+        # @F.udf(returnType=StringType())
+        def get_obtaining_method_for(value):
+            if isinstance(value, Row):
+                value = value.asDict(recursive=True)
+            return BoatFactDataModel.get_obtaining_method_for(value)
+
+        # data_layer.get_obtaining_method_for_udf = get_obtaining_method_for
+        self.register_udfs("get_obtaining_method_for_udf", get_obtaining_method_for, StringType())
+
+        @F.udf(StringType())
+        def generate_uid():
+            return str(uuid.uuid4())
+
+        self.generate_uid_udf = generate_uid
+
+    @data_transformer_method(
+        description="Extract values from original files and organize them by news publication metadata.")
+    def save_raw_data(self, *container_path, df=None, data: dict | list = None):
         """
         Save an array of ship entries (JSON) adding or updating them in files organized by:  date_path / publication_name / y / m / d / publication_edition
         """
-
+        super().save_raw_data(*container_path, df=df, data=data)
         if not df and data is None:
             raise ValueError("A DataFrame or JSON list must be passed.")
 
@@ -258,7 +173,8 @@ class BoatFactDataLayer(DeltaDataLayer):
                 data_json_array = data
                 source_path = "UNKNOWN"
             df = TracedDataFrame(
-                df=self.spark.read.json(self.spark.sparkContext.parallelize([json.dumps(obj) for obj in data_json_array])),
+                df=self.spark.read.json(
+                    self.spark.sparkContext.parallelize([json.dumps(obj) for obj in data_json_array])),
                 source_name=source_path,
             )
         elif isinstance(df, TracedDataFrame):
@@ -268,13 +184,13 @@ class BoatFactDataLayer(DeltaDataLayer):
             source_path = "UNKNOWN"
 
         if not self.is_initialized():
-            error_msg = "BoatFactDataLayer instance is not initializer. start_spark() method must be called first."
+            error_msg = "PortadaIngestion instance is not initializer. start_spark() method must be called first."
             logger.error(error_msg)
             raise ValueError(error_msg)
 
-        #Get value from boat fact data model format
-        uuid_udf = F.udf(lambda: str(uuid.uuid4()))
-        df = df.withColumn("entry_id", uuid_udf())
+        # uuid_udf = F.udf(generate_uuid, StringType())
+        df = df.withColumn("entry_id", self.generate_uid_udf())
+        df.persist()
         df = df.withColumn("publication_name_value", F.lower(self.get_value_of_udf(F.col("publication_name"))))
         df = df.withColumn("publication_edition_value", F.lower(self.get_value_of_udf(F.col("publication_edition"))))
         df = df.withColumn("parsed_text_value", self.get_value_of_udf(F.col("parsed_text")))
@@ -315,19 +231,21 @@ class BoatFactDataLayer(DeltaDataLayer):
             # If file exists, load it and detect duplicates
             if self.json_file_exist(full_path):
                 existing_df = self.read_json(full_path)
+                existing_df = existing_df.localCheckpoint()
                 merged_df = subset.unionByName(existing_df, allowMissingColumns=True).dropDuplicates(["parsed_text_value"])
                 duplicates = subset.count() + existing_df.count() - merged_df.count()
                 regs += merged_df.count()
                 if duplicates > 0:
-                    duplicated_df = subset.join(merged_df, on="entry_id", how="left_anti")
+                    duplicated_df = existing_df.join(merged_df, on="entry_id", how="left_anti")
+                    duplicated_df = subset.join(duplicated_df.select("parsed_text_value"), on="parsed_text_value", how="left").unionByName(duplicated_df, allowMissingColumns=True)
                     metadata.log_duplicates(
                         data_layer=self,
                         action=DataLakeMetadataManager.DELETE_DUPLICATES_ACTION,
                         publication=pub_name,
-                        date=f"{year_:04d}_{month_:02d}_{day_:02d}",
+                        date={"year": year_, "month": month_, "day": day_},
                         edition=edition,
                         duplicates_df=duplicated_df,
-                        source_path= source_path,
+                        source_path=source_path,
                         source_version=source_version,
                         target_path=full_path
                     )
@@ -341,7 +259,8 @@ class BoatFactDataLayer(DeltaDataLayer):
 
         logger.info(f"{regs} entries was saved")
 
-    def read_raw_entries(self, *container_path, publication_name: str = None, y: int | str = None, m: int | str = None, d: int | str = None, edition: str = None):
+    def read_raw_data(self, *container_path, publication_name: str = None, y: int | str = None, m: int | str = None,
+                      d: int | str = None, edition: str = None):
         base_path = f"{self._resolve_path(*container_path, process_level_dir=self.raw_subdir)}"
         if isinstance(y, int):
             y = f"{y:04d}"
@@ -367,7 +286,8 @@ class BoatFactDataLayer(DeltaDataLayer):
         logger.info(f"{0 if df is None else df.count()} entries was read")
         return df
 
-    def get_missing_dates_from_a_newspaper(self, *container_path, publication_name:str, start_date: str=None, end_date: str=None):
+    def get_missing_dates_from_a_newspaper(self, *container_path, publication_name: str, start_date: str = None,
+                                           end_date: str = None):
         publication_name = publication_name.lower()
         p = list(container_path)
         p.append(publication_name)
@@ -376,7 +296,7 @@ class BoatFactDataLayer(DeltaDataLayer):
         if self.path_exists(p0):
             years = self.subdirs_list(p0)
             years = sorted(years)
-            if len(years)>0:
+            if len(years) > 0:
                 year0 = years[0]
                 year1 = years[-1]
                 p0.append(year0)
@@ -418,9 +338,87 @@ class BoatFactDataLayer(DeltaDataLayer):
             raise Exception(f"The container {'/'.join(p0)} doesn't exist.")
 
 
+class KnownEntitiesIngestion(PortadaIngestion):
+    __first_container_path = "known_entities"
 
-    # def flatten_fields(self, *container_path, df: DataFrame):
-    #     pass
-    #
-    # def clean_fields(self, *container_path, df: DataFrame):
-    #     pass
+    def __resolve_container_path(self, *container_path):
+        if len(container_path) > 0 and isinstance(container_path[0], list) or isinstance(container_path[0], tuple):
+            container_path = container_path[0]
+        if len(container_path) > 0 and isinstance(container_path[0], str) and not container_path[0].startswith(
+                self.__first_container_path):
+            container_path = list(container_path)
+        if len(container_path) == 0:
+            raise Exception("The name of entity or the container_path is necessary")
+        container_path.insert(0, self.__first_container_path)
+        return container_path
+
+    def copy_ingested_raw_data(self, *container_path, local_path: str, return_dest_path=False):
+        super().copy_ingested_raw_data(self.__first_container_path, local_path=local_path,
+                                       return_dest_path=return_dest_path)
+
+    def save_raw_data(self, *container_path, df=None, data: dict | list = None):
+        super().save_raw_data(*container_path, df=df, data=data)
+        container_path = self.__resolve_container_path(*container_path)
+        if not df and data is None:
+            raise ValueError("A DataFrame or JSON list must be passed.")
+
+        source_version = -1
+        if df is None:
+            if isinstance(data, dict) and "source_path" in data:
+                source_path = self._resolve_relative_path(data["source_path"])
+                data = data["data"]
+            else:
+                data = data
+                source_path = "UNKNOWN"
+            if isinstance(data, dict):
+                data = data["names"]
+            elif isinstance(data, str):
+                if data.startswith("{"):
+                    data = json.load(data)["names"]
+                elif data.startswith("["):
+                    data = json.load(data)
+                else:
+                    data = data.split("\n")
+            df = TracedDataFrame(
+                df=self.spark.createDataFrame([(data,)], ["names"]),
+                source_name=source_path,
+            )
+        elif not isinstance(df, TracedDataFrame):
+            source_path = "UNKNOWN"
+            df = TracedDataFrame(df, source_name=source_path)
+
+        if not self.is_initialized():
+            error_msg = "PortadaIngestion instance is not initializer. start_spark() method must be called first."
+            logger.error(error_msg)
+            raise ValueError(error_msg)
+
+        base_path = f"{self._resolve_path(*container_path)}"
+        self.write_json(base_path, df=df, mode="overwrite")
+
+    def copy_ingested_entities(self, entity: str, local_path: str, return_dest_path=False):
+        return super().copy_ingested_raw_data(self.__first_container_path, local_path=local_path,
+                                              return_dest_path=return_dest_path)
+
+    def save_raw_entities(self, entity: str, df=None, data: dict | list = None):
+        return self.save_raw_data(entity, df=df, data=data)
+
+
+class BoatFactIngestion(NewsExtractionIngestion):
+    __container_path = "ship_entries"
+
+    def copy_ingested_raw_data(self, local_path: str, return_dest_path=False):
+        return super().copy_ingested_raw_data(self.__container_path, local_path=local_path,
+                                              return_dest_path=return_dest_path)
+
+    def save_raw_data(self, df=None, data: dict | list = None, *args, **kwargs):
+        return super().save_raw_data(self.__container_path, df=df, data=data)
+
+    def read_raw_data(self, publication_name: str = None, y: int | str = None, m: int | str = None, d: int | str = None,
+                      edition: str = None, *args, **kwargs):
+        return super().read_raw_data(self.__container_path, publication_name=publication_name, y=y, m=m, d=d,
+                                     edition=edition)
+
+    def get_missing_dates_from_a_newspaper(self, *container_path, publication_name: str, start_date: str = None,
+                                           end_date: str = None):
+        return super().get_missing_dates_from_a_newspaper(self.__container_path, publication_name=publication_name,
+                                                          start_date=start_date, end_date=end_date)

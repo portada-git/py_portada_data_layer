@@ -1,4 +1,6 @@
 data_lake_metadata_manager
 delta_data_layer
+portada_cleaning
 portada_data_layer
+portada_ingestion
 traced_data_frame
