@@ -1,7 +1,7 @@
 from setuptools import setup
 
 setup(name='py_portada_data_layer',
-      version='0.0.9',
+      version='0.0.10',
       description='Data layer for portada project for ETL process',
       author='PortADa team',
       author_email='jcbportada@gmail.com',
@@ -14,6 +14,8 @@ setup(name='py_portada_data_layer',
         'delta-spark==3.2.1',
         'hdfs==2.7.0',
         'py4j',
+        'pyyaml',
+        'xmltodict',
       ],
       python_requires='>=3.12',
       zip_safe=False)

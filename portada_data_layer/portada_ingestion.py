@@ -1,6 +1,9 @@
 import datetime
 import json
-from pyspark.sql.types import StringType
+
+import xmltodict as xmltodict
+import yaml
+from pyspark.sql.types import StringType, StructType, StructField, ArrayType
 
 from portada_data_layer.boat_fact_model import BoatFactDataModel
 from portada_data_layer.data_lake_metadata_manager import DataLakeMetadataManager, enable_storage_log_for_class, \
@@ -40,7 +43,7 @@ class PortadaIngestion(DeltaDataLayer):
 
         logger.info(f"Starting ingestion process for {local_path}")
 
-        #Copy original file from local to data lake and get data
+        # Copy original file from local to data lake and get data
         data, dest_path = self.copy_ingested_raw_data(*container_path, local_path=local_path, return_dest_path=True)
 
         # Classificació i desduplicació
@@ -86,15 +89,22 @@ class PortadaIngestion(DeltaDataLayer):
         try:
             with open(local_path) as f:
                 data = json.load(f)
-        except json.decoder.JSONDecodeError as e:
-            with open(local_path) as f:
-                data = f.read()
+        except json.decoder.JSONDecodeError:
+            try:
+                with open(local_path) as f:
+                    data = yaml.safe_load(f)
+            except yaml.YAMLError:
+                try:
+                    with open(local_path) as f:
+                        data = xmltodict.parse(f.read())
+                except Exception as e:
+                    raise e
         except Exception as e:
             logger.error(f"Error reading file {local_path}: {e}")
             raise
         logger.info(f"Read {len(data)} entries from loca file.")
 
-        #Copia del fitxer original (bronze)
+        # Copia del fitxer original (bronze)
         fs_exec = FileSystemTaskExecutor(self.get_configuration())
         try:
             file_extension = os.path.splitext(local_path)[1][1:]
@@ -232,12 +242,14 @@ class NewsExtractionIngestion(PortadaIngestion):
             if self.json_file_exist(full_path):
                 existing_df = self.read_json(full_path)
                 existing_df = existing_df.localCheckpoint()
-                merged_df = subset.unionByName(existing_df, allowMissingColumns=True).dropDuplicates(["parsed_text_value"])
+                merged_df = subset.unionByName(existing_df, allowMissingColumns=True).dropDuplicates(
+                    ["parsed_text_value"])
                 duplicates = subset.count() + existing_df.count() - merged_df.count()
                 regs += merged_df.count()
                 if duplicates > 0:
                     duplicated_df = existing_df.join(merged_df, on="entry_id", how="left_anti")
-                    duplicated_df = subset.join(duplicated_df.select("parsed_text_value"), on="parsed_text_value", how="left").unionByName(duplicated_df, allowMissingColumns=True)
+                    duplicated_df = subset.join(duplicated_df.select("parsed_text_value"), on="parsed_text_value",
+                                                how="left").unionByName(duplicated_df, allowMissingColumns=True)
                     metadata.log_duplicates(
                         data_layer=self,
                         action=DataLakeMetadataManager.DELETE_DUPLICATES_ACTION,
@@ -347,14 +359,16 @@ class KnownEntitiesIngestion(PortadaIngestion):
         if len(container_path) > 0 and isinstance(container_path[0], str) and not container_path[0].startswith(
                 self.__first_container_path):
             container_path = list(container_path)
+            container_path.insert(0, self.__first_container_path)
         if len(container_path) == 0:
             raise Exception("The name of entity or the container_path is necessary")
-        container_path.insert(0, self.__first_container_path)
         return container_path
 
     def copy_ingested_raw_data(self, *container_path, local_path: str, return_dest_path=False):
-        super().copy_ingested_raw_data(self.__first_container_path, local_path=local_path,
-                                       return_dest_path=return_dest_path)
+        container_path = self.__resolve_container_path(*container_path)
+        container_path.insert(1, "original_files")
+        return super().copy_ingested_raw_data(*container_path, local_path=local_path,
+                                              return_dest_path=return_dest_path)
 
     def save_raw_data(self, *container_path, df=None, data: dict | list = None):
         super().save_raw_data(*container_path, df=df, data=data)
@@ -370,7 +384,7 @@ class KnownEntitiesIngestion(PortadaIngestion):
             else:
                 data = data
                 source_path = "UNKNOWN"
-            if isinstance(data, dict):
+            if isinstance(data, dict) and "names" in data:
                 data = data["names"]
             elif isinstance(data, str):
                 if data.startswith("{"):
@@ -378,9 +392,20 @@ class KnownEntitiesIngestion(PortadaIngestion):
                 elif data.startswith("["):
                     data = json.load(data)
                 else:
-                    data = data.split("\n")
+                    try:
+                        data = yaml.reader(data)
+                    except yaml.YAMLError:
+                        try:
+                            data = xmltodict.parse(data)
+                        except Exception as e:
+                            error_msg = "Known entities list must have an accepted format: json, yaml or xml."
+                            logger.error(error_msg)
+                            raise SyntaxError(error_msg)
+            structured_data = [{"name": k, "voices": data[k]} for k in data]
+            schema = StructType(
+                [StructField("name", StringType(), False), StructField("voices", ArrayType(StringType()))])
             df = TracedDataFrame(
-                df=self.spark.createDataFrame([(data,)], ["names"]),
+                df=self.spark.createDataFrame(structured_data, schema=schema),
                 source_name=source_path,
             )
         elif not isinstance(df, TracedDataFrame):
@@ -393,15 +418,22 @@ class KnownEntitiesIngestion(PortadaIngestion):
             raise ValueError(error_msg)
 
         base_path = f"{self._resolve_path(*container_path)}"
-        self.write_json(base_path, df=df, mode="overwrite")
+        self.write_delta(base_path, df=df, mode="overwrite")
 
     def copy_ingested_entities(self, entity: str, local_path: str, return_dest_path=False):
-        return super().copy_ingested_raw_data(self.__first_container_path, local_path=local_path,
-                                              return_dest_path=return_dest_path)
+        return self.copy_ingested_raw_data(entity, local_path=local_path,
+                                           return_dest_path=return_dest_path)
 
     def save_raw_entities(self, entity: str, df=None, data: dict | list = None):
         return self.save_raw_data(entity, df=df, data=data)
 
+    def read_raw_data(self, *container_path):
+        container_path= self.__resolve_container_path(*container_path)
+        df = self.read_delta(*container_path)
+        return df
+
+    def read_raw_entities(self, entity: str):
+        return self.read_raw_data(entity)
 
 class BoatFactIngestion(NewsExtractionIngestion):
     __container_path = "ship_entries"

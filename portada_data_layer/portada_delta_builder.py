@@ -48,6 +48,7 @@ class AbstractDeltaDataLayerBuilder(PortadaDeltaConstants):
         self._raw_subdir = self.DEFAULT_RAW_SUBDIR
         self._clean_subdir = self.DEFAULT_CLEAN_SUBDIR
         self._curated_subdir = self.DEFAULT_CURATED_SUBDIR
+        self._transformer_block_name = ""
 
         if "configs" in json_config:
             for c in json_config["configs"]:
@@ -133,6 +134,10 @@ class AbstractDeltaDataLayerBuilder(PortadaDeltaConstants):
         self._master = master.strip()
         return self
 
+    def from_transformer_block_name(self, transformer_block_name):
+        self._transformer_block_name = transformer_block_name
+        return self
+
     def process_level(self, process_level: int | str):
         if isinstance(process_level, str):
             process_level = self.process_levels().index(process_level)
@@ -143,6 +148,7 @@ class AbstractDeltaDataLayerBuilder(PortadaDeltaConstants):
 
     def process_levels(self):
         return self.DEFAULT_RAW_SUBDIR, self.DEFAULT_CLEAN_SUBDIR, self.DEFAULT_CURATED_SUBDIR, ""
+
 
 # ==============================================================
 # BUILDER: DeltaDataLayerBuilder
@@ -183,19 +189,34 @@ class PortadaBuilder(DeltaDataLayerBuilder):
         layer.close()
     """
 
-    def build(self, type:str = None) -> "PortadaIngestion":
+    def build(self, type:str = None, as_config_layer:dict = None) -> "PortadaIngestion":
         """Constructs and returns a DeltaDataLayer initialized with this constructor."""
         if not type or type==self.DELTA_DATA_LAYER:
-            delta_layer = DeltaDataLayer(builder=self)
+            if as_config_layer:
+                delta_layer = DeltaDataLayer(as_config_layer)
+            else:
+                delta_layer = DeltaDataLayer(builder=self)
         elif type==self.NEWS_TYPE:
-            delta_layer = NewsExtractionIngestion(builder=self)
+            if as_config_layer:
+                delta_layer = NewsExtractionIngestion(as_config_layer)
+            else:
+                delta_layer = NewsExtractionIngestion(builder=self)
         elif type == self.BOAT_NEWS_TYPE:
-            delta_layer = BoatFactIngestion(builder=self)
+            if as_config_layer:
+                delta_layer = BoatFactIngestion(as_config_layer)
+            else:
+                delta_layer = BoatFactIngestion(builder=self)
         elif type==self.KNOWN_ENTITIES_TYPE:
-            delta_layer = KnownEntitiesIngestion(builder=self)
+            if as_config_layer:
+                delta_layer = KnownEntitiesIngestion(as_config_layer)
+            else:
+                delta_layer = KnownEntitiesIngestion(builder=self)
         elif type in self.CLASS_REGISTRY:
             cls = self.CLASS_REGISTRY[type]
-            return cls(builder=self)
+            if as_config_layer:
+                delta_layer = cls(as_config_layer)
+            else:
+                delta_layer = cls(builder=self)
         else:
             raise Exception(f"Unknown type {type}")
         return delta_layer
