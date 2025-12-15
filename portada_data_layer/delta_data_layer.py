@@ -268,7 +268,7 @@ class ConfigDeltaDataLayer(PathConfigDeltaDataLayer):
         self._save_lineage_on_store = v
 
 
-@staticmethod
+    @staticmethod
     def _flatten_table_name(*table_name):
         if len(table_name) == 1 and (type(table_name[0]) == tuple or type(table_name[0]) == list):
             table_path = table_name[0]
