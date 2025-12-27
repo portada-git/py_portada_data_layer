@@ -125,8 +125,10 @@ def __is_data_transformer(func, data_layer_key: str=None, dataframe_key: str = "
             num_records = resultat.count()
         elif isinstance(resultat, (list, tuple)):
             if len(resultat) >0 and isinstance(resultat[0], (DataFrame, TracedDataFrame)):
-                num_records = dataframes[0].count() if len(dataframes) > 0 else 0
                 dataframes = [r if isinstance(r, TracedDataFrame) else TracedDataFrame(r, "UNKNOWN") for r in resultat]
+                num_records =0
+                for r in dataframes:
+                    num_records += dataframes[0].count()
             else:
                 num_records = len(resultat)
         final = datetime.now(UTC)
@@ -629,6 +631,7 @@ class DataLakeMetadataManager(PathConfigDeltaDataLayer):
             source_version: Optional[int] = -1,
             target_path: Optional[str] = None,  # és el fitxer amb el qual es compara el sourc_epath.
             target_version: Optional[int] = -1,
+            uploaded_by: Optional[str] = None,
     ):
         """
         Logs duplicate detection.
@@ -640,10 +643,10 @@ class DataLakeMetadataManager(PathConfigDeltaDataLayer):
         # dup_base = f"metadata/duplicates_records/{safe_pub}/{date}/{edition}"
         # dup_base = self._resolve_path(dup_base)
         dup_base = self._resolve_path("metadata/duplicates_records")
-        dup_filter =f"publication_name_value='{publication}' AND publication_date_year_value={date['year']} AND publication_date_month_value={date['month']} AND publication_date_day_value={date['day']}"
+        dup_filter =f"lower(publication_name)='{publication.lower()}' AND publication_date_year={date['year']} AND publication_date_month={date['month']} AND publication_date_day={date['day']}"
 
         # Escriu els duplicats com a taula Delta
-        duplicates_df.write.partitionBy("publication_name_value", "publication_date_year_value", "publication_date_month_value", "publication_date_day_value", "publication_edition_value").mode("append").format(self.format).save(dup_base)
+        duplicates_df.write.partitionBy("publication_name", "publication_date_year", "publication_date_month", "publication_date_day", "publication_edition").mode("append").format(self.format).save(dup_base)
 
         # Recompte
         num_dups = duplicates_df.count()
@@ -661,9 +664,10 @@ class DataLakeMetadataManager(PathConfigDeltaDataLayer):
             target_path=self._resolve_relative_path(target_path),
             target_version=target_version,
             action=action,
-            publication=publication,
+            publication=publication.lower(),
             date=f"{date['year']:04d}-{date['month']:02d}-{date['day']:02d}",
-            edition=edition,
+            edition=edition.lower(),
+            uploaded_by=uploaded_by,
             duplicates=num_dups,
             duplicate_ids=ids,
             duplicates_filter=dup_filter,
@@ -759,16 +763,16 @@ class DataLakeMetadataManager(PathConfigDeltaDataLayer):
 
         self._write_log([entry], "error_log")
 
-    def _write_dataframe(self, df: TracedDataFrame):
-        """Common logging to the Data Lake."""
-        if df.source_version==-1:
-            n = df.name.replace("/*", "").replace("/", "___DIR_SEP___").replace(".", "___EXT___")
-            target_path = self._resolve_path("metadata", "values", n)
-        else:
-            target_path = self._resolve_path(df.source_name)
-        df.write.mode("overwrite").format("delta").save(target_path)
-        v = DeltaTable.forPath(self.spark, target_path).history(1).collect()[0]['version']
-        return self._resolve_relative_path(target_path), v
+    # def _write_dataframe(self, df: TracedDataFrame):
+    #     """Common logging to the Data Lake."""
+    #     if df.source_version==-1:
+    #         n = df.name.replace("/*", "").replace("/", "___DIR_SEP___").replace(".", "___EXT___")
+    #         target_path = self._resolve_path("metadata", "values", n)
+    #     else:
+    #         target_path = self._resolve_path(df.source_name)
+    #     df.write.mode("overwrite").format("delta").save(target_path)
+    #     v = DeltaTable.forPath(self.spark, target_path).history(1).collect()[0]['version']
+    #     return self._resolve_relative_path(target_path), v
 
     # ----------------------------------------------------------------------
     # 🔹 ESCRIPTURA GENERAL

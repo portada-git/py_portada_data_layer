@@ -1,4 +1,9 @@
+import datetime
 import logging
+import re
+
+from pyspark.sql import functions as F
+from pyspark.sql.types import StructField
 
 logger = logging.getLogger("portada_data.boat_fact_data_model")
 
@@ -7,12 +12,15 @@ class BoatFactDataModel(dict):
     DEFAULT_VALUE_FIELD = "default_value"
     ORIGINAL_VALUE_FIELD = "original_value"
     STACKED_VALUE = "stacked_value"
+    EXTRACTION_SOURCE_METHOD_FIELD = "extraction_source_method"
+    MORE_EXTRACTED_VALUES_FIELD = "more_extracted_values"
+    PUBLICATION_DATE_FIELD = "publication_date"
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
 
     def __setitem__(self, key, value):
-        if self.__is_json_structured_filed(key):
+        if self.__is_json_structured_field(key):
             if BoatFactDataModel.STACKED_VALUE in super().__getitem__(key):
                 super().__getitem__(key).__getitem__(BoatFactDataModel.STACKED_VALUE).append(value)
             else:
@@ -21,7 +29,7 @@ class BoatFactDataModel(dict):
             super().__setitem__(key, value)
 
     def __getitem__(self, key):
-        if self.__is_json_structured_filed(key):
+        if self.__is_json_structured_field(key):
             if BoatFactDataModel.STACKED_VALUE in super().__getitem__(key):
                 return super().__getitem__(key).__getitem__(BoatFactDataModel.STACKED_VALUE)[-1]
             elif BoatFactDataModel.CALCULATED_VALUE_FIELD in super().__getitem__(key):
@@ -40,8 +48,37 @@ class BoatFactDataModel(dict):
         else:
             return default
 
+    def reformat(self):
+        ret = {}
+        for key in self:
+            if self.__is_json_structured_field(key):
+                ret[key] = self[key]
+                ret[f"{key}_{self.EXTRACTION_SOURCE_METHOD_FIELD}"] = self.get_obtaining_method_for(super().__getitem__(key))
+                ret[f"{key}_{self.MORE_EXTRACTED_VALUES_FIELD}"] =[]
+                for f in [BoatFactDataModel.DEFAULT_VALUE_FIELD, BoatFactDataModel.ORIGINAL_VALUE_FIELD]:
+                    if f == ret[f"{key}_{self.EXTRACTION_SOURCE_METHOD_FIELD}"]:
+                        break
+                    if f in super().__getitem__(key):
+                        ret[f"{key}_{self.MORE_EXTRACTED_VALUES_FIELD}"].append({"value":super().__getitem__(key).__getitem__(f), BoatFactDataModel.EXTRACTION_SOURCE_METHOD_FIELD:f})
+            else:
+                ret[key] = self[key]
+                ret[f"{key}_{self.EXTRACTION_SOURCE_METHOD_FIELD}"] = BoatFactDataModel.ORIGINAL_VALUE_FIELD
+                ret[f"{key}_{self.MORE_EXTRACTED_VALUES_FIELD}"] =[]
+        if BoatFactDataModel.PUBLICATION_DATE_FIELD in ret and (
+                isinstance(ret[BoatFactDataModel.PUBLICATION_DATE_FIELD], int)
+                or isinstance(ret[BoatFactDataModel.PUBLICATION_DATE_FIELD], str) and re.match("^[-\d]\d*?\.?\d*?$", ret[BoatFactDataModel.PUBLICATION_DATE_FIELD])):
+            ret[f"{BoatFactDataModel.PUBLICATION_DATE_FIELD}_{self.MORE_EXTRACTED_VALUES_FIELD}"].append(
+                {
+                    "value":ret[BoatFactDataModel.PUBLICATION_DATE_FIELD],
+                    BoatFactDataModel.EXTRACTION_SOURCE_METHOD_FIELD: ret[f"{BoatFactDataModel.PUBLICATION_DATE_FIELD}_{self.EXTRACTION_SOURCE_METHOD_FIELD}"]
+                }
+            )
+            ret[BoatFactDataModel.PUBLICATION_DATE_FIELD] = datetime.datetime.fromtimestamp(int(ret[BoatFactDataModel.PUBLICATION_DATE_FIELD])/1000.0).strftime('%Y-%m-%d')
+            ret[f"{BoatFactDataModel.PUBLICATION_DATE_FIELD}_{self.EXTRACTION_SOURCE_METHOD_FIELD}"] = "boat_fact_model"
 
-    def __is_json_structured_filed(self, key):
+        return ret
+
+    def __is_json_structured_field(self, key):
         return key in self and BoatFactDataModel.is_structured_value(super().__getitem__(key))
 
     @staticmethod
@@ -49,17 +86,14 @@ class BoatFactDataModel(dict):
         return (isinstance(value, dict) and
                 (BoatFactDataModel.DEFAULT_VALUE_FIELD in value or
                  BoatFactDataModel.ORIGINAL_VALUE_FIELD in value or
-                 BoatFactDataModel.CALCULATED_VALUE_FIELD in value or
-                 BoatFactDataModel.STACKED_VALUE in value))
+                 BoatFactDataModel.CALCULATED_VALUE_FIELD in value))
 
     @staticmethod
-    def get_value_of(value):
+    def get_single_value_of(value):
         if value is None:
             ret = ""
         elif BoatFactDataModel.is_structured_value(value):
-            if BoatFactDataModel.STACKED_VALUE in value:
-                ret = value[BoatFactDataModel.STACKED_VALUE][-1] if value[BoatFactDataModel.STACKED_VALUE] else None
-            elif BoatFactDataModel.CALCULATED_VALUE_FIELD in value:
+            if BoatFactDataModel.CALCULATED_VALUE_FIELD in value:
                 ret = value[BoatFactDataModel.CALCULATED_VALUE_FIELD]
             elif BoatFactDataModel.ORIGINAL_VALUE_FIELD in value:
                 ret = value[BoatFactDataModel.ORIGINAL_VALUE_FIELD]
@@ -76,9 +110,7 @@ class BoatFactDataModel(dict):
         if value is None:
             ret = None
         elif BoatFactDataModel.is_structured_value(value):
-            if BoatFactDataModel.STACKED_VALUE in value:
-                ret = f"{BoatFactDataModel.STACKED_VALUE}_{len(value[BoatFactDataModel.STACKED_VALUE])-1}"
-            elif BoatFactDataModel.CALCULATED_VALUE_FIELD in value:
+            if BoatFactDataModel.CALCULATED_VALUE_FIELD in value:
                 ret = BoatFactDataModel.CALCULATED_VALUE_FIELD
             elif BoatFactDataModel.ORIGINAL_VALUE_FIELD in value:
                 ret = BoatFactDataModel.ORIGINAL_VALUE_FIELD
@@ -89,3 +121,50 @@ class BoatFactDataModel(dict):
         else:
             ret = BoatFactDataModel.ORIGINAL_VALUE_FIELD
         return str(ret)
+
+
+    # @staticmethod
+    # def get_struct_value_of(value):
+    #     if value is None:
+    #         ret = {BoatFactDataModel.DEFAULT_VALUE_FIELD:None, BoatFactDataModel.ORIGINAL_VALUE_FIELD:None, BoatFactDataModel.CALCULATED_VALUE_FIELD:None}
+    #     elif BoatFactDataModel.is_structured_value(value):
+    #         ret = {
+    #             BoatFactDataModel.DEFAULT_VALUE_FIELD: value[BoatFactDataModel.DEFAULT_VALUE_FIELD] if BoatFactDataModel.DEFAULT_VALUE_FIELD in value else None,
+    #             BoatFactDataModel.ORIGINAL_VALUE_FIELD: value[BoatFactDataModel.ORIGINAL_VALUE_FIELD] if BoatFactDataModel.ORIGINAL_VALUE_FIELD in value else None,
+    #             BoatFactDataModel.CALCULATED_VALUE_FIELD: value[BoatFactDataModel.CALCULATED_VALUE_FIELD] if BoatFactDataModel.CALCULATED_VALUE_FIELD in value else None,
+    #         }
+    #     else:
+    #         ret = {BoatFactDataModel.DEFAULT_VALUE_FIELD:None, BoatFactDataModel.ORIGINAL_VALUE_FIELD:value, BoatFactDataModel.CALCULATED_VALUE_FIELD:None}
+    #     return ret
+    #
+
+
+
+
+    # @staticmethod
+    # def process_value_from_column(column, df_schema):
+    #     def process(c):
+    #         dtype = df_schema[column].dtype
+    #         if c.isNull():
+    #             ret = F.Lit("")
+    #         elif isinstance(dtype, StructField):
+    #             fnames = dtype.fieldNames()
+    #             if BoatFactDataModel.STACKED_VALUE in fnames:
+    #                 ret = c[BoatFactDataModel.STACKED_VALUE].getItem(F.size(c[BoatFactDataModel.STACKED_VALUE])-1)
+    #             elif BoatFactDataModel.CALCULATED_VALUE_FIELD in fnames:
+    #                 ret = c[BoatFactDataModel.CALCULATED_VALUE_FIELD]
+    #             elif  BoatFactDataModel.ORIGINAL_VALUE_FIELD in fnames:
+    #                 ret = c[BoatFactDataModel.ORIGINAL_VALUE_FIELD]
+    #             elif BoatFactDataModel.DEFAULT_VALUE_FIELD in fnames:
+    #                 ret = c[BoatFactDataModel.DEFAULT_VALUE_FIELD]
+    #             else:
+    #                 ret = c
+    #         else:
+    #             ret = c
+    #         return ret
+    #     ret = F.transform(
+    #         F.col(column),
+    #         process
+    #     )
+    #     return ret
+

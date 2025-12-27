@@ -12,7 +12,7 @@ import logging
 import re
 
 from portada_data_layer.portada_delta_common import PortadaDeltaConstants
-from portada_data_layer.traced_data_frame import TracedDataFrame, TRANSFORMING_METHODS
+from portada_data_layer.traced_data_frame import TracedDataFrame
 
 logger = logging.getLogger("delta_data_layer")
 
@@ -177,8 +177,9 @@ class ConfigDeltaDataLayer(PathConfigDeltaDataLayer):
         self._transformer_process_name = ""
         self._transformer_block_name = ""
         self._process_level_dirs_ = [self.DEFAULT_RAW_SUBDIR,
+                                     self.DEFAULT_TO_CLEAN_SUBDIR,
+                                     self.DEFAULT_TO_CURATE_SUBDIR,
                                      self.DEFAULT_CURATED_SUBDIR,
-                                     self.DEFAULT_PROJECT_DATA_NAME,
                                      ""]
         super().__init__(cfg_json)
         if builder is not None:
@@ -186,7 +187,8 @@ class ConfigDeltaDataLayer(PathConfigDeltaDataLayer):
             self._base_path = builder._base_path
             self._protocol = builder._protocol
             self._process_level_dirs_[self.RAW_PROCESS_LEVEL] = builder._raw_subdir
-            self._process_level_dirs_[self.CLEAN_PROCESS_LEVEL] = builder._clean_subdir
+            self._process_level_dirs_[self.TO_CLEAN_PROCESS_LEVEL] = builder._to_clean_subdir
+            self._process_level_dirs_[self.TO_CURATE_PROCESS_LEVEL] = builder._to_curate_subdir
             self._process_level_dirs_[self.CURATED_PROCESS_LEVEL] = builder._curated_subdir
             self._project_data_name = builder._project_data_name
             self._current_process_level = builder._process_level
@@ -232,6 +234,14 @@ class ConfigDeltaDataLayer(PathConfigDeltaDataLayer):
         return self._process_level_dirs_[self.CURATED_PROCESS_LEVEL]
 
     @property
+    def to_curate_subdir(self):
+        """
+        Name for the penultimate level or stage of the data
+        :return:
+        """
+        return self._process_level_dirs_[self.TO_CURATE_PROCESS_LEVEL]
+
+    @property
     def raw_subdir(self):
         """
         Name for the first level or stage of the data
@@ -240,12 +250,12 @@ class ConfigDeltaDataLayer(PathConfigDeltaDataLayer):
         return self._process_level_dirs_[self.RAW_PROCESS_LEVEL]
 
     @property
-    def clean_subdir(self):
+    def to_clean_subdir(self):
         """
         Name for the middle level or stage of the data
         :return:
         """
-        return self._process_level_dirs_[self.CLEAN_PROCESS_LEVEL]
+        return self._process_level_dirs_[self.TO_CLEAN_PROCESS_LEVEL]
 
     @property
     def transformer_name(self):
@@ -545,11 +555,10 @@ class BaseDeltaDataLayer(ConfigDeltaDataLayer):
         :class:`DataFrame`
         """
         if self._transformer_process_name:
-            n = f"created_by_{self._transformer_process_name}"
+            n = f"created_by_{self.transformer_name}"
         else:
             n = "CREATED_BY_UNKNOWN"
-        return TracedDataFrame(self.spark.createDataFrame(data=data, schema=schema, samplingRatio=sampling_ratio,
-                                                          verifySchema=verify_schema), source_name=n)
+        return TracedDataFrame(self.spark.createDataFrame(data=data, schema=schema, samplingRatio=sampling_ratio, verifySchema=verify_schema), source_name=n)
 
     def data_frame_from_range(self, start, end=None, step=1, num_partitions=None):
         """
@@ -666,10 +675,10 @@ class DeltaDataLayer(BaseDeltaDataLayer):
 
         return TracedDataFrame(original_df, target_path, -1)
 
-    def write_delta(self, *table_path, df: DataFrame | TracedDataFrame, mode: str = "overwrite"):
+    def write_delta(self, *table_path, df: DataFrame | TracedDataFrame, mode: str = "overwrite", partition_by:list =None):
         """
         Write the dataframe df to delta table addressed by table_path.
-        table_path can be any of the following forms:
+        :param table_path: can be any of the following forms:
             1. tuple or list. Examples: write_delta(("portada", "ships"), df) or write_delta(["portada", "ships"], df). In these cases, the table "ships" will be saved in <delta_data_base_path>/portada. The table *container_path will be <delta_data_base_path>/portada/ships
             2. Only the table name or a sequence of strings. Examples:
                  - write_delta("ships", df). This case will be resolved as <delta_data_base_path>/ships
@@ -677,13 +686,13 @@ class DeltaDataLayer(BaseDeltaDataLayer):
             3. String, sequence of strings, dict or list with dots as separator. Examples:
                  - write_delta("portada.masters", df) will be resolved as <delta_data_base_path>/portada/masters
                  - write_delta(("bronze", "portada.masters"), df) will be resolved as <delta_data_base_path>/bronze/portada/masters
-        :param table_path:
         :param df:
         :param mode:  mode to write the DataFrame in the delta table. Accepted options:
             * `append`: Append contents of this :class:`DataFrame` to existing data.
             * `overwrite`: Overwrite existing data.
             * `error` or `errorifexists`: Throw an exception if data already exists.
             * `ignore`: Silently ignore this operation if data already exists.
+        :param partitionBy:
         """
         if isinstance(df, TracedDataFrame):
             source_path = df.source_name
@@ -702,7 +711,10 @@ class DeltaDataLayer(BaseDeltaDataLayer):
         path = self._resolve_path(*table_path)
         target_path = self._resolve_relative_path(path)
         logger.info(f"Writing Delta → {path}")
-        original_df.write.format("delta").mode(mode).save(path)
+        if partition_by is None:
+            original_df.write.format("delta").mode(mode).save(path)
+        else:
+            original_df.write.format("delta").mode(mode).partitionBy(partition_by).save(path)
         version = self.get_delta_metatable(path).history(1).collect()[0]['version']
         if self.log_storage or self._save_lineage_on_store or df.save_lineage_on_store:
             if hasattr(self, "metadata"):
@@ -901,7 +913,7 @@ class FileSystemTaskExecutor(BaseDeltaDataLayer):
     def path_exists(self, path: str):
         """
         Checks if a file or directory exists for any protocol supported by Hadoop.
-        :param *container_path: *container_path to check as string
+        :param path:
         :return: True o False if *container_path exists
         """
         # sc = data_layer.spark.sparkContext
@@ -914,7 +926,7 @@ class FileSystemTaskExecutor(BaseDeltaDataLayer):
     def is_delta_table_type(self, path: str):
         """
         Checks if a file or directory exists for any protocol supported by Hadoop.
-        :param *container_path: *container_path to check as string
+        :param path: path to check as string
         :return: True o False if *container_path exists
         """
         return self.path_exists(f"{path}/_delta_log")
@@ -922,7 +934,7 @@ class FileSystemTaskExecutor(BaseDeltaDataLayer):
     def is_json_type(self, path: str):
         """
         Checks if a file exists for any protocol supported by Hadoop and is a json type saved by spark.
-        :param *container_path: *container_path to check as string
+        :param path: path to check as string
         :return: True o False if *container_path exists
         """
         return self.path_exists(f"{path}/_SUCCESS")

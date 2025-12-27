@@ -46,7 +46,8 @@ class AbstractDeltaDataLayerBuilder(PortadaDeltaConstants):
         self._master = "local[*]"
         self._configs = {}
         self._raw_subdir = self.DEFAULT_RAW_SUBDIR
-        self._clean_subdir = self.DEFAULT_CLEAN_SUBDIR
+        self._to_clean_subdir = self.DEFAULT_TO_CLEAN_SUBDIR
+        self._to_curate_subdir = self.DEFAULT_TO_CURATE_SUBDIR
         self._curated_subdir = self.DEFAULT_CURATED_SUBDIR
         self._transformer_block_name = ""
 
@@ -106,14 +107,19 @@ class AbstractDeltaDataLayerBuilder(PortadaDeltaConstants):
         self._raw_subdir = raw_subdir.strip().rstrip("/")
         return self
 
-    def clean_subdir(self, clean_subdir: str):
+    def to_clean_subdir(self, subdir: str):
         """Define the name of clean subdirectory."""
-        self._clean_subdir = clean_subdir.strip().rstrip("/")
+        self._to_clean_subdir = subdir.strip().rstrip("/")
         return self
 
-    def curated_subdir(self, curated_subdir: str):
+    def to_curate_subdir(self, subdir: str):
         """Define the name of clean subdirectory."""
-        self._curated_subdir = curated_subdir.strip().rstrip("/")
+        self._to_curate_subdir = subdir.strip().rstrip("/")
+        return self
+
+    def curated_subdir(self, subdir: str):
+        """Define the name of clean subdirectory."""
+        self._curated_subdir = subdir.strip().rstrip("/")
         return self
 
     def base_path(self, base_path: str):
@@ -147,7 +153,7 @@ class AbstractDeltaDataLayerBuilder(PortadaDeltaConstants):
             self._process_level = process_level
 
     def process_levels(self):
-        return self.DEFAULT_RAW_SUBDIR, self.DEFAULT_CLEAN_SUBDIR, self.DEFAULT_CURATED_SUBDIR, ""
+        return self.DEFAULT_RAW_SUBDIR, self.DEFAULT_TO_CLEAN_SUBDIR, self.DEFAULT_TO_CURATE_SUBDIR, self.DEFAULT_CURATED_SUBDIR, ""
 
 
 # ==============================================================

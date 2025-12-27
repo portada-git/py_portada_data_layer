@@ -112,7 +112,7 @@ class TracedDataFrame:
         for i, t in enumerate(self.transformations):
             if depth is not None and depth <= i:
                 break
-            tn = f"{tn}.{t["operation"]}({t["arguments"]})"
+            tn = f"{tn}.{t['operation']}({t['arguments']})"
         if not n.startswith("DF"):
             n = f"DF({n})"
         return f"{n}{tn}"
@@ -150,7 +150,7 @@ class TracedDataFrame:
         new_df.transformations.append(transformation)
         if len(dataframes)>1:
             new_df._large_name = new_df.large_name
-            new_df._name = f"NEW_FROM([{",".join(x.name for x in dataframes)}])"
+            new_df._name = f"NEW_FROM([{','.join(x.name for x in dataframes)}])"
             new_df.transformations = []
 
         return new_df

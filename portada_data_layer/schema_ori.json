@@ -50,55 +50,27 @@
       "type": "array",
       "description": "Lista de puertos donde el barco hizo escala.",
       "items": {
-        "type": "object",
-        "properties": {
-          "port_of_call_place": {
-            "type": "string",
-            "description": "Puerto donde hizo la escala."
-          },
-          "port_of_call_arrival_date": {
-            "type": "string",
-            "format": "date",
-            "description": "Fecha de llegada al puerto de escala.",
-            "nullable": true
-          },
-          "required": [
-            "port_of_call_place"
-          ],
-          "additionalProperties": false
-        }
-      },
-      "normalize": {
-        "type": "foreach_item",
-        "options": [
+        "oneOf":[
           {
-            "try_cast_to": {
-              "type": "string"
+            "type": "object",
+            "properties": {
+              "port_of_call_place": {
+                "type": "string",
+                "description": "Puerto donde hizo la escala."
+              },
+              "port_of_call_arrival_date": {
+                "type": "string",
+                "format":"date",
+                "description": "Fecha de llegada al puerto de escala.",
+                "nullable":true
+              }
             },
-            "equivalence": {
-              "type": "struct",
-              "new_value": {
-                "port_of_call_place": {
-                  "type": "column",
-                  "value": "old_value"
-                },
-                "port_of_call_arrival_date": {
-                  "type": "literal",
-                  "value": null
-                }
-              }
-            }
+            "required": ["port_of_call_place"],
+            "additionalProperties": false
+          },{
+            "type": "string"
           }
-        ],
-        "otherwise":{
-            "equivalence": {
-              "type": "value",
-              "new_value": {
-                "type": "column",
-                "value": "old_value"
-              }
-            }
-        }
+        ]
       }
     },
     "ship_type": {

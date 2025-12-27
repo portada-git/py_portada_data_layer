@@ -1,0 +1,100 @@
+normalize:{
+    type="foreach_item"
+    options:[
+        {
+           try_cast_to:{
+              <structure to try>
+           }
+           equivalence:{
+                type:"struct"
+                new_value:{
+                   "a":{
+                        type:"column"
+                        value:"old_value.a"
+                    },
+                   "b":{
+                        type:"expr",
+                        value:"lower(colX.c)"
+                    },
+                   "c": {
+                        type:"literal",
+                        value:null
+                    }
+                }
+           }
+        }
+      ]
+}
+
+normalize:{
+    type="foreach_item"
+    equivalence:{
+        type:"struct"
+        new_value: {
+           "a":{
+                type:"column"
+                value:"old_value.a"
+            },
+           "b":{
+                type:"expr",
+                value:"lower(col_name.c)"
+            },
+           "c": {
+                type:"literal",
+                value:null
+            }
+        }
+    }
+}
+
+normalize:{
+    type:"value"
+    equivalence:{
+        type:"struct"
+        new_value: {
+           "a":{
+                type:"column"
+                value:"old_value.a"
+            },
+           "b":{
+                type:"expr",
+                value:"lower(col_name.c)"
+            },
+           "c": {
+                type:"literal",
+                value:null
+            }
+       }
+    }
+}
+
+
+normalize:{
+    type:"value"
+    options:[
+        {
+           try_cast_to:{
+              <structure to try>
+           }
+           equivalence:{
+              type:"value"
+              new_value: {
+                type:"expr",
+                value:"lower(col_name.c)"
+              }
+           }
+        },
+        {
+           try_cast_to:{
+              <structure to try>
+           }
+           equivalence:{
+              type:"value"
+              new_value: {
+                type:"column",
+                value:"old_value"
+              }
+           }
+        }
+    ]
+}

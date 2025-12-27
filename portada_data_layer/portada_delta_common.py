@@ -2,13 +2,15 @@ import importlib
 import inspect
 
 class PortadaDeltaConstants:
-    CURATED_PROCESS_LEVEL = 2
-    CLEAN_PROCESS_LEVEL = 1
+    CURATED_PROCESS_LEVEL = 3
+    TO_CURATE_PROCESS_LEVEL = 2
+    TO_CLEAN_PROCESS_LEVEL = 1
     RAW_PROCESS_LEVEL = 0
     DEFAULT_PROJECT_DATA_NAME = "default"
     DEFAULT_CURATED_SUBDIR = "gold"
-    DEFAULT_CLEAN_SUBDIR = "silver"
-    DEFAULT_RAW_SUBDIR = "bronze"
+    DEFAULT_TO_CURATE_SUBDIR = "silver"
+    DEFAULT_TO_CLEAN_SUBDIR = "bronze"
+    DEFAULT_RAW_SUBDIR = "ingest"
     DEFAULT_BASE_PATH = "~/.delta_lake/data"
     CLASS_REGISTRY = {}
 
