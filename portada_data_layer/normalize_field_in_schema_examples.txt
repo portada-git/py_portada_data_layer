@@ -1,3 +1,36 @@
+"normalize": {
+    "type": "foreach_item",
+    "options": [
+      {
+        "try_cast_to": {
+          "type": "string"
+        },
+        "equivalence": {
+          "type": "struct",
+          "new_value": {
+            "port_of_call_place": {
+              "type": "column",
+              "value": "old_value"
+            },
+            "port_of_call_arrival_date": {
+              "type": "literal",
+              "value": null
+            }
+          }
+        }
+      }
+    ],
+    "otherwise":{
+        "equivalence": {
+          "type": "value",
+          "new_value": {
+            "type": "column",
+            "value": "old_value"
+          }
+        }
+    }
+}
+
 normalize:{
     type="foreach_item"
     options:[

@@ -21,13 +21,6 @@ class PortadaCleaning(DeltaDataLayer):
         # self._allowed_paths=None
         self._current_process_level = 1
 
-    # @staticmethod
-    # def prune_unaccepted_fields_in_row_udf(col_name, schema):
-    #     sub_schema = schema[col_name]
-    #     @F.udf(StringType())
-    #     def prune_unaccepted_fields_in_row(value):
-    #         if isinstance(value, Row):
-
     @staticmethod
     def _collect_list_of_fields(schema: dict) -> set:
         fields = set()
@@ -45,8 +38,22 @@ class PortadaCleaning(DeltaDataLayer):
         return fields
 
     @staticmethod
-    def json_schema_to_normalize_columns(schema: dict, col_name: str = None):
+    def _json_schema_to_normalize_columns(schema: dict, col_name: str = None):
         ret = {}
+
+        def _parse_as(_col, struct):
+            # Només parsegem si el tipus esperat és STRUCT
+            if not isinstance(struct, StructType):
+                return _col.cast(struct)
+            # Convertim a string sempre
+            s = _col.cast("string")
+
+            # Detectem JSON
+            looks_like_json = s.startswith("{") & s.endswith("}")
+
+            # from_json mai llença error
+            parsed = F.from_json(s, struct)
+            return F.when(looks_like_json, parsed).otherwise(F.lit(None))
 
         def _resolve_value(ref, _col):
             if ref["type"]=="expr":
@@ -62,43 +69,44 @@ class PortadaCleaning(DeltaDataLayer):
                 return F.lit(ref["value"])
 
         def _normalize(_col, _norm_props: dict):
-            if "options" in _norm_props:
-                expr = None
-                for option in _norm_props["options"]:
-                    struct, _ = PortadaCleaning.json_schema_to_spark_type(option["try_cast_to"])
-                    cast_condition = _col.isNotNull() & _col.cast(struct).isNotNull()
-                    if option["equivalence"]["type"]=="struct":
-                        par = [_resolve_value(str_ref, _col) for k, str_ref in option["equivalence"]["new_value"].items()]
-                        new_value = F.struct(*par)
-                    else:
-                        new_value = _resolve_value(option["equivalence"]["new_value"], _col)
-                    if expr:
-                        expr.when(
-                            cast_condition,
-                            new_value
-                        )
-                    else:
-                        expr = F.when(
-                            cast_condition,
-                            new_value
-                        )
-                if "otherwise" in _norm_props:
-                    if _norm_props["otherwise"]["equivalence"]["type"]=="struct":
-                        par = [_resolve_value(str_ref, _col) for k, str_ref in _norm_props["otherwise"]["equivalence"]["new_value"].items()]
-                        new_value = F.struct(*par)
-                    else:
-                        new_value = _resolve_value(_norm_props["otherwise"]["equivalence"]["new_value"], _col)
-                    expr.otherwise(new_value)
-            else:
-                expr = _resolve_value(_norm_props["equivalence"], _col)
+            if "options" not in _norm_props:
+                return _resolve_value(_norm_props["equivalence"], _col)
+
+            expr = None
+            for option in _norm_props["options"]:
+                struct, _ = PortadaCleaning.json_schema_to_spark_type(option["try_cast_to"])
+                parsed = _parse_as(_col, struct)
+                cast_condition = _col.isNotNull() & parsed.isNotNull()
+
+                if option["equivalence"]["type"] == "struct":
+                    fields = []
+                    for k, str_ref in option["equivalence"]["new_value"].items():
+                        fields.append(_resolve_value(str_ref, parsed).alias(k))
+                    new_value = F.struct(*fields)
+                else:
+                    new_value = _resolve_value(option["equivalence"]["new_value"], parsed)
+                expr = F.when(cast_condition, new_value) if expr is None else expr.when(cast_condition, new_value)
+
+            # OTHERWISE
+            if "otherwise" in _norm_props:
+                if _norm_props["otherwise"]["equivalence"]["type"] == "struct":
+                    fields = []
+                    for k, str_ref in _norm_props["otherwise"]["equivalence"]["new_value"].items():
+                        fields.append(_resolve_value(str_ref, _col).alias(k))
+                    new_value = F.struct(*fields)
+                else:
+                    new_value = _resolve_value(_norm_props["otherwise"]["equivalence"]["new_value"], _col)
+                expr = expr.otherwise(new_value)
             return expr
 
         def _json_schema_to_normalize_columns(_schema: dict, _col_name: str, _ret: dict):
             if "normalize" in _schema:
                 normalize_properties = _schema.get("normalize")
                 if normalize_properties["type"] == "foreach_item":
-                    # normalize with transform
-                    _ret[_col_name] = F.transform(F.col(_col_name), lambda x: _normalize(x, normalize_properties))
+                    _ret[_col_name] = F.transform(
+                        F.col(_col_name),
+                        lambda x: _normalize(x, normalize_properties)
+                    )
                 else:  # normalize_properties["type"] == "value":
                     # normalize
                     _ret[_col_name] = _normalize(F.col(col_name), normalize_properties)
@@ -169,97 +177,6 @@ class PortadaCleaning(DeltaDataLayer):
 
         raise ValueError(f"Unsupported JSON schema type: {schema_type}")
 
-    # normalize_foreach_item:{
-    # options:[
-    #   {
-    #      try_cast:{
-    #         type:{}
-    #      }
-    #      equivalence:{
-    #         new_item: {
-    #            "a":"item.a",
-    #            "b":"item.c",
-    #            "c": null
-    # 	      }
-    #      }
-    #   }
-    # ]
-    # }
-
-    # normalize_foreach_item:{
-    # equivalence:{
-    #   new_item: {
-    #      "a":"item.a",
-    #       "b":"item.c",
-    #       "c": null
-    # 	 }
-    # }
-    # }
-
-    # normalize:{
-    #   equivalence:{
-    #     new_value: {
-    #       "a":"value.a",
-    #       "b":"value.c",
-    #       "c": null
-    # 	  }
-    #   }
-    # }
-
-    # normalize:{
-    # options:[
-    #   {
-    #      try_cast:{
-    #         type:{}
-    #      }
-    #      equivalence:{
-    #         new_item: {
-    #            type:"struct"
-    #            value:{
-    #               "a":"item.a",
-    #               "b":"item.c",
-    #               "c": null
-    #             }
-    # 	      }
-    #      }
-    #   }
-    # ]
-    # }
-
-    # {
-    #     try_cast:{
-    #         type:{}
-    #     },
-    #     equivalence:{
-    #         new_value:{
-    #           type:"struct"
-    #         }
-    #     }
-    # }
-
-    # Abans però, per tal de normalitzar els tipus d'una forma estandarditzada, voldria que aquells camps que ho requerissin tinguessin, dins del schema json un camp(al mateix nivell que "type" anomenat normalize:
-    # cast_as({"type": "array", "items": {"type": "string"}}).isNotNull -> for_each(items, item = {"aaaa":item, "bbbb":null})
-    # cast_as({"type": "array", "items": {"type":"object", "properties":{"ccc":{"type":"string"}, "dddd":{"type":"string"}}}}).isNotNull -> for_each(items, item = {"aaaa":item.cccc, "bbbb":item.dddd})
-    # { if: {cast:, return:"isNotNull", actions: [cast]}, if: {
-    #     cast_as: {"type": "array", "items": {"type": "string"}}
-    # normalize: action
-    # df = df.withColumn(
-    #     "travel_port_of_call_name_list",
-    #     F.transform(
-    #         "travel_port_of_call_list",
-    #         lambda x: F.when(
-    #             x.isNotNull() & x.cast("string").isNotNull(),
-    #             x.cast("string")
-    #         ).otherwise(x["port_of_call_place"])
-    #     )
-    # ).withColumn(
-    #     "travel_port_of_call_arrival_date_list",
-    #     F.transform(
-    #         "travel_port_of_call_list",
-    #         lambda x: x["port_of_call_arrival_date"]
-    #     )
-    # )
-
     def use_schema(self, json_schema: dict):
         self._schema = json_schema
         return self
@@ -289,11 +206,19 @@ class PortadaCleaning(DeltaDataLayer):
     def normalize_field_structure(self, df: TracedDataFrame) -> TracedDataFrame:
         if self._schema is None:
             raise ValueError("Cal cridar use_schema() abans.")
-        f_columns = self.json_schema_to_normalize_columns(self._schema)
+        f_columns = self._json_schema_to_normalize_columns(self._schema)
         for c_name, col_trans in f_columns.items():
             df = df.withColumn(c_name, col_trans)
         return df
 
+    @data_transformer_method()
+    def normalize_field_value(self, df: TracedDataFrame) -> TracedDataFrame:
+        if self._schema is None:
+            raise ValueError("Cal cridar use_schema() abans.")
+        f_columns = self._json_schema_to_normalize_values(self._schema)
+        for c_name, col_trans in f_columns.items():
+            df = df.withColumn(c_name, col_trans)
+        return df
 
     @data_transformer_method(description="prune unbelonging model fields ")
     def prune_unaccepted_fields(self, df: TracedDataFrame) -> TracedDataFrame:
@@ -310,240 +235,3 @@ class PortadaCleaning(DeltaDataLayer):
 
         return df.select(cols_to_keep).withColumns(cols_to_add)
 
-        #
-        # def normalize_from_boat_fact_model(self, df: TracedDataFrame) -> TracedDataFrame:
-        #     par = {
-        #         col: F.transform(
-        #             F.col(col),
-        #             lambda x: F.when(
-        #                 x.isNotNull() & x.cast("string").isNotNull(),
-        #                 x.cast("string")
-        #             ).when(x.isNotNull(),
-        #     #                get_value_of(value):
-        #     # if value is None:
-        #     #     ret = ""
-        #     # elif BoatFactDataModel.is_structured_value(value):
-        #     #     if
-        #     # BoatFactDataModel.STACKED_VALUE in value:
-        #     # ret = value[BoatFactDataModel.STACKED_VALUE][-1] if value[BoatFactDataModel.STACKED_VALUE] else None
-        #     # elif BoatFactDataModel.CALCULATED_VALUE_FIELD in value:
-        #     # ret = value[BoatFactDataModel.CALCULATED_VALUE_FIELD]
-        #     # elif BoatFactDataModel.ORIGINAL_VALUE_FIELD in value:
-        #     # ret = value[BoatFactDataModel.ORIGINAL_VALUE_FIELD]
-        #     # elif BoatFactDataModel.DEFAULT_VALUE_FIELD in value:
-        #     # ret = value[BoatFactDataModel.DEFAULT_VALUE_FIELD]
-        #     # else:
-        #     # ret = ""
-        #     # else:
-        #     # ret = value
-        #     # return str(ret)
-        #             )
-        #         )
-        #         for col in df.columns:
-        #     }
-
-        df = df.withColumn(
-
-        )
-
-    # def _normalize_column(self, col: str) -> str:
-    #     """
-    #     Normalitza columnes Spark, convertint:
-    #         a[0].b → a[*].b
-    #         a[12].x.y → a[*].x.y
-    #     """
-    #     return self.ARRAY_INDEX_REGEX.sub("[*]", col)
-
-    # def _collect_allowed_paths(self, node, prefix=""):
-    #     """
-    #     Returns all allowed flattened paths from a JSON Schema.
-    #     Supports: object, array, oneOf, anyOf, allOf.
-    #     """
-    #     if "schema" in node:
-    #         node = node["schema"]
-    #
-    #     paths = []
-    #
-    #     # Normalize prefix
-    #     p = prefix + "." if prefix else ""
-    #
-    #     # 1) If schema has oneOf / anyOf / allOf → merge results from sub-schemas
-    #     combinators = ["oneOf", "anyOf", "allOf"]
-    #     for key in combinators:
-    #         if key in node:
-    #             merged = []
-    #             for option in node[key]:
-    #                 merged.extend(self._collect_allowed_paths(option, prefix))
-    #             return merged  # This is final for this node
-    #
-    #     # 2) Object
-    #     if node.get("type") == "object":
-    #         props = node.get("properties", {})
-    #         for field_name, field_schema in props.items():
-    #             full = f"{p}{field_name}"
-    #             paths.append(full)  # include the object field itself
-    #             paths.extend(self._collect_allowed_paths(field_schema, full))
-    #         return paths
-    #
-    #     # 3) Array
-    #     if node.get("type") == "array":
-    #         items = node.get("items")
-    #
-    #         if items is None:
-    #             return paths  # no detail, cannot descend
-    #
-    #         # Case: items contains oneOf / anyOf / allOf
-    #         for key in combinators:
-    #             if key in items:
-    #                 merged = []
-    #                 for option in items[key]:
-    #                     merged.extend(self._collect_allowed_paths(option, prefix))
-    #                 return merged
-    #
-    #         # Case: items is a single schema
-    #         return self._collect_allowed_paths(items, prefix)
-    #
-    #     # 4) Primitive types (string, number, boolean…)
-    #     #    → leaf node, prefix already represents the full path
-    #     return paths
-
-    # def _collect_allowed_paths(self, schema_fragment, prefix="", defs=None):
-    #     """
-    #     Returns all allowed flattened paths from a JSON Schema.
-    #     Supports: object, array, oneOf, anyOf, allOf.
-    #     """
-    #     if defs:
-    #         defs = defs.copy()
-    #     else:
-    #         defs = {}
-    #
-    #     if "schema" in schema_fragment:
-    #         schema_fragment = schema_fragment["schema"]
-    #
-    #     if "$defs" in schema_fragment:
-    #         for n, d in schema_fragment["Sdefs"]:
-    #             defs[n] = d
-    #
-    #     allowed = []
-    #
-    #     # Normalize prefix
-    #     p = prefix + "." if prefix else ""
-    #
-    #     # 1) If schema has oneOf / anyOf / allOf → merge results from sub-schemas
-    #     combinators = ["oneOf", "anyOf", "allOf"]
-    #     for key in combinators:
-    #         if key in schema_fragment:
-    #             merged = []
-    #             for option in schema_fragment[key]:
-    #                 merged.extend(self._collect_allowed_paths(option, prefix, defs))
-    #             return merged  # This is final for this node
-    #
-    #     typ = schema_fragment.get("type")
-    #
-    #     # ---------------------------
-    #     # OBJECT
-    #     # ---------------------------
-    #     if typ == "object":
-    #         properties = schema_fragment.get("properties", {})
-    #         additional = schema_fragment.get("additionalProperties", True)
-    #
-    #         if additional:
-    #             allowed.append(prefix)
-    #
-    #         # Recorrem les propietats
-    #         for prop, prop_schema in properties.items():
-    #             path = f"{p}{prop}"
-    #             allowed.append(path)
-    #             allowed.extend(self._collect_allowed_paths(prop_schema, path, defs))
-    #
-    #         return allowed
-    #
-    #     # ---------------------------
-    #     # ARRAY
-    #     # ---------------------------
-    #     if typ == "array":
-    #         items_schema = schema_fragment.get("items")
-    #
-    #         if items_schema is None:
-    #             return allowed  # no detail, cannot descend
-    #
-    #         # Representació normalitzada d'un array:
-    #         #   a[0].b → a[*].b
-    #         array_prefix = f"{prefix}[*]" if prefix else "[*]"
-    #
-    #         # Case: items contains oneOf / anyOf / allOf
-    #         for key in combinators:
-    #             if key in items_schema:
-    #                 merged = []
-    #                 for option in items_schema[key]:
-    #                     merged.extend(self._collect_allowed_paths(option, prefix))
-    #                 return merged
-    #
-    #         # L'array en si mateix sempre és vàlid
-    #         allowed.add(array_prefix)
-    #
-    #         # Recorrem missing_date_list'esquema dels items
-    #         allowed |= self._collect_allowed_paths(items_schema, array_prefix)
-    #
-    #         return allowed
-    #
-    #     # ---------------------------
-    #     # TIPUS BÀSICS (string, number, boolean...)
-    #     # ---------------------------
-    #     if prefix:
-    #         allowed.add(prefix)
-    #
-    #     return allowed
-
-# # Funció recursiva de neteja
-# def recursive_clean(value, type_, format_=None):
-#     if value is None:
-#         return None
-#
-#     try:
-#         # Tipus simples
-#         if type_ in ["string", "integer", "decimal", "date", "boolean"]:
-#             # Aquí hi poses la lògica de neteja simple
-#             # Exemple: trim, lower, validació de dates, etc.
-#             return str(value).strip()
-#
-#         # Tipus complexos
-#         elif type_ == "struct":
-#             obj = json.loads(value)
-#             cleaned_obj = {}
-#             for k, v in obj.items():
-#                 # Suposem que el format pot contenir subtipus
-#                 sub_type = format_.get(k, {}).get("type", "string")
-#                 sub_format = format_.get(k, {}).get("format", None)
-#                 cleaned_obj[k] = recursive_clean(v, sub_type, sub_format)
-#             return json.dumps(cleaned_obj)
-#
-#         elif type_ == "array":
-#             arr = json.loads(value)
-#             sub_type = format_.get("items", {}).get("type", "string")
-#             sub_format = format_.get("items", {}).get("format", None)
-#             cleaned_arr = [recursive_clean(v, sub_type, sub_format) for v in arr]
-#             return json.dumps(cleaned_arr)
-#
-#         elif type_ == "map":
-#             obj = json.loads(value)
-#             sub_type = format_.get("values", {}).get("type", "string")
-#             sub_format = format_.get("values", {}).get("format", None)
-#             cleaned_obj = {k: recursive_clean(v, sub_type, sub_format) for k, v in obj.items()}
-#             return json.dumps(cleaned_obj)
-#
-#         else:
-#             # Tipus desconegut → retorna com string netejat
-#             return str(value).strip()
-#
-#     except Exception:
-#         # Si hi ha error de parseig, retorna el valor original netejat com string
-#         return str(value).strip()
-#
-#
-# # Wrapping en UDF
-# def clean(value, type_, format_):
-#     return recursive_clean(value, type_, format_)
-#
-# spark = SparkSession.builder.getOrCreate()
-# spark.udf.register("clean", clean, StringType())
