@@ -89,7 +89,7 @@ def __is_data_transformer(func, data_layer_key: str=None, dataframe_key: str = "
         data_layer = None
 
     if dataframe_key in bound.arguments:
-        dataframe = bound.arguments[dataframe_key] if isinstance(bound.arguments[dataframe_key], TracedDataFrame) else TracedDataFrame(bound.arguments[dataframe_key], "UNKNOWN")
+        dataframe = bound.arguments[dataframe_key] if isinstance(bound.arguments[dataframe_key], TracedDataFrame) else TracedDataFrame(bound.arguments[dataframe_key], table_name="UNKNOWN")
         dataframes = [dataframe]
     else:
         dataframe = None
@@ -118,14 +118,14 @@ def __is_data_transformer(func, data_layer_key: str=None, dataframe_key: str = "
         resultat = func(*args, **kwargs)
 
         if isinstance(resultat, DataFrame):
-            dataframes = [TracedDataFrame(resultat, "UNKNOWN", previous_transformer_name)]
+            dataframes = [TracedDataFrame(resultat, table_name="UNKNOWN", transformer_name=previous_transformer_name)]
             num_records = resultat.count()
         if isinstance(resultat, TracedDataFrame):
             dataframes = [resultat]
             num_records = resultat.count()
         elif isinstance(resultat, (list, tuple)):
             if len(resultat) >0 and isinstance(resultat[0], (DataFrame, TracedDataFrame)):
-                dataframes = [r if isinstance(r, TracedDataFrame) else TracedDataFrame(r, "UNKNOWN") for r in resultat]
+                dataframes = [r if isinstance(r, TracedDataFrame) else TracedDataFrame(r, table_name="UNKNOWN", transformer_name=previous_transformer_name) for r in resultat]
                 num_records =0
                 for r in dataframes:
                     num_records += dataframes[0].count()
@@ -501,7 +501,7 @@ def disable_field_lineage_log_for_class(cls):
 
 class DataLakeMetadataManager(PathConfigDeltaDataLayer):
     DELETE_DUPLICATES_ACTION = "delete_duplicates"
-    SOURCE_PATH_PARAM = "source_path"
+    SOURCE_PATH_PARAM = "df_name"
     TARGET_PATH_PARAM = "target_path"
     NUM_RECORDS_PARAM = "num_records"
 
@@ -527,6 +527,8 @@ class DataLakeMetadataManager(PathConfigDeltaDataLayer):
             num_records: int = -1,
             mode: str = None,
             new: bool = True,
+            table_name: str = None,
+            df_name: str = None,
             df_large_name:str = None,
             source_path: str = None,
             source_version: int = -1,
@@ -541,6 +543,8 @@ class DataLakeMetadataManager(PathConfigDeltaDataLayer):
             timestamp=datetime.now(UTC).isoformat(),
             process=data_layer.transformer_name,
             stage=data_layer.current_process_level,
+            table_name=table_name,
+            df_name=df_name if df_name is not None else table_name,
             df_large_name=df_large_name,
             source_path=source_path,
             source_version=source_version,
@@ -556,6 +560,8 @@ class DataLakeMetadataManager(PathConfigDeltaDataLayer):
             StructField("timestamp", StringType(), False),
             StructField("process", StringType(), False),
             StructField("stage", IntegerType(), False),
+            StructField("table_name", StringType(), True),
+            StructField("df_name", StringType(), True),
             StructField("df_large_name", StringType(), True),
             StructField("source_path", StringType(), True),
             StructField("source_version", IntegerType(), True),
@@ -705,9 +711,10 @@ class DataLakeMetadataManager(PathConfigDeltaDataLayer):
                 transformer_name= dataframe._transformer_name if dataframe._transformer_name else data_layer.transformer_name,
                 transformer_description= dataframe._transformer_description,
                 stage= data_layer.current_process_level,
+                table_name = dataframe.table_name,
                 dataframe_name= df_name,
-                source_path= self._resolve_relative_path(dataframe.source_name),
-                source_version= dataframe.source_version,
+                source_path= self._resolve_relative_path(dataframe.df_name),
+                source_version= dataframe.df_version,
                 change_types= change_types,
                 change_action= t["operation"],
                 arguments= t["arguments"],
@@ -725,6 +732,7 @@ class DataLakeMetadataManager(PathConfigDeltaDataLayer):
             StructField("transformer_name", StringType(), True),
             StructField("transformer_description", StringType(), True),
             StructField("stage", StringType(), True),
+            StructField("table_name", StringType(), True),
             StructField("dataframe_name", StringType(), True),
             StructField("source_path", StringType(), True),
             StructField("source_version", StringType(), True),
@@ -765,11 +773,11 @@ class DataLakeMetadataManager(PathConfigDeltaDataLayer):
 
     # def _write_dataframe(self, df: TracedDataFrame):
     #     """Common logging to the Data Lake."""
-    #     if df.source_version==-1:
+    #     if df.df_version==-1:
     #         n = df.name.replace("/*", "").replace("/", "___DIR_SEP___").replace(".", "___EXT___")
     #         target_path = self._resolve_path("metadata", "values", n)
     #     else:
-    #         target_path = self._resolve_path(df.source_name)
+    #         target_path = self._resolve_path(df.df_name)
     #     df.write.mode("overwrite").format("delta").save(target_path)
     #     v = DeltaTable.forPath(self.spark, target_path).history(1).collect()[0]['version']
     #     return self._resolve_relative_path(target_path), v

@@ -39,13 +39,14 @@ class TracedDataFrame:
     This class is used as a proxy of a dataframe of spark.sql.Dataframe, and it encapsulates a dataframe. For practical
     purposes it acts like a dataframe, but it contains the source_name_path and the source version where is data is stored
     """
-    # def __init__(self, df: DataFrame, source_name: str, source_version: int = -1, name=None, large_name=None,transformations=None):
-    def __init__(self, df: DataFrame, source_name: str, source_version: int=-1, save_lineage_on_store=False, name=None, **kwargs):
+    # def __init__(self, df: DataFrame, df_name: str, df_version: int = -1, name=None, large_name=None,transformations=None):
+    def __init__(self, df: DataFrame, table_name: str, df_name:str=None, df_version: int=-1, save_lineage_on_store=False, name=None, **kwargs):
         self._df = df
         self._name = name
         self._large_name = kwargs["large_name"] if "large_name" in kwargs else None
-        self.source_name = source_name
-        self.source_version = source_version
+        self.table_name = table_name
+        self.df_name = df_name if df_name is not None else self.table_name
+        self.df_version = df_version
         self.transformations = list(kwargs["transformations"]) if "transformations" in kwargs else []
         self.save_lineage_on_store = save_lineage_on_store
         self._transformer_name = kwargs["transformer_name"] if "transformer_name" in kwargs else ""
@@ -75,8 +76,8 @@ class TracedDataFrame:
         if self._name:
             n = self._name
         else:
-            v = "" if self.source_version==-1 else f"_{self.source_version}"
-            n = f"{self.source_name}{v}"
+            v = "" if self.df_version == -1 else f"_{self.df_version}"
+            n = f"{self.df_name}{v}"
         if not (n.startswith("DF") or n.startswith("NEW_FROM")):
             n = f"DF({n})"
         if len(self.transformations) > 0:
@@ -85,19 +86,6 @@ class TracedDataFrame:
 
     @property
     def large_name(self):
-    #     if self._large_name:
-    #         n = self._large_name
-    #     elif self._name:
-    #         n = self._name
-    #     else:
-    #         v = "" if self.source_version == -1 else f"_{self.source_version}"
-    #         n = f"{self.source_name}{v}"
-    #     tn = ""
-    #     for t in self.transformations:
-    #         tn = f"{tn}.{t["operation"]}({t["arguments"]})"
-    #     if not n.startswith("DF"):
-    #         n = f"DF({n})"
-    #     return f"{n}{tn}"
         return self.get_partial_large_name()
 
     def get_partial_large_name(self, depth:int = None):
@@ -106,8 +94,8 @@ class TracedDataFrame:
         elif self._name:
             n = self._name
         else:
-            v = "" if self.source_version == -1 else f"_{self.source_version}"
-            n = f"{self.source_name}{v}"
+            v = "" if self.df_version == -1 else f"_{self.df_version}"
+            n = f"{self.df_name}{v}"
         tn = ""
         for i, t in enumerate(self.transformations):
             if depth is not None and depth <= i:
@@ -122,10 +110,10 @@ class TracedDataFrame:
         return self._df
 
     def update_result(self, old_df, new_df, op_name, args, kwargs):
-        new_df = TracedDataFrame(new_df, self.source_name, self.source_version, name=self._name,
+        new_df = TracedDataFrame(new_df, self.table_name, self.df_name, self.df_version, name=self._name,
                                  large_name=self._large_name, transformations=self.transformations,
                                  save_lineage_on_store=self.save_lineage_on_store, transformer_name=self._transformer_name,
-                                 transformer_description=self._transformer_description,)
+                                 transformer_description=self._transformer_description, )
 
         old_cols = set(old_df.columns)
         new_cols = set(new_df.columns)

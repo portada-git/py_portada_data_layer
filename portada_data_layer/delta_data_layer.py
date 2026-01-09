@@ -279,12 +279,12 @@ class ConfigDeltaDataLayer(PathConfigDeltaDataLayer):
 
 
     @staticmethod
-    def _flatten_table_name(*table_name):
+    def _flatten_table_name(*table_name, sep="."):
         if len(table_name) == 1 and (type(table_name[0]) == tuple or type(table_name[0]) == list):
             table_path = table_name[0]
         else:
             table_path = table_name
-        table_path = '.'.join(map(str, table_path))
+        table_path = sep.join(map(str, table_path))
         return table_path
 
     def _resolve_relative_path(self, *args, process_level_dir=None, has_extension=False, contains_project_name=False,
@@ -514,7 +514,7 @@ class BaseDeltaDataLayer(ConfigDeltaDataLayer):
         fs_ex = FileSystemTaskExecutor(self.get_configuration())
         return fs_ex.path_exists(path) and fs_ex.is_json_type(path)
 
-    def create_data_frame(self, data, schema=None, sampling_ratio=None, verify_schema=True):
+    def create_data_frame(self, data, name=None, schema=None, sampling_ratio=None, verify_schema=True):
         """
         Creates a :class:`DataFrame` from an :class:`RDD`, a list, a :class:`pandas.DataFrame`
         or a :class:`numpy.ndarray`.
@@ -525,6 +525,8 @@ class BaseDeltaDataLayer(ConfigDeltaDataLayer):
             an RDD of any kind of SQL data representation (:class:`Row`,
             :class:`tuple`, ``int``, ``boolean``, etc.), or :class:`list`,
             :class:`pandas.DataFrame` or :class:`numpy.ndarray`.
+        name: str, optional
+            dataframe name
         schema : :class:`pyspark.sql.types.DataType`, str or list, optional
             a :class:`pyspark.sql.types.DataType` or a datatype string or a list of
             column names, default is None. The data type string format equals to
@@ -554,13 +556,17 @@ class BaseDeltaDataLayer(ConfigDeltaDataLayer):
         -------
         :class:`DataFrame`
         """
+        tn = name if name is not None else "UNKNOWN"
         if self._transformer_process_name:
             n = f"created_by_{self.transformer_name}"
         else:
             n = "CREATED_BY_UNKNOWN"
-        return TracedDataFrame(self.spark.createDataFrame(data=data, schema=schema, samplingRatio=sampling_ratio, verifySchema=verify_schema), source_name=n)
+        return TracedDataFrame(self.spark.createDataFrame(data=data,
+                                                          schema=schema,
+                                                          samplingRatio=sampling_ratio,
+                                                          verifySchema=verify_schema), table_name=tn, df_name=n)
 
-    def data_frame_from_range(self, start, end=None, step=1, num_partitions=None):
+    def data_frame_from_range(self, start, end=None, step=1, num_partitions=None, name=None):
         """
         Create a :class:`DataFrame` with single :class:`pyspark.sql.types.LongType` column named
         ``id``, containing elements in a range from ``start`` to ``end`` (exclusive) with
@@ -576,13 +582,20 @@ class BaseDeltaDataLayer(ConfigDeltaDataLayer):
             the incremental step (default: 1)
         num_partitions : int, optional
             the number of partitions of the DataFrame
+        name : str, optional
+             dataframe name
 
         Returns
         -------
         :class:`DataFrame`
         """
+        tn = name if name is not None else "UNKNOWN"
+        if self._transformer_process_name:
+            n = f"created_from_range_by_{self.transformer_name}"
+        else:
+            n = "CREATED_FROM_RANGE_BY_UNKNOWN"
         return TracedDataFrame(self.spark.range(start=start, end=end, step=step, numPartitions=num_partitions),
-                               source_name="FROM_MEMORY")
+                               table_name=tn, df_name=n)
 
 
 # ==============================================================
@@ -623,18 +636,20 @@ class DeltaDataLayer(BaseDeltaDataLayer):
         :param has_extension:
         """
         if isinstance(df, TracedDataFrame):
-            source_path = df.source_name
-            source_version = df.source_version
+            tn = df.table_name
+            source_path = df.df_name
+            source_version = df.df_version
             df_name = df.name
             df_large_name = df.large_name
             original_df = df.toSparkDataFrame()
         else:
+            tn = self._flatten_table_name(*table_path)
             source_path = "UNKNOWN"
             source_version = -1
             original_df = df
             df_name = "UNKNOWN"
             df_large_name = "UNKNOWN"
-            df = TracedDataFrame(df, source_name=source_path, source_version=source_version)
+            df = TracedDataFrame(df, table_name=tn, df_name=source_path, df_version=source_version)
 
         path = self._resolve_path(*table_path, process_level_dir=process_level_dir, has_extension=has_extension)
         target_path = self._resolve_relative_path(path)
@@ -657,6 +672,8 @@ class DeltaDataLayer(BaseDeltaDataLayer):
                 num_records=original_df.count(),
                 mode=mode,
                 new=not self.path_exists(path),
+                table_name=tn,
+                df_name = df_name,
                 df_large_name=df_large_name,
                 source_path=source_path,
                 source_version=source_version,
@@ -673,7 +690,7 @@ class DeltaDataLayer(BaseDeltaDataLayer):
             if prev_tr_name is not None:
                 self._transformer_process_name = prev_tr_name
 
-        return TracedDataFrame(original_df, target_path, -1)
+        return TracedDataFrame(original_df, table_name=tn, df_name=target_path, df_version=-1)
 
     def write_delta(self, *table_path, df: DataFrame | TracedDataFrame, mode: str = "overwrite", partition_by:list =None):
         """
@@ -695,18 +712,20 @@ class DeltaDataLayer(BaseDeltaDataLayer):
         :param partitionBy:
         """
         if isinstance(df, TracedDataFrame):
-            source_path = df.source_name
-            source_version = df.source_version
+            tn = df.table_name
+            source_path = df.df_name
+            source_version = df.df_version
             df_name = df.name
             df_large_name = df.large_name
             original_df = df.toSparkDataFrame()
         else:
+            tn = self._flatten_table_name(*table_path)
             source_path = "UNKNOWN"
             source_version = -1
             original_df = df
             df_name = "UNKNOWN"
             df_large_name = "UNKNOWN"
-            df = TracedDataFrame(df, source_name=source_path, source_version=source_version)
+            df = TracedDataFrame(df, table_name=tn, df_name=source_path, df_version=source_version)
 
         path = self._resolve_path(*table_path)
         target_path = self._resolve_relative_path(path)
@@ -733,6 +752,8 @@ class DeltaDataLayer(BaseDeltaDataLayer):
                 num_records=original_df.count(),
                 mode=mode,
                 new=not self.path_exists(path),
+                table_name=tn,
+                df_name=df_name,
                 df_large_name=df_large_name,
                 source_path=source_path,
                 source_version=source_version,
@@ -749,7 +770,7 @@ class DeltaDataLayer(BaseDeltaDataLayer):
             if prev_tr_name is not None:
                 self._transformer_process_name = prev_tr_name
 
-        return TracedDataFrame(original_df, target_path, version)
+        return TracedDataFrame(original_df, table_name=tn, df_name=target_path, df_version=version)
 
     def read_json(self, *table_path, process_level_dir=None, has_extension=False) -> TracedDataFrame:
         """
@@ -767,6 +788,7 @@ class DeltaDataLayer(BaseDeltaDataLayer):
        :param has_extension:
        :return: DataFrame type with the content of delta table
        """
+        tn = self._flatten_table_name(*table_path)
         path = self._resolve_path(*table_path, process_level_dir=process_level_dir, has_extension=has_extension)
         name = self._resolve_relative_path(path)
         logger.info(f"Reading Json ← {path}")
@@ -777,7 +799,7 @@ class DeltaDataLayer(BaseDeltaDataLayer):
                 df = None
             else:
                 raise e
-        return None if df is None else TracedDataFrame(df, name, -1)
+        return None if df is None else TracedDataFrame(df, table_name=tn, df_name=name, df_version=-1)
 
     def read_delta(self, *table_path, process_level_dir=None) -> TracedDataFrame:
         """
@@ -794,6 +816,7 @@ class DeltaDataLayer(BaseDeltaDataLayer):
        :param table_path:
        :return: TracedDataFrame type with the content of delta table
        """
+        tn = self._flatten_table_name(*table_path)
         path = self._resolve_path(*table_path, process_level_dir=process_level_dir)
         name = self._resolve_relative_path(path)
         logger.info(f"Reading Delta ← {path}")
@@ -806,7 +829,7 @@ class DeltaDataLayer(BaseDeltaDataLayer):
                 version = -1
             else:
                 raise e
-        return None if df is None else TracedDataFrame(df, name, version)
+        return None if df is None else TracedDataFrame(df, table_name=tn, df_name= name, df_version=version)
 
     def get_delta_metatable(self, *table_path) -> DeltaTable:
         """
@@ -826,13 +849,14 @@ class DeltaDataLayer(BaseDeltaDataLayer):
         logger.info(f"Loading DeltaTable ← {path}")
         return DeltaTable.forPath(self.spark, path)
 
-    def sql(self, query: str) -> TracedDataFrame:
+    def sql(self, query: str, name: str =None) -> TracedDataFrame:
         """
         Returns a :class:`DataFrame` representing the result of the given query in SQL language.
         """
         logger.info(f"Executing SQL: {query}")
         df = self.spark.sql(query)
-        return df if isinstance(df, TracedDataFrame) else TracedDataFrame(df, source_name=query)
+        tn = name if name else "UNKNOWN"
+        return df if isinstance(df, TracedDataFrame) else TracedDataFrame(df, table_name=tn, df_name=query)
 
     @staticmethod
     def register_temp_table(df: DataFrame | TracedDataFrame, name: str = None):
@@ -845,10 +869,10 @@ class DeltaDataLayer(BaseDeltaDataLayer):
         """
         if not name:
             if isinstance(df, TracedDataFrame):
-                if df.source_version == -1:
-                    name = f"{df.source_name}"
+                if df.df_version == -1:
+                    name = f"{df.df_name}"
                 else:
-                    name = f"{df.source_name}_{df.source_version}"
+                    name = f"{df.df_name}_{df.df_version}"
             else:
                 raise Exception("For spark Dataframes, the name parameter is absolutely needed")
         df.createOrReplaceTempView(name)

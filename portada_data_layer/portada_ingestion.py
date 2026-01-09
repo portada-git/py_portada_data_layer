@@ -1,5 +1,7 @@
 import datetime
 import json
+import re
+
 from pyspark.sql.types import StringType, StructType, StructField, ArrayType
 
 from portada_data_layer.boat_fact_model import BoatFactDataModel
@@ -47,7 +49,7 @@ class PortadaIngestion(DeltaDataLayer):
 
         # Classificació i desduplicació
         try:
-            self.save_raw_data(*container_path, data={"source_path": dest_path, "data_json_array": data}, user=user)
+            self.save_raw_data(*container_path, data={"df_name": dest_path, "data_json_array": data}, user=user)
             logger.info("Classification/Deduplication process completed successfully.")
         except Exception as e:
             logger.error(f"Error during classification/deduplication: {e}")
@@ -194,14 +196,18 @@ class NewsExtractionIngestion(PortadaIngestion):
         source_version = -1
         if isinstance(data, dict):
             data_json_array = data["data_json_array"]
-            source_path = self._resolve_relative_path(data["source_path"])
+            source_path = self._resolve_relative_path(data["df_name"])
+            p = re.compile(f"{self.project_name}/{self._process_level_dirs_[self._current_process_level]}/(.*)")
+            tn = re.sub(p, "\\g<1>", source_path, 0)
         else:
             data_json_array = data
+            tn = "UNKNOWN"
             source_path = "UNKNOWN"
         df = TracedDataFrame(
             df=self.spark.read.json(
                 self.spark.sparkContext.parallelize([json.dumps(BoatFactDataModel(obj).reformat()) for obj in data_json_array])),
-            source_name=source_path,
+            table_name=tn,
+            df_name=source_path,
         )
 
         if not self.is_initialized():
@@ -422,11 +428,14 @@ class KnownEntitiesIngestion(PortadaIngestion):
         if data is None:
             raise ValueError("A DataFrame or JSON list must be passed.")
 
-        if isinstance(data, dict) and "source_path" in data:
-            source_path = self._resolve_relative_path(data["source_path"])
+        if isinstance(data, dict) and "df_name" in data:
+            source_path = self._resolve_relative_path(data["df_name"])
+            p = re.compile(f"{self.project_name}/{self._process_level_dirs_[self._current_process_level]}/(.*)")
+            tn = re.sub(p, "\\g<1>", source_path, 0)
             data = data["data"]
         else:
             data = data
+            tn = "UNKNOWN"
             source_path = "UNKNOWN"
         if isinstance(data, dict) and "names" in data:
             data = data["names"]
@@ -453,7 +462,8 @@ class KnownEntitiesIngestion(PortadaIngestion):
             [StructField("name", StringType(), False), StructField("voices", ArrayType(StringType()))])
         df = TracedDataFrame(
             df=self.spark.createDataFrame(structured_data, schema=schema),
-            source_name=source_path,
+            table_name=tn,
+            df_name=source_path,
         )
 
         if not self.is_initialized():
