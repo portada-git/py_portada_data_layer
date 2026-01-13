@@ -11,6 +11,8 @@ import os
 import logging
 import re
 
+from pyspark.sql.types import StructType, LongType
+
 from portada_data_layer.portada_delta_common import PortadaDeltaConstants
 from portada_data_layer.traced_data_frame import TracedDataFrame
 
@@ -597,6 +599,23 @@ class BaseDeltaDataLayer(ConfigDeltaDataLayer):
         return TracedDataFrame(self.spark.range(start=start, end=end, step=step, numPartitions=num_partitions),
                                table_name=tn, df_name=n)
 
+    def get_sequence_value(self, *name: str, increment: int = 1):
+        path = self._resolve_path(*name, process_level_dir="sequencer")
+        if self.path_exists(*name, process_level_dir="sequencer"):
+            seq = self.spark.read.format("delta").load(path)
+            current_row = seq.first()
+            current_value = current_row["value"] if current_row else 0
+            new_value = current_value + increment
+        else:
+            current_value = 0
+            new_value = current_value + increment
+
+        # Aquest és el pas que et faltava: tornar a convertir l'enter a DataFrame
+        seq = self.spark.createDataFrame([(new_value,)], ["value"])
+        seq.write.format("delta").mode("overwrite").save(path)
+        return current_value
+
+
 
 # ==============================================================
 # CLASS: DeltaDataLayer
@@ -692,7 +711,7 @@ class DeltaDataLayer(BaseDeltaDataLayer):
 
         return TracedDataFrame(original_df, table_name=tn, df_name=target_path, df_version=-1)
 
-    def write_delta(self, *table_path, df: DataFrame | TracedDataFrame, mode: str = "overwrite", partition_by:list =None):
+    def write_delta(self, *table_path, df: DataFrame | TracedDataFrame, mode: str = "overwrite", partition_by:list = None):
         """
         Write the dataframe df to delta table addressed by table_path.
         :param table_path: can be any of the following forms:

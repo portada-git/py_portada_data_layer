@@ -203,9 +203,14 @@ class NewsExtractionIngestion(PortadaIngestion):
             data_json_array = data
             tn = "UNKNOWN"
             source_path = "UNKNOWN"
+
+        length = len(data_json_array)
+        if length == 0:
+            return []
+        start_counter = self.get_sequence_value("entry_ships", BoatFactDataModel(data_json_array[0])["publication_name"].lower(), increment=len(data_json_array))
         df = TracedDataFrame(
             df=self.spark.read.json(
-                self.spark.sparkContext.parallelize([json.dumps(BoatFactDataModel(obj).reformat()) for obj in data_json_array])),
+                self.spark.sparkContext.parallelize([json.dumps(BoatFactDataModel(obj).reformat(i)) for i, obj in enumerate(data_json_array, start_counter)])),
             table_name=tn,
             df_name=source_path,
         )
@@ -215,8 +220,8 @@ class NewsExtractionIngestion(PortadaIngestion):
             logger.error(error_msg)
             raise ValueError(error_msg)
 
-        df = df.withColumn("entry_id", self.generate_uid_udf())
-        df.persist()
+        # df = df.withColumn("entry_id", self.generate_uid_udf())
+        # df.persist()
         if user is not None:
             df = df.withColumn("uploaded_by", F.lit(user))
         df = df.withColumn("publication_date_value", F.to_date("publication_date", "yyyy-MM-dd"))

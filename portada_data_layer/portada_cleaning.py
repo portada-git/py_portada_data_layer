@@ -1,8 +1,11 @@
 import json
 import re
+import os
 from pyspark.sql import DataFrame, functions as F
 from pyspark.sql.types import StringType, StructField, DateType, TimestampType, LongType, DoubleType, BooleanType, \
     StructType, ArrayType
+from sqlalchemy import values
+
 from portada_data_layer import DeltaDataLayer, TracedDataFrame, block_transformer_method
 from portada_data_layer.boat_fact_model import BoatFactDataModel
 from portada_data_layer.data_lake_metadata_manager import data_transformer_method, LineageCheckingType, \
@@ -13,13 +16,20 @@ from portada_data_layer.portada_delta_common import registry_to_portada_builder
 @registry_to_portada_builder
 @enable_field_lineage_log_for_class
 class PortadaCleaning(DeltaDataLayer):
-    # ARRAY_INDEX_REGEX = re.compile(r"\[\d+]")  # exemple: a[0].b → a[*].b
-
     def __init__(self, builder=None, cfg_json: dict = None):
         super().__init__(builder=builder, cfg_json=cfg_json, )
+        schema_path = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', "config",  "schema.json"))
+        mapping_path = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', "config", "mapping_to_clean_chars.json"))
+
         self._schema = {}
+        self._mapping_to_clean_chars = {}
         # self._allowed_paths=None
         self._current_process_level = 1
+        with open(schema_path) as f:
+            self._schema = json.load(f)
+
+        with open(mapping_path) as f:
+            self._mapping_to_clean_chars = json.load(f)
 
     @staticmethod
     def _collect_list_of_fields(schema: dict) -> set:
@@ -123,6 +133,97 @@ class PortadaCleaning(DeltaDataLayer):
         ret = _json_schema_to_normalize_columns(schema, col_name, ret)
         return ret
 
+    def _json_schema_to_normalize_values(self, schema: dict, all_mapping: dict, current_expr):
+
+
+        t = schema.get("type")
+
+        # --- CASE: NUMBER OR DATE TYPE ---
+        if t in ["integer", "number", "float"] or (t == "string" and schema.get("format") == "date"):
+            mapping = all_mapping.get("numeric_map", {})
+            return self.apply_ocr_corrections(current_expr, mapping)
+
+        # --- CASE: STRINGS ---
+        elif t == "string":
+            if "for_cleaning" in schema:
+                return self.apply_cleaning_process(current_expr, schema.get("for_cleaning"), all_mapping)
+            else:
+                return F.regexp_replace(F.trim(current_expr), r"[.,; \t]+$", "")
+
+        # --- CASE: OBJECTS (STRUCTS) ---
+        elif t == "object":
+            properties = schema.get("properties", {})
+            fields = []
+            for f_name, f_schema in properties.items():
+                transformed_field = self._json_schema_to_normalize_values(
+                    f_schema, all_mapping, current_expr[f_name]
+                )
+                if transformed_field is not None:
+                    fields.append(transformed_field.alias(f_name))
+
+            # Retornem tot l'objecte reconstruït com un struct
+            return F.struct(fields) if fields else current_expr
+
+        # --- CASE: ARRAYS ---
+        elif t == "array":
+            items_schema = schema.get("items", {})
+            return F.transform(
+                current_expr,
+                lambda x: self._json_schema_to_normalize_values(items_schema, all_mapping, x)
+            )
+
+        return current_expr
+
+    @staticmethod
+    def apply_ocr_corrections(col, mapping):
+        wrong_chars = "".join(mapping.keys())
+        correct_chars = "".join(mapping.values())
+
+        return F.translate(col, wrong_chars, correct_chars)
+
+    @staticmethod
+    def apply_cleaning_process(col, for_cleaning_list: list, mapping: dict):
+        def change_chars(c, m: dict = None):
+            map_for_translate = {}
+            map_for_replace = {}
+            for k, v in m.items():
+                if v and len(k)==1:
+                    map_for_translate[k] = v
+                else:
+                    map_for_replace[k] = v
+            wrong_chars = "".join(map_for_translate.keys())
+            correct_chars = "".join(map_for_translate.values())
+            expr_col = c
+            for w, r in map_for_replace.items():
+                if len(w)==1:
+                    w = re.escape(w)
+                expr_col = F.regexp_replace(expr_col, w, r)
+            return F.translate(expr_col, wrong_chars, correct_chars)
+
+        def one_word(c, m: dict = None):
+           return change_chars(c, m.get("one_word_map", {}))
+
+        def not_digit(c, m: dict = None):
+            return change_chars(c, m.get("only_text_map", {}))
+
+        def not_paragraph(c, m: dict = None):
+            return change_chars(c, m.get("not_paragraph_map", {}))
+
+        processes = {"one_word":one_word, "not_digits":not_digit}
+        if "paragraph"  in for_cleaning_list or "not_cleanable" in for_cleaning_list:
+            expr = col
+        elif "accepted_abbreviations" in for_cleaning_list:
+            expr = F.trim(col)
+            expr = F.when(F.length(expr) > 5, F.regexp_replace(expr, r"[.,;]+$", "")).otherwise(expr)
+        else:
+            expr = F.regexp_replace(F.trim(col), r"[.,;]+$", "")
+        if "paragraph" not in for_cleaning_list and "one_word" not in for_cleaning_list:
+            not_paragraph(expr, mapping)
+        for process in for_cleaning_list:
+            if process in processes:
+                expr = processes[process](expr, mapping)
+        return expr
+
     @staticmethod
     def json_schema_to_spark_type(schema: dict):
         schema_type = schema.get("type")
@@ -181,14 +282,22 @@ class PortadaCleaning(DeltaDataLayer):
         self._schema = json_schema
         return self
 
+    def use_mapping_to_clean_chars(self, mapping: dict):
+        self._mapping_to_clean_chars = mapping
+        return self
+
+
+
     @block_transformer_method
     def cleaning(self, df: DataFrame | TracedDataFrame) -> TracedDataFrame:
         # 1.- save original values
         df = self.save_original_values_of_ship_entries(df)
         # 2.- prune values
         df = self.prune_unaccepted_fields(df)
-        # 3.- Normalice values
+        # 3.- Normalize structure
         df = self.normalize_field_structure(df)
+        # 3.- Normalize values
+        df = self.normalize_field_value(df)
         return df
 
     @data_transformer_method()
@@ -215,9 +324,13 @@ class PortadaCleaning(DeltaDataLayer):
     def normalize_field_value(self, df: TracedDataFrame) -> TracedDataFrame:
         if self._schema is None:
             raise ValueError("Cal cridar use_schema() abans.")
-        f_columns = self._json_schema_to_normalize_values(self._schema)
-        for c_name, col_trans in f_columns.items():
-            df = df.withColumn(c_name, col_trans)
+        final_expressions = {}
+        properties = self._schema.get("properties", {})
+
+        for field_name, field_schema in properties.items():
+            # Obtenim l'expressió completa per a tota la columna (sigui simple, struct o array)
+            expr = self._json_schema_to_normalize_values(field_schema, self._mapping_to_clean_chars, F.col(field_name))
+            df = df.withColumn(field_name, expr)
         return df
 
     @data_transformer_method(description="prune unbelonging model fields ")

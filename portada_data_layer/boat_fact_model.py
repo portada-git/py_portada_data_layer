@@ -15,6 +15,7 @@ class BoatFactDataModel(dict):
     EXTRACTION_SOURCE_METHOD_FIELD = "extraction_source_method"
     MORE_EXTRACTED_VALUES_FIELD = "more_extracted_values"
     PUBLICATION_DATE_FIELD = "publication_date"
+    PUBLICATION_NAME_FIELD = "publication_name"
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -48,7 +49,7 @@ class BoatFactDataModel(dict):
         else:
             return default
 
-    def reformat(self):
+    def reformat(self, id):
         ret = {}
         for key in self:
             if self.__is_json_structured_field(key):
@@ -75,7 +76,9 @@ class BoatFactDataModel(dict):
             )
             ret[BoatFactDataModel.PUBLICATION_DATE_FIELD] = datetime.datetime.fromtimestamp(int(ret[BoatFactDataModel.PUBLICATION_DATE_FIELD])/1000.0).strftime('%Y-%m-%d')
             ret[f"{BoatFactDataModel.PUBLICATION_DATE_FIELD}_{self.EXTRACTION_SOURCE_METHOD_FIELD}"] = "boat_fact_model"
-
+        ret["entry_id"] = f"{ret[BoatFactDataModel.PUBLICATION_NAME_FIELD]}_{id}"
+        ret[f"entry_id_{self.EXTRACTION_SOURCE_METHOD_FIELD}"] = "boat_fact_model"
+        ret[f"entry_id_{self.MORE_EXTRACTED_VALUES_FIELD}"] = []
         return ret
 
     def __is_json_structured_field(self, key):
