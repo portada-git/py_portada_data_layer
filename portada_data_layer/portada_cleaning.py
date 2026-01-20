@@ -134,10 +134,7 @@ class PortadaCleaning(DeltaDataLayer):
         return ret
 
     def _json_schema_to_normalize_values(self, schema: dict, all_mapping: dict, current_expr):
-
-
         t = schema.get("type")
-
         # --- CASE: NUMBER OR DATE TYPE ---
         if t in ["integer", "number", "float"] or (t == "string" and schema.get("format") == "date"):
             mapping = all_mapping.get("numeric_map", {})

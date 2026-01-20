@@ -49,7 +49,7 @@ class PortadaIngestion(DeltaDataLayer):
 
         # Classificació i desduplicació
         try:
-            self.save_raw_data(*container_path, data={"df_name": dest_path, "data_json_array": data}, user=user)
+            self.save_raw_data(*container_path, data={"source_path": dest_path, "data_json_array": data}, user=user)
             logger.info("Classification/Deduplication process completed successfully.")
         except Exception as e:
             logger.error(f"Error during classification/deduplication: {e}")
@@ -125,7 +125,7 @@ class PortadaIngestion(DeltaDataLayer):
             return data, dest_path
         return data
 
-    def save_raw_data(self, *container_path, data: dict | list = None, user: str = None, **kwargs):
+    def save_raw_data(self, *container_path, data: dict | list = None, user: str = None, source_path: str = None, **kwargs):
         pass
 
     def read_raw_data(self, *container_path, user: str = None, **kwargs):
@@ -185,7 +185,7 @@ class NewsExtractionIngestion(PortadaIngestion):
 
     @data_transformer_method(
         description="Extract values from original files and organize them by news publication metadata.")
-    def save_raw_data(self, *container_path, data: dict | list = None, user: str = None, **kwargs):
+    def save_raw_data(self, *container_path, data: dict | list = None, user: str = None, source_path: str = None, **kwargs):
         """
         Save an array of ship entries (JSON) adding or updating them in files organized by:  date_path / publication_name / y / m / d / publication_edition
         """
@@ -196,13 +196,19 @@ class NewsExtractionIngestion(PortadaIngestion):
         source_version = -1
         if isinstance(data, dict):
             data_json_array = data["data_json_array"]
-            source_path = self._resolve_relative_path(data["df_name"])
+            source_path = self._resolve_relative_path(data["source_path"])
             p = re.compile(f"{self.project_name}/{self._process_level_dirs_[self._current_process_level]}/(.*)")
             tn = re.sub(p, "\\g<1>", source_path, 0)
         else:
             data_json_array = data
-            tn = "UNKNOWN"
-            source_path = "UNKNOWN"
+            if source_path is None:
+                tn = "UNKNOWN"
+                source_path = "UNKNOWN"
+            else:
+                source_path = self._resolve_relative_path(source_path)
+                p = re.compile(f"{self.project_name}/{self._process_level_dirs_[self._current_process_level]}/(.*)")
+                tn = re.sub(p, "\\g<1>", source_path, 0)
+
 
         length = len(data_json_array)
         if length == 0:
@@ -427,21 +433,27 @@ class KnownEntitiesIngestion(PortadaIngestion):
         return super().copy_ingested_raw_data(*container_path, local_path=local_path,
                                               return_dest_path=return_dest_path)
 
-    def save_raw_data(self, *container_path, data: dict | list = None, **kwargs):
+    def save_raw_data(self, *container_path, data: dict | list = None, source_path: str = None, **kwargs):
         super().save_raw_data(*container_path, data=data, **kwargs)
         container_path = self.__resolve_container_path(*container_path)
         if data is None:
             raise ValueError("A DataFrame or JSON list must be passed.")
 
-        if isinstance(data, dict) and "df_name" in data:
-            source_path = self._resolve_relative_path(data["df_name"])
+        if isinstance(data, dict) and "source_path" in data:
+            source_path = self._resolve_relative_path(data["source_path"])
             p = re.compile(f"{self.project_name}/{self._process_level_dirs_[self._current_process_level]}/(.*)")
             tn = re.sub(p, "\\g<1>", source_path, 0)
             data = data["data"]
         else:
             data = data
-            tn = "UNKNOWN"
-            source_path = "UNKNOWN"
+            if source_path is None:
+                tn = "UNKNOWN"
+                source_path = "UNKNOWN"
+            else:
+                source_path = self._resolve_relative_path(source_path)
+                p = re.compile(f"{self.project_name}/{self._process_level_dirs_[self._current_process_level]}/(.*)")
+                tn = re.sub(p, "\\g<1>", source_path, 0)
+
         if isinstance(data, dict) and "names" in data:
             data = data["names"]
         elif isinstance(data, str):
@@ -506,8 +518,8 @@ class BoatFactIngestion(NewsExtractionIngestion):
                                               return_dest_path=return_dest_path)
 
 
-    def save_raw_data(self, data: dict | list = None, user:str = None, **kwargs):
-        return super().save_raw_data(self.__container_path, user=user, data=data, **kwargs)
+    def save_raw_data(self, data: dict | list = None, user:str = None, source_path: str = None, **kwargs):
+        return super().save_raw_data(self.__container_path, user=user, data=data, source_path=source_path, **kwargs)
 
     def read_raw_data(self, publication_name: str = None, y: int | str = None, m: int | str = None, d: int | str = None,
                       edition: str = None, user: str = None, **kwargs):
