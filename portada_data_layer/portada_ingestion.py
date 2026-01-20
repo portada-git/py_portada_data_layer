@@ -433,6 +433,7 @@ class KnownEntitiesIngestion(PortadaIngestion):
         return super().copy_ingested_raw_data(*container_path, local_path=local_path,
                                               return_dest_path=return_dest_path)
 
+    @data_transformer_method(description="Copy the original file to the FileSystem (HDFS/S3/file)")
     def save_raw_data(self, *container_path, data: dict | list = None, source_path: str = None, **kwargs):
         super().save_raw_data(*container_path, data=data, **kwargs)
         container_path = self.__resolve_container_path(*container_path)
@@ -490,11 +491,14 @@ class KnownEntitiesIngestion(PortadaIngestion):
 
         base_path = f"{self._resolve_path(*container_path)}"
         self.write_delta(base_path, df=df, mode="overwrite")
+        return df
 
     def copy_ingested_entities(self, entity: str, local_path: str, return_dest_path=False):
         return self.copy_ingested_raw_data(entity, local_path=local_path,
                                            return_dest_path=return_dest_path)
 
+    @data_transformer_method(
+        description="Extract values from original files and save as delta format.")
     def save_raw_entities(self, entity: str, data: dict | list = None):
         return self.save_raw_data(entity, data=data)
 
