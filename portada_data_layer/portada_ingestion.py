@@ -125,7 +125,7 @@ class PortadaIngestion(DeltaDataLayer):
             return data, dest_path
         return data
 
-    def save_raw_data(self, *container_path, data: dict | list = None, user: str = None, source_path: str = None, **kwargs):
+    def save_raw_data(self, *container_path, data: dict | list = None, user: str = None, source_path: str = None, return_none: bool = False,  **kwargs):
         pass
 
     def read_raw_data(self, *container_path, user: str = None, **kwargs):
@@ -177,15 +177,15 @@ class NewsExtractionIngestion(PortadaIngestion):
         #     )
         # )
 
-        @F.udf(StringType())
-        def generate_uid():
-            return str(uuid.uuid4())
-
-        self.generate_uid_udf = generate_uid
+        # @F.udf(StringType())
+        # def generate_uid():
+        #     return str(uuid.uuid4())
+        #
+        # self.generate_uid_udf = generate_uid
 
     @data_transformer_method(
         description="Extract values from original files and organize them by news publication metadata.")
-    def save_raw_data(self, *container_path, data: dict | list = None, user: str = None, source_path: str = None, **kwargs):
+    def save_raw_data(self, *container_path, data: dict | list = None, user: str = None, source_path: str = None, return_none: bool = False, **kwargs):
         """
         Save an array of ship entries (JSON) adding or updating them in files organized by:  date_path / publication_name / y / m / d / publication_edition
         """
@@ -212,7 +212,7 @@ class NewsExtractionIngestion(PortadaIngestion):
 
         length = len(data_json_array)
         if length == 0:
-            return []
+            return None if return_none else []
         start_counter = self.get_sequence_value("entry_ships", BoatFactDataModel(data_json_array[0])["publication_name"].lower(), increment=len(data_json_array))
         df = TracedDataFrame(
             df=self.spark.read.json(
@@ -297,7 +297,7 @@ class NewsExtractionIngestion(PortadaIngestion):
 
         logger.info(f"{regs} entries was saved")
 
-        return df_list
+        return None if return_none else df_list
 
     def read_raw_data(self, *container_path, user: str = None, publication_name: str = None, y: int | str = None, m: int | str = None,
                       d: int | str = None, edition: str = None):
@@ -433,7 +433,7 @@ class KnownEntitiesIngestion(PortadaIngestion):
                                               return_dest_path=return_dest_path)
 
     @data_transformer_method(description="Copy the original file to the FileSystem (HDFS/S3/file)")
-    def save_raw_data(self, *container_path, data: dict | list = None, source_path: str = None, **kwargs):
+    def save_raw_data(self, *container_path, data: dict | list = None, source_path: str = None, return_none: bool = False, **kwargs):
         super().save_raw_data(*container_path, data=data, **kwargs)
         container_path = self.__resolve_container_path(*container_path)
         if data is None:
@@ -490,7 +490,7 @@ class KnownEntitiesIngestion(PortadaIngestion):
 
         base_path = f"{self._resolve_path(*container_path)}"
         self.write_delta(base_path, df=df, mode="overwrite")
-        return df
+        return None if return_none else df
 
     def copy_ingested_entities(self, entity: str, local_path: str, return_dest_path=False):
         return self.copy_ingested_raw_data(entity, local_path=local_path,
@@ -521,8 +521,8 @@ class BoatFactIngestion(NewsExtractionIngestion):
                                               return_dest_path=return_dest_path)
 
 
-    def save_raw_data(self, data: dict | list = None, user:str = None, source_path: str = None, **kwargs):
-        return super().save_raw_data(self.__container_path, user=user, data=data, source_path=source_path, **kwargs)
+    def save_raw_data(self, data: dict | list = None, user:str = None, source_path: str = None, return_none: bool = False, **kwargs):
+        return super().save_raw_data(self.__container_path, user=user, data=data, source_path=source_path, return_none=return_none, **kwargs)
 
     def read_raw_data(self, publication_name: str = None, y: int | str = None, m: int | str = None, d: int | str = None,
                       edition: str = None, user: str = None, **kwargs):
