@@ -44,22 +44,152 @@ class PortadaCleaning(DeltaDataLayer):
         for field_name in props:
             fields.add(field_name)
             fields.add(f"{field_name}_{BoatFactDataModel.EXTRACTION_SOURCE_METHOD_FIELD}")
-            fields.add(f"{field_name}_{BoatFactDataModel.MORE_EXTRACTED_VALUES_FIELD}")
+            fields.add(f"{field_name}_{BoatFactDataModel.DETAILED_VALUE_FIELD}")
         return fields
 
     @staticmethod
-    def _json_schema_to_normalize_columns(schema: dict, col_name: str = None):
+    def _parse_as(_col, struct):
+        # Només parsegem si el tipus esperat és STRUCT
+        if not (isinstance(struct, StructType) or isinstance(struct, ArrayType)):
+            return _col.cast(struct)
+        # Convertim a string sempre
+        s = _col.cast("string")
+
+        # Detectem JSON
+        looks_like_json = s.startswith("{") & s.endswith("}") | s.startswith("[") & s.endswith("]")
+
+        # from_json mai llença error
+        parsed = F.from_json(s, struct)
+        return F.when(looks_like_json, parsed).otherwise(F.lit(None))
+
+    @staticmethod
+    def _resolve_column_path(root_col, ref):
+        t = ref.get("type")
+        v = ref.get("value")
+
+        if t == "expr":
+            return F.expr(v)
+
+        if t == "literal":
+            return F.lit(v)
+
+        if t == "column":
+            # Si el valor és exactament "old_value", retornem la columna arrel
+            if v == "old_value":
+                return root_col
+
+            # Eliminem el prefix "old_value." si existeix
+            clean_path = re.sub(r"^old_value\.", "", v)
+
+            # Naveguem pel path
+            parts = clean_path.split(".")
+            res = root_col
+            for p in parts:
+                res = res[p]
+            return res
+
+        return F.lit(None)
+
+    @staticmethod
+    def _build_equivalence_expr(old_col, equivalence_rule):
+        """
+        Construeix l'expressió que transforma el valor 'castejat' (old_col)
+        a la nova estructura definida a 'equivalence'.
+        """
+        eq_type = equivalence_rule.get("type")
+
+        # Cas 1: Construir un nou Struct
+        if eq_type == "struct":
+            new_values = equivalence_rule.get("new_value", {})
+            struct_fields = []
+            for field_name, logic in new_values.items():
+                # Cridem recursivament per a cada camp de l'struct
+                col_expr = PortadaCleaning._resolve_column_path(old_col, logic).alias(field_name)
+                struct_fields.append(col_expr)
+            return F.struct(*struct_fields)
+        else:
+            return PortadaCleaning._resolve_column_path(old_col, equivalence_rule.get("new_value"))
+
+    @staticmethod
+    def _build_try_cast_logic(raw_col, normalize_spec):
+        """
+        Crea l'expressió complexa amb COALESCE per provar opcions.
+        """
+        if "options" not in normalize_spec:
+            return PortadaCleaning._build_equivalence_expr(raw_col, normalize_spec["equivalence"])
+
+        options_exprs = []
+        # 1. Iterar per les opcions de 'try_cast_to'
+        for option in normalize_spec.get("options", []):
+            try_schema_json = option.get("try_cast_to")
+            spark_schema, _ = PortadaCleaning.json_schema_to_spark_type(try_schema_json)
+            parsed = PortadaCleaning._parse_as(raw_col, spark_schema)
+            equivalence_expr = PortadaCleaning._build_equivalence_expr(parsed, option["equivalence"])
+            # Si 'parsed' és null (el cast ha fallat), hem de retornar NULL explícitament
+            # perquè el coalesce passi a la següent opció.
+            options_exprs.append(F.when(parsed.isNotNull(), equivalence_expr))
+
+        # 2. Gestionar el 'otherwise'
+        if "otherwise" in normalize_spec:
+            otherwise_spec = normalize_spec.get("otherwise")
+            # Nota: L'otherwise sol treballar sobre l'string original cru
+            otherwise_expr = PortadaCleaning._build_equivalence_expr(raw_col, otherwise_spec.get("equivalence"))
+            options_exprs.append(otherwise_expr)
+
+        # 3. Retornar el primer que no sigui null
+        return F.coalesce(*options_exprs)
+
+    @staticmethod
+    def _build_normalize_expr_with_spec(raw_col, normalize_spec):
+        norm_type = normalize_spec.get("type", "single")
+        # options = normalize_spec.get("options", [])
+        # otherwise = normalize_spec.get("otherwise")
+
+        # CAS 1: FOREACH_ITEM (Arrays)
+        if norm_type == "foreach_item":
+            # Pas A: L'entrada és un string "[{},{}]". Primer el trenquem en Array<String>.
+            # Això ens dóna un array on cada element és l'string JSON de l'objecte.
+            array_of_strings = PortadaCleaning._parse_as(raw_col, ArrayType(StringType()))
+
+            # Pas B: Utilitzem TRANSFORM per aplicar la lògica a cada element de l'array
+
+            return F.transform(
+                array_of_strings,
+                lambda x: PortadaCleaning._build_try_cast_logic(x, normalize_spec)
+            )
+
+        # CAS 2: SINGLE (Objectes o valors simples)
+        else:
+            return PortadaCleaning._build_try_cast_logic(raw_col, normalize_spec)
+
+    @staticmethod
+    def _build_normalize_expr(raw_col, schema: dict):
+        # Comprovar si hi ha lògica de normalització complexa
+        if "normalize" in schema:
+            print(f"Applying normalize logic for: {raw_col.alias()}")
+            expr = PortadaCleaning._build_normalize_expr_with_spec(raw_col, schema["normalize"])
+        else:
+            # Lògica estàndard (Sense 'normalize')
+            json_type = schema.get("type")
+
+            target_schema, _ = PortadaCleaning.json_schema_to_spark_type(schema, primitive_types_as_strings=True)
+            expr = PortadaCleaning._parse_as(raw_col, target_schema)
+        return expr
+
+
+    @staticmethod
+    def _json_schema_to_normalize_columns_no(schema: dict, col_name: str = None):
         ret = {}
 
         def _parse_as(_col, struct):
             # Només parsegem si el tipus esperat és STRUCT
-            if not isinstance(struct, StructType):
+            if not (isinstance(struct, StructType) or isinstance(struct, ArrayType)):
                 return _col.cast(struct)
             # Convertim a string sempre
             s = _col.cast("string")
 
             # Detectem JSON
-            looks_like_json = s.startswith("{") & s.endswith("}")
+            looks_like_json = s.startswith("{") & s.endswith("}") | s.startswith("[") & s.endswith("]")
 
             # from_json mai llença error
             parsed = F.from_json(s, struct)
@@ -77,6 +207,7 @@ class PortadaCleaning(DeltaDataLayer):
                 return _resolved_value
             if ref["type"]=="literal":
                 return F.lit(ref["value"])
+            return None
 
         def _normalize(_col, _norm_props: dict):
             if "options" not in _norm_props:
@@ -114,7 +245,7 @@ class PortadaCleaning(DeltaDataLayer):
                 normalize_properties = _schema.get("normalize")
                 if normalize_properties["type"] == "foreach_item":
                     _ret[_col_name] = F.transform(
-                        F.col(_col_name),
+                        _parse_as(F.col(_col_name), ArrayType(StringType())),
                         lambda x: _normalize(x, normalize_properties)
                     )
                 else:  # normalize_properties["type"] == "value":
@@ -198,7 +329,7 @@ class PortadaCleaning(DeltaDataLayer):
             return F.translate(expr_col, wrong_chars, correct_chars)
 
         def one_word(c, m: dict = None):
-           return change_chars(c, m.get("one_word_map", {}))
+            return change_chars(c, m.get("one_word_map", {}))
 
         def not_digit(c, m: dict = None):
             return change_chars(c, m.get("only_text_map", {}))
@@ -222,27 +353,34 @@ class PortadaCleaning(DeltaDataLayer):
         return expr
 
     @staticmethod
-    def json_schema_to_spark_type(schema: dict):
+    def json_schema_to_spark_type(schema: dict, primitive_types_as_strings: bool = False):
         schema_type = schema.get("type")
         nullable = schema.get("nullable", True)
 
         # --- Tipus primitius ---
         if schema_type == "string":
-            fmt = schema.get("format")
-            if fmt == "date":
-                return DateType(), nullable
-            elif fmt in ("date-time", "datetime"):
-                return TimestampType(), nullable
+            if not primitive_types_as_strings:
+                fmt = schema.get("format")
+                if fmt == "date":
+                    return DateType(), nullable
+                elif fmt in ("date-time", "datetime"):
+                    return TimestampType(), nullable
             return StringType(), nullable
 
         if schema_type == "integer":
             # Recomanable LongType per dades històriques
+            if primitive_types_as_strings:
+                return StringType(), nullable
             return LongType(), nullable
 
         if schema_type == "number":
+            if primitive_types_as_strings:
+                return StringType(), nullable
             return DoubleType(), nullable
 
         if schema_type == "boolean":
+            if primitive_types_as_strings:
+                return StringType(), nullable
             return BooleanType(), nullable
 
         # --- Objecte ---
@@ -252,7 +390,7 @@ class PortadaCleaning(DeltaDataLayer):
             required = set(schema.get("required", []))
 
             for field_name, field_schema in properties.items():
-                field_type, field_nullable = PortadaCleaning.json_schema_to_spark_type(field_schema)
+                field_type, field_nullable = PortadaCleaning.json_schema_to_spark_type(field_schema, primitive_types_as_strings)
 
                 # JSON Schema: si és required → nullable = False
                 if field_name in required:
@@ -270,7 +408,7 @@ class PortadaCleaning(DeltaDataLayer):
             if not items_schema:
                 raise ValueError("Array schema must define 'items'")
 
-            element_type, _ = PortadaCleaning.json_schema_to_spark_type(items_schema)
+            element_type, _ = PortadaCleaning.json_schema_to_spark_type(items_schema, primitive_types_as_strings)
             return ArrayType(element_type), nullable
 
         raise ValueError(f"Unsupported JSON schema type: {schema_type}")
@@ -310,18 +448,27 @@ class PortadaCleaning(DeltaDataLayer):
 
     @data_transformer_method()
     def normalize_field_structure(self, df: TracedDataFrame) -> TracedDataFrame:
+        # if self._schema is None:
+        #     raise ValueError("Cal cridar use_schema() abans.")
+        # f_columns = self._json_schema_to_normalize_columns_no(self._schema)
+        # for c_name, col_trans in f_columns.items():
+        #     df = df.withColumn(c_name, col_trans)
+        # return df
         if self._schema is None:
             raise ValueError("Cal cridar use_schema() abans.")
-        f_columns = self._json_schema_to_normalize_columns(self._schema)
-        for c_name, col_trans in f_columns.items():
-            df = df.withColumn(c_name, col_trans)
-        return df
+        final_expressions = {}
+        properties = self._schema.get("properties", {})
+        selects = []
+        for field_name, field_schema in properties.items():
+            # Obtenim l'expressió completa per a tota la columna (sigui simple, struct o array)
+            expr = self._build_normalize_expr(F.col(field_name), field_schema)
+            selects.append(expr.alias(field_name))
+        return df.select(*selects)
 
     @data_transformer_method()
     def normalize_field_value(self, df: TracedDataFrame) -> TracedDataFrame:
         if self._schema is None:
             raise ValueError("Cal cridar use_schema() abans.")
-        final_expressions = {}
         properties = self._schema.get("properties", {})
 
         for field_name, field_schema in properties.items():

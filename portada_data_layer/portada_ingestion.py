@@ -268,8 +268,7 @@ class NewsExtractionIngestion(PortadaIngestion):
             if self.json_file_exist(full_path):
                 existing_df = self.read_json(full_path)
                 existing_df = existing_df.localCheckpoint()
-                merged_df = subset.unionByName(existing_df, allowMissingColumns=True).dropDuplicates(
-                    ["parsed_text"])
+                merged_df = subset.unionByName(existing_df, allowMissingColumns=True).dropDuplicates(["parsed_text"])
                 duplicates = subset.count() + existing_df.count() - merged_df.count()
                 regs += merged_df.count()
                 if duplicates > 0:
