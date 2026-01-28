@@ -53,8 +53,8 @@ class AbstractDeltaDataLayerBuilder(PortadaDeltaConstants):
 
         if "configs" in json_config:
             for c in json_config["configs"]:
-                k = c.keys()[0]
-                self._configs[k](c[k])
+                k = next(iter(c))
+                self._configs[k]=c[k]
 
         for key, value in json_config.items():
             if key == "configs":
