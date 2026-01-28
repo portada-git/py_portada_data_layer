@@ -601,18 +601,28 @@ class BaseDeltaDataLayer(ConfigDeltaDataLayer):
 
     def get_sequence_value(self, *name: str, increment: int = 1):
         path = self._resolve_path(*name, process_level_dir="sequencer")
+        # if self.path_exists(*name, process_level_dir="sequencer"):
+        #     seq = self.spark.read.format("delta").load(path)
+        #     current_row = seq.first()
+        #     current_value = current_row["value"] if current_row else 0
+        #     new_value = current_value + increment
+        # else:
+        #     current_value = 0
+        #     new_value = current_value + increment
+        #
+        # # Aquest és el pas que et faltava: tornar a convertir l'enter a DataFrame
+        # seq = self.spark.createDataFrame([(new_value,)], ["value"])
+        # seq.write.format("delta").mode("overwrite").save(path)
         if self.path_exists(*name, process_level_dir="sequencer"):
-            seq = self.spark.read.format("delta").load(path)
-            current_row = seq.first()
-            current_value = current_row["value"] if current_row else 0
-            new_value = current_value + increment
+            deltaTable = DeltaTable.forPath(self.spark, path)
+            current_value = deltaTable.toDF().first()["value"]
+            # Actualitzem directament sobre la taula Delta
+            deltaTable.update(set={"value": f"value + {increment}"})
         else:
+            # Primera vegada
+            df = self.spark.createDataFrame([(increment,)], ["value"])
+            df.write.format("delta").save(path)
             current_value = 0
-            new_value = current_value + increment
-
-        # Aquest és el pas que et faltava: tornar a convertir l'enter a DataFrame
-        seq = self.spark.createDataFrame([(new_value,)], ["value"])
-        seq.write.format("delta").mode("overwrite").save(path)
         return current_value
 
 
