@@ -16,18 +16,18 @@ from portada_data_layer.portada_delta_common import registry_to_portada_builder
 class PortadaCleaning(DeltaDataLayer):
     def __init__(self, builder=None, cfg_json: dict = None):
         super().__init__(builder=builder, cfg_json=cfg_json, )
-        schema_path = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', "config",  "schema.json"))
-        mapping_path = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', "config", "mapping_to_clean_chars.json"))
+        # schema_path = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', "config",  "schema.json"))
+        # mapping_path = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', "config", "mapping_to_clean_chars.json"))
 
         self._schema = {}
         self._mapping_to_clean_chars = {}
         # self._allowed_paths=None
         self._current_process_level = 1
-        with open(schema_path) as f:
-            self._schema = json.load(f)
-
-        with open(mapping_path) as f:
-            self._mapping_to_clean_chars = json.load(f)
+        # with open(schema_path) as f:
+        #     self._schema = json.load(f)
+        #
+        # with open(mapping_path) as f:
+        #     self._mapping_to_clean_chars = json.load(f)
 
     @staticmethod
     def _collect_list_of_fields(schema: dict) -> set:
