@@ -155,6 +155,11 @@ class AbstractDeltaDataLayerBuilder(PortadaDeltaConstants):
     def process_levels(self):
         return self.DEFAULT_RAW_SUBDIR, self.DEFAULT_TO_CLEAN_SUBDIR, self.DEFAULT_TO_CURATE_SUBDIR, self.DEFAULT_CURATED_SUBDIR, ""
 
+    def close_session(self):
+        b = self.get_spark_builder()
+        s = b.getOrCreate()
+        s.stop()
+
 
 # ==============================================================
 # BUILDER: DeltaDataLayerBuilder
