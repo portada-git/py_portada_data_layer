@@ -4,8 +4,6 @@ import os
 from pyspark.sql import DataFrame, functions as F
 from pyspark.sql.types import StringType, StructField, DateType, TimestampType, LongType, DoubleType, BooleanType, \
     StructType, ArrayType
-from sqlalchemy import values
-
 from portada_data_layer import DeltaDataLayer, TracedDataFrame, block_transformer_method
 from portada_data_layer.boat_fact_model import BoatFactDataModel
 from portada_data_layer.data_lake_metadata_manager import data_transformer_method, LineageCheckingType, \
