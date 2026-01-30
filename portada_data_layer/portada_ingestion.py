@@ -512,6 +512,9 @@ class KnownEntitiesIngestion(PortadaIngestion):
 class BoatFactIngestion(NewsExtractionIngestion):
     __container_path = "ship_entries"
 
+    def ingest(self, local_path: str, user: str ):
+        super().ingest(self.__container_path, local_path=local_path, user=user)
+
     def copy_ingested_raw_data(self, local_path: str, return_dest_path=False, user: str=None):
         if user is None:
             return super().copy_ingested_raw_data(self.__container_path, local_path=local_path,
