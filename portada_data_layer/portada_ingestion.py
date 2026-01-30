@@ -512,8 +512,24 @@ class KnownEntitiesIngestion(PortadaIngestion):
 class BoatFactIngestion(NewsExtractionIngestion):
     __container_path = "ship_entries"
 
+    @block_transformer_method
     def ingest(self, local_path: str, user: str ):
-        super().ingest(self.__container_path, local_path=local_path, user=user)
+        if not os.path.exists(local_path):
+            raise FileNotFoundError(f"Ingest file not found: {local_path}")
+
+        logger.info(f"Starting ingestion process for {local_path}")
+
+        # Copy original file from local to data lake and get data
+        data, dest_path = self.copy_ingested_raw_data(local_path=local_path, user=user, return_dest_path=True)
+
+        # Classificació i desduplicació
+        try:
+            self.save_raw_data(data={"source_path": dest_path, "data_json_array": data}, user=user)
+            logger.info("Classification/Deduplication process completed successfully.")
+        except Exception as e:
+            logger.error(f"Error during classification/deduplication: {e}")
+            raise
+        logger.info("Ingestion process completed successfully.")
 
     def copy_ingested_raw_data(self, local_path: str, return_dest_path=False, user: str=None):
         if user is None:
