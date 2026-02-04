@@ -271,6 +271,10 @@ class ConfigDeltaDataLayer(PathConfigDeltaDataLayer):
             pre = ""
         return f"{pre}{self._transformer_process_name}"
 
+    def set_transformer_block(self, tr):
+        self._transformer_block_name = tr
+        return self
+
     @property
     def save_lineage_on_store(self):
         return self._save_lineage_on_store
@@ -278,6 +282,7 @@ class ConfigDeltaDataLayer(PathConfigDeltaDataLayer):
     @save_lineage_on_store.setter
     def save_lineage_on_store(self, v: bool):
         self._save_lineage_on_store = v
+
 
 
     @staticmethod
