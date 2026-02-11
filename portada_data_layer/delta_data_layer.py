@@ -1,5 +1,4 @@
 import inspect
-
 from delta import configure_spark_with_delta_pip
 from pyspark.sql import SparkSession, DataFrame
 from pyspark.sql import functions as F
@@ -10,6 +9,8 @@ import uuid
 import os
 import logging
 import re
+from delta.exceptions import ConcurrentAppendException, ConcurrentWriteException
+import time
 
 from pyspark.sql.types import StructType, LongType
 
@@ -606,29 +607,69 @@ class BaseDeltaDataLayer(ConfigDeltaDataLayer):
 
     def get_sequence_value(self, *name: str, increment: int = 1):
         path = self._resolve_path(*name, process_level_dir="sequencer")
-        # if self.path_exists(*name, process_level_dir="sequencer"):
-        #     seq = self.spark.read.format("delta").load(path)
-        #     current_row = seq.first()
-        #     current_value = current_row["value"] if current_row else 0
-        #     new_value = current_value + increment
-        # else:
-        #     current_value = 0
-        #     new_value = current_value + increment
-        #
-        # # Aquest és el pas que et faltava: tornar a convertir l'enter a DataFrame
-        # seq = self.spark.createDataFrame([(new_value,)], ["value"])
-        # seq.write.format("delta").mode("overwrite").save(path)
-        if self.path_exists(*name, process_level_dir="sequencer"):
-            deltaTable = DeltaTable.forPath(self.spark, path)
-            current_value = deltaTable.toDF().first()["value"]
-            # Actualitzem directament sobre la taula Delta
-            deltaTable.update(set={"value": f"value + {increment}"})
-        else:
-            # Primera vegada
-            df = self.spark.createDataFrame([(increment,)], ["value"])
-            df.write.format("delta").save(path)
-            current_value = 0
-        return current_value
+
+        # 1. Assegurar inicialització
+        if not DeltaTable.isDeltaTable(self.spark, path):
+            try:
+                DeltaTable.createIfNotExists(self.spark) \
+                    .location(path) \
+                    .addColumn("id", "STRING") \
+                    .addColumn("value", "LONG") \
+                    .execute()
+                self.spark.createDataFrame([("SEQ", 0)], ["id", "value"]) \
+                    .write.format("delta").mode("append").save(path)
+            except:
+                pass
+
+                # 2. Bucle d'intent d'actualització
+        while True:
+            try:
+                # Llegim el valor actual
+                # Fem un read fresh per evitar caches de Spark
+                df_actual = self.spark.read.format("delta").load(path)
+                old_val = df_actual.filter("id = 'SEQ'").first()["value"]
+                new_val = old_val + increment
+
+                dt = DeltaTable.forPath(self.spark, path)
+
+                # Intentem l'actualització amb condició
+                # Si un altre procés ha canviat el 'value' entre la lectura i ara,
+                # Delta Lake detectarà un conflicte de concurrència en fer el commit.
+                dt.update(
+                    condition=f"id = 'SEQ' AND value = {old_val}",
+                    set={"value": str(new_val)}
+                )
+
+                # Si l'update ha acabat sense llançar excepció, hem tingut èxit
+                return new_val
+
+            except (ConcurrentAppendException, ConcurrentWriteException):
+                # Si hi ha hagut un conflicte, esperem un moment i reintentem el bucle
+                time.sleep(0.1)
+                continue
+
+    # def get_sequence_value(self, *name: str, increment: int = 1):
+    #     path = self._resolve_path(*name, process_level_dir="sequencer")
+    #     if not DeltaTable.isDeltaTable(self.spark, path):
+    #         DeltaTable.createIfNotExists(self.spark) \
+    #             .tableName(name[-1]) \
+    #             .location(path) \
+    #             .addColumn("id", "STRING") \
+    #             .addColumn("value", "INT") \
+    #             .execute()
+    #     source_df = self.spark.createDataFrame([Row(id="VALOR_CONSTANT", inc=increment)])
+    #     deltaTable = DeltaTable.forPath(self.spark, path)
+    #     deltaTable.alias(name[-1]).merge(
+    #         source=source_df.alias("source"),
+    #         condition="target.id = source.id"  # O una condició que sempre sigui certa si només hi ha 1 fila
+    #     ).whenMatchedUpdate(set={
+    #         "value": "target.value + source.inc"
+    #     }).whenNotMatchedInsert(values={
+    #         "id": "source.id",
+    #         "value": "source.inc"
+    #     }).execute()
+    #     current_value = deltaTable.toDF().first()["value"]
+    #     return current_value
 
 
 

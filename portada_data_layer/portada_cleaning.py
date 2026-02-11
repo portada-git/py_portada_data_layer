@@ -326,26 +326,42 @@ class PortadaCleaning(DeltaDataLayer):
                 expr_col = F.regexp_replace(expr_col, w, r)
             return F.translate(expr_col, wrong_chars, correct_chars)
 
-        def one_word(c, m: dict = None):
-            return change_chars(c, m.get("one_word_map", {}))
+        def transform_mapping_with_params(mapping: dict, params: dict):
+            return mapping
 
-        def not_digit(c, m: dict = None):
-            return change_chars(c, m.get("only_text_map", {}))
+        def one_word(c, m: dict = None, params: dict = None):
+            m = transform_mapping_with_params(m.get("one_word_map", {}), params)
+            return change_chars(c, m)
 
-        def not_paragraph(c, m: dict = None):
-            return change_chars(c, m.get("not_paragraph_map", {}))
+        def not_digit(c, m: dict = None, params: dict = None):
+            m = transform_mapping_with_params(m.get("one_word_map", {}), params)
+            return change_chars(c, m)
+
+        def not_paragraph(c, m: dict = None, params: dict = None):
+            m = transform_mapping_with_params(m.get("one_word_map", {}), params)
+            return change_chars(c, m)
+
+        params_for_cleaning_list = []
+        alg_for_cleaning_list = []
+        for item in for_cleaning_list:
+            if isinstance(item, dict):
+                alg_for_cleaning_list.append(item["algorithm"])
+                params_for_cleaning_list.append(item.get("params", None))
+            else:
+                alg_for_cleaning_list.append(item)
+                params_for_cleaning_list.append(None)
 
         processes = {"one_word":one_word, "not_digits":not_digit}
-        if "paragraph"  in for_cleaning_list or "not_cleanable" in for_cleaning_list:
+        if "paragraph" in alg_for_cleaning_list or "not_cleanable" in alg_for_cleaning_list:
             expr = col
-        elif "accepted_abbreviations" in for_cleaning_list:
+        elif "accepted_abbreviations" in alg_for_cleaning_list:
             expr = F.trim(col)
             expr = F.when(F.length(expr) > 5, F.regexp_replace(expr, r"[.,;]+$", "")).otherwise(expr)
         else:
             expr = F.regexp_replace(F.trim(col), r"[.,;]+$", "")
-        if "paragraph" not in for_cleaning_list and "one_word" not in for_cleaning_list:
+        if "paragraph" not in alg_for_cleaning_list and "one_word" not in alg_for_cleaning_list:
             not_paragraph(expr, mapping)
-        for process in for_cleaning_list:
+        for process in alg_for_cleaning_list:
             if process in processes:
                 expr = processes[process](expr, mapping)
         return expr
