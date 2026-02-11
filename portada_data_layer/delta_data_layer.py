@@ -12,7 +12,7 @@ import re
 from delta.exceptions import ConcurrentAppendException, ConcurrentWriteException
 import time
 
-from pyspark.sql.types import StructType, LongType
+from pyspark.sql.types import StructType, LongType, StructField, StringType
 
 from portada_data_layer.portada_delta_common import PortadaDeltaConstants
 from portada_data_layer.traced_data_frame import TracedDataFrame
@@ -608,45 +608,50 @@ class BaseDeltaDataLayer(ConfigDeltaDataLayer):
     def get_sequence_value(self, *name: str, increment: int = 1):
         path = self._resolve_path(*name, process_level_dir="sequencer")
 
-        # 1. Assegurar inicialització
+        # 1. Definició explícita de l'esquema per evitar inferències errònies
+        schema = StructType([
+            StructField("id", StringType(), False),
+            StructField("value", LongType(), False)
+        ])
+
+        # 2. Inicialització simplificada
         if not DeltaTable.isDeltaTable(self.spark, path):
             try:
-                DeltaTable.createIfNotExists(self.spark) \
-                    .location(path) \
-                    .addColumn("id", "STRING") \
-                    .addColumn("value", "LONG") \
-                    .execute()
-                self.spark.createDataFrame([("SEQ", 0)], ["id", "value"]) \
-                    .write.format("delta").mode("append").save(path)
-            except:
+                # Creem el registre inicial (id="SEQ", value=0)
+                # El mode "append" en un directori buit crearà la taula automàticament
+                df_inicial = self.spark.createDataFrame([("SEQ", 0)], schema)
+                df_inicial.write.format("delta").mode("append").save(path)
+            except Exception as e:
+                # En HDFS, si un altre procés ha creat la carpeta _delta_log
+                # un mil·lisegon abans, aquest procés simplement fallarà i continuarà.
                 pass
 
-                # 2. Bucle d'intent d'actualització
+        # 3. El bucle de seguretat (CAS) que hem comentat abans
         while True:
             try:
-                # Llegim el valor actual
-                # Fem un read fresh per evitar caches de Spark
-                df_actual = self.spark.read.format("delta").load(path)
-                old_val = df_actual.filter("id = 'SEQ'").first()["value"]
+                # Llegim sempre de disc per tenir l'última versió del log de Delta
+                current_df = self.spark.read.format("delta").load(path)
+                row = current_df.filter("id = 'SEQ'").first()
+
+                old_val = row["value"]
                 new_val = old_val + increment
 
                 dt = DeltaTable.forPath(self.spark, path)
 
-                # Intentem l'actualització amb condició
-                # Si un altre procés ha canviat el 'value' entre la lectura i ara,
-                # Delta Lake detectarà un conflicte de concurrència en fer el commit.
+                # UPDATE ATÒMIC: La clau de la seguretat en sistemes distribuïts
                 dt.update(
                     condition=f"id = 'SEQ' AND value = {old_val}",
                     set={"value": str(new_val)}
                 )
 
-                # Si l'update ha acabat sense llançar excepció, hem tingut èxit
                 return new_val
 
-            except (ConcurrentAppendException, ConcurrentWriteException):
-                # Si hi ha hagut un conflicte, esperem un moment i reintentem el bucle
-                time.sleep(0.1)
+            except Exception:
+                # Si hi ha qualsevol conflicte d'escriptura concurrent a HDFS, reintentem
+                import time
+                time.sleep(0.2)
                 continue
+
 
     # def get_sequence_value(self, *name: str, increment: int = 1):
     #     path = self._resolve_path(*name, process_level_dir="sequencer")
