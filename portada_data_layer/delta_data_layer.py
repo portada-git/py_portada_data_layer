@@ -436,6 +436,15 @@ class BaseDeltaDataLayer(ConfigDeltaDataLayer):
     def __init__(self, builder=None, cfg_json: dict = None):
         super().__init__(builder=builder, cfg_json=cfg_json)
         self._a_log_process_info = None
+        self._client_db_sequencer = None
+
+    @property
+    def sequencer(self):
+        return self._client_db_sequencer
+
+    @sequencer.setter
+    def sequencer(self, cli):
+        self._client_db_sequencer = cli
 
     @property
     def log_process_info(self):
@@ -608,73 +617,37 @@ class BaseDeltaDataLayer(ConfigDeltaDataLayer):
                                table_name=tn, df_name=n)
 
     def get_sequence_value(self, *name: str, increment: int = 1):
+        if self.sequencer is None:
+            return self._get_sequence_value(*name, increment=increment)
+        else:
+            seq_name = "_".join(name)
+            return self.sequencer.get_sequence_value(seq_name, increment)
+
+    def _get_sequence_value(self, *name: str, increment: int = 1):
         path = self._resolve_path(*name, process_level_dir="sequencer")
-        isolated_spark = self.spark.newSession()
-        isolated_spark.conf.set("spark.sql.shuffle.partitions", "1")
-
-        # 1. Inicialització simplificada
-        if not DeltaTable.isDeltaTable(isolated_spark, path):
-            try:
-                schema = StructType([
-                    StructField("id", StringType(), False),
-                    StructField("value", LongType(), False)
-                ])
-                isolated_spark.createDataFrame([("SEQ", 0)], schema)\
-                    .write.format("delta").mode("append").save(path)
-            except Exception:
-                pass
-
-        attempts = 0
-        max_attempts = 50
-        while attempts < max_attempts:
-            try:
-                current_df = isolated_spark.read.format("delta").load(path)
-                row = current_df.filter("id = 'SEQ'").first()
-                if not row:
-                    raise RuntimeError("Sequencer registry not found")
-
-                old_val = row["value"]
-                new_val = old_val + increment
-
-                dt = DeltaTable.forPath(isolated_spark, path)
-                dt.update(
-                    condition=f"id = 'SEQ' AND value = {old_val}",
-                    set={"value": str(new_val)}
-                )
-
-                return new_val
-
-            except (ConcurrentAppendException, ConcurrentWriteException):
-                # Si hi ha qualsevol conflicte d'escriptura concurrent a HDFS, reintentem
-                attempts += 1
-                time.sleep(random.uniform(0.1, 0.8))
-                continue
-        raise RuntimeError("Sequencer is blocked!")
-
-
-    # def get_sequence_value(self, *name: str, increment: int = 1):
-    #     path = self._resolve_path(*name, process_level_dir="sequencer")
-    #     if not DeltaTable.isDeltaTable(self.spark, path):
-    #         DeltaTable.createIfNotExists(self.spark) \
-    #             .tableName(name[-1]) \
-    #             .location(path) \
-    #             .addColumn("id", "STRING") \
-    #             .addColumn("value", "INT") \
-    #             .execute()
-    #     source_df = self.spark.createDataFrame([Row(id="VALOR_CONSTANT", inc=increment)])
-    #     deltaTable = DeltaTable.forPath(self.spark, path)
-    #     deltaTable.alias(name[-1]).merge(
-    #         source=source_df.alias("source"),
-    #         condition="target.id = source.id"  # O una condició que sempre sigui certa si només hi ha 1 fila
-    #     ).whenMatchedUpdate(set={
-    #         "value": "target.value + source.inc"
-    #     }).whenNotMatchedInsert(values={
-    #         "id": "source.id",
-    #         "value": "source.inc"
-    #     }).execute()
-    #     current_value = deltaTable.toDF().first()["value"]
-    #     return current_value
-
+        # if self.path_exists(*name, process_level_dir="sequencer"):
+        #     seq = self.spark.read.format("delta").load(path)
+        #     current_row = seq.first()
+        #     current_value = current_row["value"] if current_row else 0
+        #     new_value = current_value + increment
+        # else:
+        #     current_value = 0
+        #     new_value = current_value + increment
+        #
+        # # Aquest és el pas que et faltava: tornar a convertir l'enter a DataFrame
+        # seq = self.spark.createDataFrame([(new_value,)], ["value"])
+        # seq.write.format("delta").mode("overwrite").save(path)
+        if self.path_exists(*name, process_level_dir="sequencer"):
+            deltaTable = DeltaTable.forPath(self.spark, path)
+            current_value = deltaTable.toDF().first()["value"]
+            # Actualitzem directament sobre la taula Delta
+            deltaTable.update(set={"value": f"value + {increment}"})
+        else:
+            # Primera vegada
+            df = self.spark.createDataFrame([(increment,)], ["value"])
+            df.write.format("delta").save(path)
+            current_value = 0
+        return current_value
 
 
 # ==============================================================
