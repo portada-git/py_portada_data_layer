@@ -1,4 +1,6 @@
 import inspect
+import random
+
 from delta import configure_spark_with_delta_pip
 from pyspark.sql import SparkSession, DataFrame
 from pyspark.sql import functions as F
@@ -627,7 +629,9 @@ class BaseDeltaDataLayer(ConfigDeltaDataLayer):
                 pass
 
         # 3. El bucle de seguretat (CAS) que hem comentat abans
-        while True:
+        attempts = 0
+        max_attempts = 50
+        while attempts < max_attempts:
             try:
                 # Llegim sempre de disc per tenir l'última versió del log de Delta
                 current_df = self.spark.read.format("delta").load(path)
@@ -648,9 +652,10 @@ class BaseDeltaDataLayer(ConfigDeltaDataLayer):
 
             except Exception:
                 # Si hi ha qualsevol conflicte d'escriptura concurrent a HDFS, reintentem
-                import time
-                time.sleep(0.2)
+                attempts += 1
+                time.sleep(random.uniform(0.1, 0.8))
                 continue
+        raise RuntimeError("Sequencer is blocked!")
 
 
     # def get_sequence_value(self, *name: str, increment: int = 1):
