@@ -287,9 +287,8 @@ class NewsExtractionIngestion(PortadaIngestion):
                         target_path=full_path,
                         uploaded_by=user,
                     )
-                    df_list.append(merged_df)
-                    self.write_json(full_path, df=merged_df, mode="overwrite")
-
+                df_list.append(merged_df)
+                self.write_json(full_path, df=merged_df, mode="overwrite")
             else:
                 regs += subset.count()
                 df_list.append(subset)
@@ -323,9 +322,10 @@ class NewsExtractionIngestion(PortadaIngestion):
         #     else:
         #         raise e
         df = self.read_json(path, has_extension=True)
-        if user is not None:
-            df = df.filter(F.col("uploaded_by") == user)
-        logger.info(f"{0 if df is None else df.count()} entries was read")
+        if df is not None:
+            if user is not None:
+                df = df.filter(F.col("uploaded_by") == user)
+            logger.info(f"{0 if df is None else df.count()} entries was read")
         return df
 
     def get_missing_dates_from_a_newspaper(self, *container_path, publication_name: str, start_date: str = None,

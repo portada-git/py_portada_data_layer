@@ -61,7 +61,6 @@ class AbstractDeltaDataLayerBuilder(PortadaDeltaConstants):
                 continue
             self.config(key, value)
 
-
     def get_spark_builder(self) -> SparkSession.Builder:
         """Creates and returns a configured SparkSession.Builder."""
         builder = (
@@ -180,6 +179,7 @@ class PortadaBuilder(DeltaDataLayerBuilder):
     NEWS_TYPE = "NewsExtractionIngestion"
     BOAT_NEWS_TYPE = "BoatFactIngestion"
     KNOWN_ENTITIES_TYPE = "KnownEntitiesIngestion"
+
     def __init__(self, json_config=None, json_extended_classes=None):
         super().__init__(json_config=json_config)
         self.__classes_to_build = json_extended_classes

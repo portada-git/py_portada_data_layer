@@ -713,7 +713,7 @@ class DataLakeMetadataManager(PathConfigDeltaDataLayer):
                 stage= data_layer.current_process_level,
                 table_name = dataframe.table_name,
                 dataframe_name= df_name,
-                source_path= self._resolve_relative_path(dataframe.df_name),
+                source_path = self._resolve_relative_path(dataframe.df_name),
                 source_version= dataframe.df_version,
                 change_types= change_types,
                 change_action= t["operation"],
