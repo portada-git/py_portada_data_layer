@@ -609,40 +609,34 @@ class BaseDeltaDataLayer(ConfigDeltaDataLayer):
 
     def get_sequence_value(self, *name: str, increment: int = 1):
         path = self._resolve_path(*name, process_level_dir="sequencer")
+        isolated_spark = self.spark.newSession()
+        isolated_spark.conf.set("spark.sql.shuffle.partitions", "1")
 
-        # 1. Definició explícita de l'esquema per evitar inferències errònies
-        schema = StructType([
-            StructField("id", StringType(), False),
-            StructField("value", LongType(), False)
-        ])
-
-        # 2. Inicialització simplificada
-        if not DeltaTable.isDeltaTable(self.spark, path):
+        # 1. Inicialització simplificada
+        if not DeltaTable.isDeltaTable(isolated_spark, path):
             try:
-                # Creem el registre inicial (id="SEQ", value=0)
-                # El mode "append" en un directori buit crearà la taula automàticament
-                df_inicial = self.spark.createDataFrame([("SEQ", 0)], schema)
-                df_inicial.write.format("delta").mode("append").save(path)
-            except Exception as e:
-                # En HDFS, si un altre procés ha creat la carpeta _delta_log
-                # un mil·lisegon abans, aquest procés simplement fallarà i continuarà.
+                schema = StructType([
+                    StructField("id", StringType(), False),
+                    StructField("value", LongType(), False)
+                ])
+                isolated_spark.createDataFrame([("SEQ", 0)], schema)\
+                    .write.format("delta").mode("append").save(path)
+            except Exception:
                 pass
 
-        # 3. El bucle de seguretat (CAS) que hem comentat abans
         attempts = 0
         max_attempts = 50
         while attempts < max_attempts:
             try:
-                # Llegim sempre de disc per tenir l'última versió del log de Delta
-                current_df = self.spark.read.format("delta").load(path)
+                current_df = isolated_spark.read.format("delta").load(path)
                 row = current_df.filter("id = 'SEQ'").first()
+                if not row:
+                    raise RuntimeError("Sequencer registry not found")
 
                 old_val = row["value"]
                 new_val = old_val + increment
 
-                dt = DeltaTable.forPath(self.spark, path)
-
-                # UPDATE ATÒMIC: La clau de la seguretat en sistemes distribuïts
+                dt = DeltaTable.forPath(isolated_spark, path)
                 dt.update(
                     condition=f"id = 'SEQ' AND value = {old_val}",
                     set={"value": str(new_val)}
@@ -650,7 +644,7 @@ class BaseDeltaDataLayer(ConfigDeltaDataLayer):
 
                 return new_val
 
-            except Exception:
+            except (ConcurrentAppendException, ConcurrentWriteException):
                 # Si hi ha qualsevol conflicte d'escriptura concurrent a HDFS, reintentem
                 attempts += 1
                 time.sleep(random.uniform(0.1, 0.8))
