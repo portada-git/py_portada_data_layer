@@ -21,7 +21,7 @@ logger = logging.getLogger("delta_data_layer")
 
 class RedisSequencer:
     def __init__(self, host, port, db=1):
-        self.client = redis.Redis(host=self.host, port=self.port, decode_responses=True, db=db)
+        self.client = redis.Redis(host=host, port=port, decode_responses=True, db=db)
 
     def get_sequence_value(self, seq_name: str, increment: int = 1):
         # El prefix 'seq:' ajuda a mantenir el Redis organitzat
