@@ -11,15 +11,23 @@ import uuid
 import os
 import logging
 import re
-from delta.exceptions import ConcurrentAppendException, ConcurrentWriteException
-import time
-
-from pyspark.sql.types import StructType, LongType, StructField, StringType
+import redis
 
 from portada_data_layer.portada_delta_common import PortadaDeltaConstants
 from portada_data_layer.traced_data_frame import TracedDataFrame
 
 logger = logging.getLogger("delta_data_layer")
+
+
+class RedisSequencer:
+    def __init__(self, host, port, db=1):
+        self.client = redis.Redis(host=self.host, port=self.port, decode_responses=True, db=db)
+
+    def get_sequence_value(self, seq_name: str, increment: int = 1):
+        # El prefix 'seq:' ajuda a mantenir el Redis organitzat
+        key = f"seq:{seq_name}"
+        nv = self.client.incrby(key, increment)
+        return nv - increment
 
 
 # ==============================================================
@@ -437,14 +445,19 @@ class BaseDeltaDataLayer(ConfigDeltaDataLayer):
         super().__init__(builder=builder, cfg_json=cfg_json)
         self._a_log_process_info = None
         self._client_db_sequencer = None
+        self.sequencer_params = None
 
     @property
     def sequencer(self):
+        if self._client_db_sequencer is None:
+            if self.sequencer_params is None:
+                return None
+            else:
+                self._client_db_sequencer = RedisSequencer(self.sequencer_params["host"], self.sequencer_params["port"], self.sequencer_params["db"])
         return self._client_db_sequencer
 
-    @sequencer.setter
-    def sequencer(self, cli):
-        self._client_db_sequencer = cli
+    def set_sequencer_params(self, host: str, port: str, db: int = 1):
+        self.sequencer_params = {"host": host, "port": port, "db": db}
 
     @property
     def log_process_info(self):
