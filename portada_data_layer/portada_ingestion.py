@@ -57,7 +57,7 @@ class PortadaIngestion(DeltaDataLayer):
         logger.info("Ingestion process completed successfully.")
 
     @data_transformer_method(description="Copy the original file to the FileSystem (HDFS/S3/file)")
-    def copy_ingested_raw_data(self, *container_path, local_path: str, return_dest_path=False, user: str = None,  **kwargs):
+    def copy_ingested_raw_data(self, *container_path, local_path: str, return_dest_path=False, user: str = None, remove_local: bool = True,  **kwargs):
         """
         Copy a file pointed by a local_path to a destination_path. The destination path is built using container_path.
         the methodology  used to buid destination_path is the following:
@@ -110,9 +110,14 @@ class PortadaIngestion(DeltaDataLayer):
         fs_exec = FileSystemTaskExecutor(self.get_configuration())
         try:
             file_extension = os.path.splitext(local_path)[1][1:]
-            dest_path = fs_exec.copy_from_local(*container_path, user,
+            if user is None:
+                dest_path = fs_exec.copy_from_local(*container_path,
                                                 file_name_dest=fs_exec.date_random_file_name_generator(file_extension),
-                                                src_path=local_path, remove_local=True)
+                                                src_path=local_path, remove_local=remove_local)
+            else:
+                dest_path = fs_exec.copy_from_local(*container_path, user,
+                                                file_name_dest=fs_exec.date_random_file_name_generator(file_extension),
+                                                src_path=local_path, remove_local=remove_local)
             dp = self._resolve_relative_path(dest_path)
             metadata = DataLakeMetadataManager(self.get_configuration())
             metadata.log_storage(data_layer=self, source_path=local_path, target_path=dp, mode="overwrite", new=True)
@@ -426,11 +431,11 @@ class KnownEntitiesIngestion(PortadaIngestion):
             raise Exception("The name of entity or the container_path is necessary")
         return container_path
 
-    def copy_ingested_raw_data(self, *container_path, local_path: str, return_dest_path=False):
+    def copy_ingested_raw_data(self, *container_path, local_path: str, return_dest_path=False, remove_local: bool = True):
         container_path = self.__resolve_container_path(*container_path)
         container_path.insert(1, "original_files")
         return super().copy_ingested_raw_data(*container_path, local_path=local_path,
-                                              return_dest_path=return_dest_path)
+                                              return_dest_path=return_dest_path, remove_local= remove_local)
 
     @data_transformer_method(description="Copy the original file to the FileSystem (HDFS/S3/file)")
     def save_raw_data(self, *container_path, data: dict | list = None, source_path: str = None, **kwargs):
@@ -513,16 +518,7 @@ class BoatFactIngestion(NewsExtractionIngestion):
     __container_path = "ship_entries"
 
     def ingest(self, local_path: str, user: str ):
-       raise Exception("BoatFactIngestion#ingest is not supported.")
-
-    def copy_ingested_raw_data(self, local_path: str, return_dest_path=False, user: str=None):
-        if user is None:
-            return super().copy_ingested_raw_data(self.__container_path, local_path=local_path,
-                                              return_dest_path=return_dest_path)
-        else:
-            return super().copy_ingested_raw_data(self.__container_path, user, local_path=local_path,
-                                              return_dest_path=return_dest_path)
-
+        return super().ingest(self.__container_path, local_path=local_path, user=user)
 
     def save_raw_data(self, data: dict | list = None, user:str = None, source_path: str = None, **kwargs):
         return super().save_raw_data(self.__container_path, user=user, data=data, source_path=source_path, **kwargs)
