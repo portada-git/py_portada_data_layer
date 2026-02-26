@@ -828,6 +828,31 @@ class PortadaCleaning(DeltaDataLayer):
 
 @registry_to_portada_builder
 class BoatFactCleaning(PortadaCleaning):
+    FLAG_ENTITY = 'flag'
+    SHIP_TONS_ENTITY = 'ship_tons'
+    TRAVEL_DURATION_ENTITY = 'travel_duration'
+    COMODITY_ENTITY = 'comodity'
+    SHIP_TYPE_ENTITY = 'ship_type'
+    UNIT_ENTITY = 'unit'
+    PORT_ENTITY = 'port'
+    MASTER_ROLE_ENTITY = 'master_role'
+
+    def __init__(self, builder=None, cfg_json: dict = None):
+        super().__init__(builder=builder, cfg_json=cfg_json)
+        self.__container_path = "ship_entries"
+
+    def read_ship_entries(self) -> TracedDataFrame:
+        ship_entries_df = self.read_delta(self.__container_path)
+        return ship_entries_df
+
+    def read_raw_entries(self, user: str = None, publication_name: str = None, y: int | str = None,
+                         m: int | str = None,
+                         d: int | str = None, edition: str = None):
+
+        ship_entries_df = super().read_raw_entries(self.__container_path, user=user, publication_name=publication_name,
+                                                   y=y, m=m, d=d, edition=edition)
+        return ship_entries_df
+
     @staticmethod
     def extract_ports(df_entries, from_departure_port = True, from_port_of_calls = True, from_arrival_port = True):
         if from_port_of_calls:
@@ -1012,14 +1037,14 @@ class BoatFactCleaning(PortadaCleaning):
 
     @staticmethod
     def extract_master(df_entries):
-       return BoatFactCleaning._extract_ship(df_entries)
+       return BoatFactCleaning._extract_single_entry(df_entries)
 
     @staticmethod
     def extract_ship(df_entries):
-        return BoatFactCleaning._extract_ship(df_entries)
+        return BoatFactCleaning._extract_single_entry(df_entries)
 
     @staticmethod
-    def _extract_ship(df_entries):
+    def _extract_single_entry(df_entries):
         df_to_return = df_entries.select(
             F.col("entry_id").alias("id"),
             "entry_id",

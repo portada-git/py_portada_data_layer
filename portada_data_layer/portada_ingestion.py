@@ -419,6 +419,15 @@ class NewsExtractionIngestion(PortadaIngestion):
 
 class KnownEntitiesIngestion(PortadaIngestion):
     __first_container_path = "known_entities"
+    FLAG_ENTITY = 'flag'
+    SHIP_TONS_ENTITY = 'ship_tons'
+    TRAVEL_DURATION_ENTITY = 'travel_duration'
+    COMODITY_ENTITY = 'comodity'
+    SHIP_TYPE_ENTITY = 'ship_type'
+    UNIT_ENTITY = 'unit'
+    PORT_ENTITY = 'port'
+    MASTER_ROLE_ENTITY = 'master_role'
+
 
     def __resolve_container_path(self, *container_path):
         if len(container_path) > 0 and isinstance(container_path[0], list) or isinstance(container_path[0], tuple):
