@@ -672,7 +672,7 @@ class PortadaCleaning(DeltaDataLayer):
                     continue
                 lag_col = F.lag(F.col(col_name)).over(w)
                 expr = F.when(
-                    F.trim(F.lower(F.col(col_name))).isin(self.IDEM_VALUES),
+                    F.trim(F.lower(F.col(col_name))).isin(*self.IDEM_VALUES),
                     lag_col
                 ).otherwise(F.col(col_name))
                 df = df.withColumn(col_name, expr)
@@ -713,22 +713,25 @@ class PortadaCleaning(DeltaDataLayer):
 
     @block_transformer_method
     def cleaning(self, df: DataFrame | TracedDataFrame) -> TracedDataFrame:
-        # 1.- save original values
-        self.save_original_values_of_ship_entries(df)
-        # 2.- prune values
+        # 1.- prune values
         df = self.prune_unaccepted_fields(df)
-        # 3.- Normalize structure
+        # 2.- Normalize structure
         df = self.normalize_field_structure(df)
+        # 3.- save original values
+        self.save_original_values_of_ship_entries(df)
         # 4.- Normalize values
         df = self.normalize_field_value(df)
-        # 5.- Resolve idem/id/id. with the value of the predecessor record
+        # 6.- Resolve idem/id/id. with the value of the predecessor record
         df = self.resolve_idems(df)
-        self.save_ship_entries(df)
+        # # 7.- Convert values form string to corrected type
+        # df = self.convert_string_to_schematype(df) - Numero en letras a número
+        # # 8.- Save cleaned values
+        # self.save_ship_entries(df)
         return df
 
     def save_original_values_of_ship_entries(self, ship_entries_df: TracedDataFrame) -> TracedDataFrame:
         self.write_delta("original_data", "ship_entries", df=ship_entries_df, mode="overwrite",
-                         partition_by=["publication_name", "publication_date_year", "publication_date_month"])
+                         partition_by=["publication_name", "publication_date", "publication_edition"])
         return ship_entries_df
 
     def save_ship_entries(self, ship_entries_df: TracedDataFrame) -> TracedDataFrame:
@@ -736,23 +739,32 @@ class PortadaCleaning(DeltaDataLayer):
                          partition_by=["publication_name", "publication_date_year", "publication_date_month"])
         return ship_entries_df
 
-    def read_ship_entries(self, ship_entries_df: TracedDataFrame) -> TracedDataFrame:
+    def read_ship_entries(self) -> TracedDataFrame:
         ship_entries_df = self.read_delta("ship_entries")
         return ship_entries_df
 
     @data_transformer_method()
     def normalize_field_structure(self, df: TracedDataFrame) -> TracedDataFrame:
-        # if self._schema is None:
-        #     raise ValueError("Must call use_schema() before.")
-        # f_columns = self._json_schema_to_normalize_columns_no(self._schema)
-        # for c_name, col_trans in f_columns.items():
-        #     df = df.withColumn(c_name, col_trans)
-        # return df
+        """
+        Normalize the structure of a DataFrame according to the schema.
+
+        This method iterates over the properties of the schema and builds an expression
+        to normalize the structure of the corresponding column in the DataFrame.
+
+        For example, if the schema defines a struct field "address" with two fields "street"
+        and "city", this method ensures that all rows comply with the structure.
+
+        :param df: The DataFrame to normalize
+        :return: A new DataFrame with the normalized structure
+        """
         if self._schema is None:
             raise ValueError("Must call use_schema() before.")
         final_expressions = {}
         properties = self._schema.get("properties", {})
         selects = []
+        for col in df.columns:
+            if col not in properties:
+                selects.append(F.col(col).alias(col))
         for field_name, field_schema in properties.items():
             # Get the full expression for the column (simple, struct or array)
             expr = self._build_normalize_expr(F.col(field_name), field_schema)
@@ -771,6 +783,34 @@ class PortadaCleaning(DeltaDataLayer):
             df = df.withColumn(field_name, expr)
         return df
 
+    @data_transformer_method()
+    def duplicate_fields(self, df: TracedDataFrame) -> TracedDataFrame:
+        """
+        Duplicate each field in the DataFrame, adding a suffix "_original_value" to the new field name.
+
+        This is useful when we want to keep a record of the original values of a field before
+        applying some transformation to it.
+
+        For example, if we want to normalize the values of a field, but also keep the original
+        values, we can use this method to create a new field with the original values.
+
+        :param df: The DataFrame to duplicate fields from
+        :return: A new DataFrame with the duplicated fields
+        """
+        if self._schema is None:
+            raise ValueError("Must call use_schema() before.")
+        # Get the list of fields from the schema
+        fields = self._collect_list_of_fields(self._schema)
+        # Create a list of new field names
+        new_fields = [
+            f"{col}_original_value" for col in fields
+        ]
+        # Create a list of expressions to duplicate the fields
+        exprs = [F.col(col).alias(new_field) for col, new_field in zip(fields, new_fields)]
+        # Apply the expressions to the DataFrame
+        df = df.select(*exprs)
+        return df
+
     @data_transformer_method(description="prune unbelonging model fields ")
     def prune_unaccepted_fields(self, df: TracedDataFrame) -> TracedDataFrame:
         if self._schema is None:
@@ -781,12 +821,12 @@ class PortadaCleaning(DeltaDataLayer):
         ]
         missing_cols = allowed - set(cols_to_keep)
         cols_to_add = {
-            col: F.lit(None) for col in missing_cols
+            col: F.lit(None).alias(col) for col in missing_cols
         }
 
         return df.select(cols_to_keep).withColumns(cols_to_add)
 
-
+@registry_to_portada_builder
 class BoatFactCleaning(PortadaCleaning):
     @staticmethod
     def extract_ports(df_entries, from_departure_port = True, from_port_of_calls = True, from_arrival_port = True):
@@ -914,8 +954,8 @@ class BoatFactCleaning(PortadaCleaning):
             F.lit("cargo_list.cargo.cargo_per_merchant_list").alias("field_origin"),
             "merchant_idx",
             "cargo_idx",
-            F.col("c.cargo_commodity").alias("cargo_commodity"),
-            F.col("c.cargo_unit").alias("cargo_unit")
+            F.col("c.cargo_commodity").alias("cargo_commodity_citation"),
+            F.col("c.cargo_unit").alias("cargo_unit_citation")
         )
         df_comodity = df_comodity.withColumn(
             "id",
@@ -923,6 +963,7 @@ class BoatFactCleaning(PortadaCleaning):
         )
 
         return df_comodity
+
 
     @staticmethod
     def extract_cargo_merchant(df_entries):
@@ -946,3 +987,66 @@ class BoatFactCleaning(PortadaCleaning):
         return df_merchants
 
 
+    @staticmethod
+    def extract_ship_agent(df_entries):
+        df_ship_agent = df_entries.select(
+            F.col("entry_id").alias("id"),
+            "entry_id",
+            "temp_key",
+            F.lit("ship_agent_name").alias("field_origin"),
+            F.col("ship_agent_name").alias("citation")
+        )
+        return df_ship_agent
+
+
+    @staticmethod
+    def extract_broker(df_entries):
+        df_broker = df_entries.select(
+            F.col("entry_id").alias("id"),
+            "entry_id",
+            "temp_key",
+            F.lit("broker_name").alias("field_origin"),
+            F.col("broker_name").alias("citation")
+        )
+        return df_broker
+
+    @staticmethod
+    def extract_master(df_entries):
+       return BoatFactCleaning._extract_ship(df_entries)
+
+    @staticmethod
+    def extract_ship(df_entries):
+        return BoatFactCleaning._extract_ship(df_entries)
+
+    @staticmethod
+    def _extract_ship(df_entries):
+        df_to_return = df_entries.select(
+            F.col("entry_id").alias("id"),
+            "entry_id",
+            "temp_key",
+            F.col("travel_departure_port").alias("travel_departure_port_citation"),
+            F.col("travel_departure_date").alias("travel_departure_date_citation"),
+            F.col("travel_arrival_port").alias("travel_arrival_port_citation"),
+            F.col("travel_arrival_date").alias("travel_arrival_date_citation"),
+            F.col("ship_type").alias("ship_type_citation"),
+            F.col("ship_flag").alias("ship_flag_citation"),
+            F.col("ship_tons_capacity").alias("ship_tons_capacity_citation"),
+            F.col("ship_name").alias("ship_name_citation"),
+            F.col("master_rol").alias("master_rol_citation"),
+            F.col("master_name").alias("master_name_citation"),
+            F.lit("single_ship_entry_fields").alias("field_origin"),
+        )
+        return df_to_return
+
+    def get_known_entity_voices(self, known_entity=None, df_entities = None):
+        if known_entity is not None:
+            df_entities = self.read_delta("known_entities", known_entity)
+        if df_entities is None:
+            raise ValueError("No known entities found")
+        df_voices = df_entities.select(
+            F.concat(F.col("name"), F.lit("-"), F.col("voice")).alias("id"),
+            F.col("name"),
+            F.lit("voice").alias("field_origin"),
+            F.col("voice")
+        )
+        return df_voices

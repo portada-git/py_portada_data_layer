@@ -4,7 +4,6 @@ portada_data_layer/__init__.py
 portada_data_layer/boat_fact_model.py
 portada_data_layer/data_lake_metadata_manager.py
 portada_data_layer/delta_data_layer.py
-portada_data_layer/ingestor_manager.py
 portada_data_layer/portada_cleaning.py
 portada_data_layer/portada_delta_builder.py
 portada_data_layer/portada_delta_common.py
