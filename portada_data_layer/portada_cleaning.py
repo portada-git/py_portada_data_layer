@@ -12,12 +12,16 @@ from portada_data_layer.data_lake_metadata_manager import data_transformer_metho
     enable_field_lineage_log_for_class
 from portada_data_layer.portada_delta_common import registry_to_portada_builder
 
-logger = logging.getLogger("portada_data.delta_data_layer.boat_fact_ingestion")
+logger = logging.getLogger("portada_data.delta_data_layer.boat_fact_cleaning")
+
+
+IDEM_TOKENS = ["idem", "id.", "id", "1dem"]
 
 
 @registry_to_portada_builder
 @enable_field_lineage_log_for_class
 class PortadaCleaning(DeltaDataLayer):
+
     def __init__(self, builder=None, cfg_json: dict = None):
         super().__init__(builder=builder, cfg_json=cfg_json, )
         # schema_path = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', "config",  "schema.json"))
@@ -439,8 +443,6 @@ class PortadaCleaning(DeltaDataLayer):
         self._mapping_to_clean_chars = mapping
         return self
 
-    # Values that indicate "same as previous" (idem)
-    IDEM_VALUES = ("idem", "id", "id.")
 
     @staticmethod
     def _has_accepted_idem(schema: dict) -> bool:
@@ -458,87 +460,184 @@ class PortadaCleaning(DeltaDataLayer):
         return t in ("string", "number", "integer", "float", "boolean")
 
     @staticmethod
-    def _collect_fields_with_accepted_idem(
-        schema: dict,
-        parent_path: str = "",
-        result: list = None
-    ) -> list:
+    def _collect_idems_for_spark(
+            schema: dict,
+            path: str = "",
+            is_inside_array: bool = False,
+            current_array_path: str = None,
+            result: dict = None
+    ) -> dict:
         """
-        Traverse the schema and return the list of (path, field_schema, meta)
-        for fields marked with accepted_idem in for_cleaning.
-        Uses the 'type' attribute to deduce structure:
-        - Array of simple types: first item gets last of previous row; others get previous in same row.
-        - Array of structs: same logic, but only the idem field is replaced, not the whole item.
+        Separa els camps amb 'accepted_idem' en dues categories per a Spark.
         """
         if result is None:
-            result = []
+            result = {"root_fields": [], "arrays": {}}
 
-        props = schema.get("properties", schema) if "properties" in schema else schema
-        if "properties" not in schema and "type" in schema:
-            return result
+        field_type = schema.get("type")
 
-        for field_name, field_schema in props.items():
-            path = f"{parent_path}.{field_name}" if parent_path else field_name
-
-            if field_schema.get("type") == "string" and PortadaCleaning._has_accepted_idem(field_schema):
-                result.append((path, field_schema, None))  # top-level or nested-in-object field
-
-            elif field_schema.get("type") == "object":
-                PortadaCleaning._collect_fields_with_accepted_idem(
-                    field_schema, path, result
+        # 1. CAS OBJECTE: Explorem les seves propietats
+        if field_type == "object":
+            props = schema.get("properties", {})
+            for name, sub_schema in props.items():
+                new_path = f"{path}.{name}" if path else name
+                PortadaCleaning._collect_idems_for_spark(
+                    sub_schema, new_path, is_inside_array, current_array_path, result
                 )
 
-            elif field_schema.get("type") == "array":
-                items = field_schema.get("items", {})
-                items_type = items.get("type", "string")
+        # 2. CAS ARRAY: Marquem que entrem en zona 'Nested'
+        elif field_type == "array":
+            items = schema.get("items", {})
+            # Registrem l'array al diccionari de resultats si no hi és
+            if path not in result["arrays"]:
+                result["arrays"][path] = {
+                    "items_type": items.get("type"),
+                    "schema": items,
+                    "fields": [],
+                    "all_struct_fields": list(items.get("properties", {}).keys()) if items.get(
+                        "type") == "object" else []
+                }
 
-                if PortadaCleaning._is_simple_type(items_type) and PortadaCleaning._has_accepted_idem(items):
-                    # Array of simple types with accepted_idem
-                    result.append((
-                        path,
-                        items,
-                        {"array_col": path, "items_type": "simple"}
-                    ))
-                elif items_type == "object":
-                    struct_fields = list(items.get("properties", {}).keys())
-                    for nested_name, nested_schema in items.get("properties", {}).items():
-                        if nested_schema.get("type") == "string" and PortadaCleaning._has_accepted_idem(nested_schema):
-                            result.append((
-                                f"{path}.{nested_name}",
-                                nested_schema,
-                                {
-                                    "array_col": path,
-                                    "items_type": "object",
-                                    "idem_field": nested_name,
-                                    "struct_fields": struct_fields
-                                }
-                            ))
-                            break  # one idem field per array for now
-                elif items_type == "array":
-                    inner_items = items.get("items", {})
-                    for inner_name, inner_schema in inner_items.get("properties", {}).items():
-                        if inner_schema.get("type") == "string" and PortadaCleaning._has_accepted_idem(inner_schema):
-                            inner_struct_fields = list(inner_items.get("properties", {}).keys())
-                            result.append((
-                                f"{path}.{field_name}.{inner_name}",
-                                inner_schema,
-                                {
-                                    "array_col": path,
-                                    "inner_array": field_name,
-                                    "items_type": "object",
-                                    "idem_field": inner_name,
-                                    "struct_fields": inner_struct_fields
-                                }
-                            ))
-                            break
+            # Continuem la recursió DINS de l'array
+            PortadaCleaning._collect_idems_for_spark(
+                items, path, is_inside_array=True, current_array_path=path, result=result
+            )
+
+        # 3. CAS CAMP FINAL (String/Simple): Mirem si té l'etiqueta
+        else:
+            if PortadaCleaning._has_accepted_idem(schema):
+                if is_inside_array:
+                    # Si estem dins d'un array, el camp s'afegeix a la llista d'aquell array
+                    # Només guardem el nom relatiu del camp dins de l'estructura
+                    field_name = path.split(".")[-1] if "." in path else path
+                    if field_name not in result["arrays"][current_array_path]["fields"]:
+                        result["arrays"][current_array_path]["fields"].append(field_name)
+                else:
+                    # Si és primer nivell, va a la llista de Window
+                    result["root_fields"].append(path)
 
         return result
+
+    # @staticmethod
+    # def _collect_fields_with_accepted_idem(
+    #         schema: dict,
+    #         parent_path: str = "",
+    #         result: list = None
+    # ) -> list:
+    #     if result is None:
+    #         result = []
+    #
+    #     field_type = schema.get("type")
+    #
+    #     # CAS 1: És un OBJECTE
+    #     if field_type == "object":
+    #         props = schema.get("properties", {})
+    #         for name, sub_schema in props.items():
+    #             path = f"{parent_path}.{name}" if parent_path else name
+    #             PortadaCleaning._collect_fields_with_accepted_idem(sub_schema, path, result)
+    #
+    #     # CAS 2: És un ARRAY
+    #     elif field_type == "array":
+    #         items = schema.get("items", {})
+    #         # Si els items de l'array tenen l'etiqueta o contenen objectes amb l'etiqueta
+    #         target_fields = PortadaCleaning._get_fields_to_clean(items)
+    #
+    #         if target_fields:
+    #             result.append({
+    #                 "path": parent_path,
+    #                 "type": "array",
+    #                 "items_type": items.get("type"),
+    #                 "fields_to_check": target_fields  # Llista de noms de camps (o None si és simple)
+    #             })
+    #
+    #         # Continuem explorant recursivament dins dels items per si hi ha arrays aniuats
+    #         PortadaCleaning._collect_fields_with_accepted_idem(items, parent_path, result)
+    #
+    #     return result
+    #
+    # @staticmethod
+    # def _get_fields_to_clean(item_schema: dict) -> list:
+    #     """Retorna quins camps dins d'un element d'array s'han de netejar."""
+    #     fields = []
+    #     if item_schema.get("type") == "object":
+    #         props = item_schema.get("properties", {})
+    #         for name, sch in props.items():
+    #             if PortadaCleaning._has_accepted_idem(sch):
+    #                 fields.append(name)
+    #     elif PortadaCleaning._has_accepted_idem(item_schema):
+    #         fields.append(None)  # Indica que l'array és de tipus simple (ex: list[str])
+    #     return fields
+
+    # @staticmethod
+    # def _collect_fields_with_accepted_idem(
+    #         schema: dict,
+    #         parent_path: str = "",
+    #         result: list = None,
+    #         array_context: dict = None
+    # ) -> list:
+    #     """
+    #     Traverse the schema and return the list of (path, field_schema, meta)
+    #     for fields marked with accepted_idem in for_cleaning.
+    #     Uses the 'type' attribute to deduce structure:
+    #     - Array of simple types: first item gets last of previous row; others get previous in same row.
+    #     - Array of structs: same logic, but only the idem field is replaced, not the whole item.
+    #     """
+    #     if result is None:
+    #         result = []
+    #
+    #     # 1. Obtenir les propietats depenent de l'estructura del nivell actual
+    #     # Si és un objecte, mirem 'properties'. Si no, potser som directament a l'esquema d'un camp.
+    #     properties = schema.get("properties", {})
+    #
+    #     # 2. Si no té propietats però és un tipus simple amb l'etiqueta, l'anotem
+    #     # (Això gestiona el cas de recursió cap a camps fulla)
+    #     if not properties:
+    #         if PortadaCleaning._has_accepted_idem(schema):
+    #             result.append((parent_path, schema, array_context))
+    #         return result
+    #
+    #     # 3. Iterar sobre cada camp de l'objecte actual
+    #     for field_name, field_schema in properties.items():
+    #         current_path = f"{parent_path}.{field_name}" if parent_path else field_name
+    #         field_type = field_schema.get("type")
+    #
+    #         # CAS A: És un camp simple amb l'etiqueta
+    #         if PortadaCleaning._is_simple_type(field_type) and PortadaCleaning._has_accepted_idem(field_schema):
+    #             result.append((current_path, field_schema, array_context))
+    #
+    #         # CAS B: És un Objecte (Recursió estàndard)
+    #         elif field_type == "object":
+    #             PortadaCleaning._collect_fields_with_accepted_idem(
+    #                 field_schema, current_path, result, array_context
+    #             )
+    #
+    #         # CAS C: És un Array (Recursió amb context de col·lecció)
+    #         elif field_type == "array":
+    #             items = field_schema.get("items", {})
+    #             items_type = items.get("type")
+    #
+    #             # Preparem el context de l'array per als fills
+    #             new_array_context = {
+    #                 "array_col": current_path,
+    #                 "items_type": "simple" if PortadaCleaning._is_simple_type(items_type) else "object"
+    #             }
+    #
+    #             if new_array_context["items_type"] == "object":
+    #                 new_array_context["struct_fields"] = list(items.get("properties", {}).keys())
+    #                 # Nota: No posem "idem_field" aquí perquè el trobarem en la següent iteració recursiva
+    #
+    #             # Cridem recursivament sobre el contingut de l'array ('items')
+    #             # El path no canvia (o s'hi podria afegir '[]'), però passem el context
+    #             PortadaCleaning._collect_fields_with_accepted_idem(
+    #                 items, current_path, result, new_array_context
+    #             )
+    #
+    #     return result
 
     def _build_resolve_idem_expr_for_column(
         self, col_expr, lag_col, idem_values: tuple = None
     ):
         """Build the expression that replaces idem/id/id. with the predecessor value."""
-        idem_values = idem_values or self.IDEM_VALUES
+        idem_values = idem_values or IDEM_TOKENS
         trimmed_lower = F.trim(F.lower(F.col(col_expr) if isinstance(col_expr, str) else col_expr))
         is_idem = trimmed_lower.isin(idem_values)
         return F.when(is_idem, lag_col).otherwise(col_expr if isinstance(col_expr, str) else F.col(col_expr))
@@ -636,10 +735,9 @@ class PortadaCleaning(DeltaDataLayer):
             return df
 
     @data_transformer_method()
-    def resolve_idems(self, df: TracedDataFrame) -> TracedDataFrame:
+    def resolve_idems(self, df: DataFrame) -> DataFrame:
         """
-        For fields marked with accepted_idem in the schema, replace the values
-        'idem', 'id', 'id.' with the value of the predecessor record (previous row).
+        Aplica la lògica de reemplaçament recursiu IDEM fent servir Spark.
         """
         if self._schema is None:
             raise ValueError("Must call use_schema() before.")
@@ -647,69 +745,356 @@ class PortadaCleaning(DeltaDataLayer):
             schema_to_use = self._schema["schema"]
         else:
             schema_to_use = self._schema
-        props = schema_to_use.get("properties", {})
 
-        fields_info = self._collect_fields_with_accepted_idem(schema_to_use)
-        if not fields_info:
-            return df
+        # 1. Obtenim el mapa de camps a processar des de l'esquema JSON
+        idems_map = self._collect_idems_for_spark(schema_to_use)
 
-        # Window: partition by publication/date, order by entry_id (or numeric id if not present)
-        part_cols = [c for c in ["publication_name", "publication_date"] if c in df.columns]
-        order_col = F.col("entry_id") if "entry_id" in df.columns else F.monotonically_increasing_id()
-        if part_cols:
-            w = Window.partitionBy(part_cols).orderBy(order_col)
+        # Definim la finestra per al Forward Fill entre files
+        # Fem que la finestra sigui des de l'inici dels temps fins a la fila actual
+        order_and_partitions = schema_to_use.get("order_and_partitions") if "order_and_partitions" in schema_to_use else None
+
+        if order_and_partitions is None:
+            raise ValueError("No 'order' field in schema")
+
+        order_cols = order_and_partitions.get("order")
+        partitions = order_and_partitions.get("partitions") if "partitions" in order_and_partitions else None
+
+        if order_cols is None:
+            raise ValueError("No 'order' field in schema")
+
+        if partitions is None:
+            window_spec = Window.orderBy(*order_cols).rowsBetween(Window.unboundedPreceding, Window.currentRow)
         else:
-            w = Window.orderBy(order_col)
+            window_spec = Window.partitionBy(*partitions).orderBy(*order_cols).rowsBetween(Window.unboundedPreceding, Window.currentRow)
 
-        lag_cols_to_drop = []
+        # --- FASE 1: NETEJA DE CAMPS ROOT ---
+        for field in idems_map["root_fields"]:
+            # Convertim tokens i Nones a Null real de Spark
+            df = df.withColumn(field, F.when(F.col(field).isin(IDEM_TOKENS) | F.col(field).isNull(),
+                                             F.lit(None)).otherwise(F.col(field)))
+            # Apliquem forward fill entre files
+            df = df.withColumn(field, F.last(field, ignorenulls=True).over(window_spec))
 
-        for path, field_schema, meta in fields_info:
-            parts = path.split(".")
-            if len(parts) == 1:
-                # Top-level scalar field
-                col_name = parts[0]
-                if col_name not in df.columns:
-                    continue
-                lag_col = F.lag(F.col(col_name)).over(w)
-                expr = F.when(
-                    F.trim(F.lower(F.col(col_name))).isin(*self.IDEM_VALUES),
-                    lag_col
-                ).otherwise(F.col(col_name))
-                df = df.withColumn(col_name, expr)
+        # --- FASE 2: NETEJA D'ARRAYS (Amb memòria entre files) ---
+        # Ordenem els arrays per profunditat (de més profund a més superficial)
+        sorted_arrays = sorted(idems_map["arrays"].keys(), key=lambda x: x.count('.'), reverse=True)
+
+        for array_path in sorted_arrays:
+            meta = idems_map["arrays"][array_path]
+
+            # # Aquesta part és la clau: per passar el valor de l'últim element de la fila anterior
+            # # a la fila actual, creem una columna temporal "seed"
+            # seed_col = f"{array_path}_seed"
+
+            # CORRECCIÓ 1: Nom de la columna seed sense punts
+            seed_col_name = f"{array_path.replace('.', '_')}_seed"
+
+            # # Obtenim el darrer element de l'array de la fila anterior
+            # last_element_expr = f"element_at({array_path}, -1)"
+            # df = df.withColumn(seed_col, F.last(F.expr(last_element_expr), ignorenulls=True).over(window_spec))
+
+            # CORRECCIÓ 2: Expressió de seed que navega per l'estructura
+            # Si el path és 'cargo_list.cargo', volem l'últim 'cargo' de l'últim 'cargo_list'
+            nested_seed_expr = self._build_nested_element_at_expr(array_path)
+            # Obtenim el valor de la fila anterior
+            df = df.withColumn(
+                seed_col_name,
+                F.last(F.expr(nested_seed_expr), ignorenulls=True).over(window_spec)
+            )
+
+            # # Construïm l'expressió aggregate per processar l'array
+            # clean_expr = self._build_aggregate_expr(array_path, seed_col, meta)
+            # df = df.withColumn(array_path, F.expr(clean_expr))
+
+            # Apliquem l'aggregate (referenciant el seed_col_name sanejat)
+            # Nota: L'aggregate s'ha d'aplicar sobre el nivell superior.
+            # Si l'array_path és 'cargo_list.cargo', hem de transformar 'cargo_list'
+            if "." in array_path:
+                parent_path, current_array = array_path.rsplit(".", 1)
+                # Obtenim la funció que genera l'aggregate
+                aggregate_func = self._build_nested_aggregate_expr(current_array, seed_col_name, meta)
+
+                # Apliquem el transform fent servir withField de forma nativa
+                df = df.withColumn(
+                    parent_path,
+                    F.transform(
+                        F.col(parent_path),
+                        lambda x: x.withField(current_array, aggregate_func(x))
+                    )
+                )
+
+                # df = df.withColumn(
+                #     parent_path,
+                #     F.transform(
+                #         F.col(parent_path),
+                #         lambda x: x.withField(current_array, F.expr(clean_expr))
+                #     )
+                # )
             else:
-                # Array field (path = "array_col.idem_field" or "array_col" for simple)
-                array_col = meta["array_col"] if meta else parts[0]
-                if array_col not in df.columns:
-                    continue
+                # Si és un array d'arrel
+                clean_expr = self._build_aggregate_expr(array_path, seed_col_name, meta)
+                df = df.withColumn(array_path, clean_expr)
 
-                lag_col_name = f"_lag_resolve_{array_col}"
-                if lag_col_name not in df.columns:
-                    df = df.withColumn(lag_col_name, F.lag(F.col(array_col)).over(w))
-                    lag_cols_to_drop.append(lag_col_name)
-
-                items_type = meta.get("items_type", "object") if meta else "object"
-
-                if items_type == "simple":
-                    resolved = self._build_resolve_idem_expr_for_array_simple(
-                        array_col, lag_col_name
-                    )
-                    df = df.withColumn(array_col, resolved)
-                elif items_type == "object":
-                    idem_field = meta.get("idem_field", parts[1])
-                    struct_fields = meta.get("struct_fields", [])
-                    if not struct_fields:
-                        continue
-                    resolved = self._build_resolve_idem_expr_for_array_struct(
-                        array_col, idem_field, struct_fields, lag_col_name
-                    )
-                    df = df.withColumn(array_col, resolved)
-                # Nested arrays (inner_array) skipped for now
-
-        for c in lag_cols_to_drop:
-            if c in df.columns:
-                df = df.drop(c)
+            # Netegem la columna seed temporal
+            # df = df.drop(seed_col)
+            df = df.drop(seed_col_name)
 
         return df
+
+    def _build_nested_element_at_expr(self, path: str) -> str:
+        """
+        Converteix 'a.b.c' en 'element_at(element_at(a, -1).b, -1).c'
+        per obtenir l'últim estat d'una estructura aniuada.
+        """
+        parts = path.split(".")
+        expr = parts[0]
+        for part in parts[1:]:
+            expr = f"element_at({expr}, -1).{part}"
+        # Finalment volem l'últim d'aquest últim
+        return f"element_at({expr}, -1)"
+
+    def _build_nested_aggregate_expr(self, child_array_name: str, seed_col: str, meta: dict) -> str:
+        """
+        Construeix l'aggregate per a un array que està DINS d'un altre array.
+        Es diferencia en què l'origen de dades és 'x.{child_array_name}'
+        en lloc d'un nom de columna global.
+        """
+        fields_to_fix = meta["fields"]
+        all_fields = meta["all_struct_fields"]
+
+        # 1. Obtenim el tipus real des del teu mètode
+        element_struct_type, _ = PortadaCleaning.json_schema_to_spark_type(meta["schema"], primitive_types_as_strings=True)
+        ddl_schema = f"array<{element_struct_type.simpleString()}>"
+        # 2. Inicialitzador (Seed) - Ens assegurem que és una columna neta
+        initial_acc = F.array(F.col(seed_col)).cast(ddl_schema)
+
+        # 3. Lògica de combinació (Merge)
+        def merge_logic(acc, el):
+            struct_fields = []
+            for f_name in all_fields:
+                # Utilitzem getItem() que és més robust dins de lambdes que getField()
+                current_field = el.getItem(f_name)
+
+                if f_name in fields_to_fix:
+                    prev_field = F.element_at(acc, -1).getItem(f_name)
+                    # Comparem forçant a string el token
+                    condition = current_field.cast("string").isin(IDEM_TOKENS)
+                    field_val = F.when(condition, prev_field).otherwise(current_field)
+                else:
+                    field_val = current_field
+
+                # .alias() retorna una columna, ens assegurem que no hi hagi res més
+                struct_fields.append(field_val.alias(f_name))
+
+            # Empaquetem la llista de columnes (*struct_fields desempaqueta la llista)
+            return F.array_union(acc, F.array(F.struct(*struct_fields)))
+
+        # 4. Funció de sortida
+        def finish_logic(acc):
+            return F.slice(acc, 2, F.size(acc))
+
+        # Retornem la lambda per al transform
+        return lambda obj: F.aggregate(
+            obj.getItem(child_array_name),
+            initial_acc,
+            merge_logic,
+            finish_logic
+        )
+
+    #     fields_to_fix = meta["fields"]
+    #     all_fields = meta["all_struct_fields"]
+    #
+    #     # Construïm la definició de l'estructura (Schema) per al CAST
+    #     # És vital perquè Spark sàpiga quin tipus de dades té la 'seed'
+    #     struct_schema = ", ".join([f"{f}:string" for f in all_fields])
+    #     array_struct_type = PortadaCleaning.json_schema_to_spark_type(meta["schema"])
+    #
+    #     # 2. Creem l'acumulador inicial (seed)
+    #     # L'array només conté el darrer element de la fila anterior
+    #     initial_acc = F.cast(F.array(F.col(seed_col)), array_struct_type)
+    #
+    #     # 3. Definim la lògica de combinació (merge)
+    #     def merge_logic(acc, el):
+    #         # Reconstruïm l'estructura element a element
+    #         struct_fields = []
+    #         for f_name in all_fields:
+    #             if f_name in fields_to_fix:
+    #                 # Lògica IDEM: si és token, agafa el de l'acumulador (element_at -1)
+    #                 field_val = F.coalesce(
+    #                     F.when(el[f_name].isin(IDEM_TOKENS), F.lit(None)).otherwise(el[f_name]),
+    #                     F.element_at(acc, -1).getItem(f_name)
+    #                 )
+    #             else:
+    #                 # Si no és IDEM, només omplim si és null (opcional, segons el teu criteri)
+    #                 field_val = F.coalesce(el[f_name], F.element_at(acc, -1).getItem(f_name))
+    #
+    #             struct_fields.append(field_val.alias(f_name))
+    #
+    #         return F.array_union(acc, F.array(F.struct(*struct_fields)))
+    #
+    #     # 4. Definim la funció de sortida (finish)
+    #     # Eliminem el primer element (la seed artificial)
+    #     def finish_logic(acc):
+    #         return F.slice(acc, 2, F.size(acc))
+    #
+    #     # Retornem l'objecte Column construït
+    #     # Note: 'el' és l'argument que passarà el transform pare
+    #     return lambda obj: F.aggregate(
+    #         obj.getItem(child_array_name),
+    #         initial_acc,
+    #         merge_logic,
+    #         finish_logic
+    #     )
+    #     # # Generem la lògica de reconstrucció de l'objecte (coalesce amb l'element anterior)
+    #     # struct_gen = []
+    #     # for f_name in all_fields:
+    #     #     if f_name in fields_to_fix:
+    #     #         # Si és IDEM, agafem el camp de l'últim element de l'acumulador (acc)
+    #     #         join_idems = '", "'.join(IDEM_TOKENS)
+    #     #         val = f"coalesce(if(element.{f_name} IN ('{join_idems}'), null, element.{f_name}), element_at(acc, -1).{f_name})"
+    #     #     else:
+    #     #         # Si no és IDEM, el mantenim o agafem el predecessor si és null
+    #     #         val = f"coalesce(element.{f_name}, element_at(acc, -1).{f_name})"
+    #     #     struct_gen.append(f"{val} AS {f_name}")
+    #     #
+    #     # struct_sql = ", ".join(struct_gen)
+    #     #
+    #     # # Nota: Aquí l'iterador de l'aggregate l'anomenem 'element' per no
+    #     # # confondre'l amb la 'x' del transform pare.
+    #     # return F.aggregate(
+    #     #         x[child_array_name],
+    #     #         F.cast()
+    #     #         CAST(array({seed_col}) AS array<struct<{struct_schema}>>),
+    #     #         (acc, element) -> array_union(acc, array(
+    #     #             struct({struct_sql})
+    #     #         )),
+    #     #         acc -> slice(acc, 2, size(acc))
+    #     #     )
+
+    def _build_aggregate_expr(self, array_path: str, seed_col: str, meta: dict) -> str:
+        """
+        Construeix l'expressió SQL 'aggregate' per a Spark.
+        """
+        """
+            Construeix l'aggregate per a un array de primer nivell usant PySpark pur.
+            """
+        fields_to_fix = meta["fields"]
+        all_fields = meta["all_struct_fields"]
+
+        # Obtenim l'estructura real per evitar el Datatype Mismatch
+        element_struct_type, _ = PortadaCleaning.json_schema_to_spark_type(meta["schema"], primitive_types_as_strings=True)
+
+        # Usem el format DDL per evitar l'AssertionError d'abans
+        ddl_schema = f"array<{element_struct_type.simpleString()}>"
+
+        # L'acumulador inicial amb el tipus perfectament definit
+        initial_acc = F.array(F.col(seed_col)).cast(ddl_schema)
+
+        def merge_logic(acc, el):
+            struct_fields = []
+            for f_name in all_fields:
+                current_field = el[f_name]
+
+                if f_name in fields_to_fix:
+                    # Camps simples que poden ser "idem"
+                    prev_field = F.element_at(acc, -1)[f_name]
+                    is_idem = current_field.cast("string").isin(IDEM_TOKENS)
+
+                    # Si és idem agafem l'anterior, si no l'actual
+                    field_val = F.when(is_idem, prev_field).otherwise(current_field)
+                else:
+                    # Camps complexos (com 'cargo') o sense idem.
+                    # Com que sabem que no són Null, ens els quedem directament
+                    field_val = current_field
+
+                struct_fields.append(field_val.alias(f_name))
+
+            return F.array_union(acc, F.array(F.struct(*struct_fields)))
+
+        def finish_logic(acc):
+            return F.slice(acc, 2, F.size(acc))
+
+        # ATENCIÓ: Aquí no retornem una lambda, sinó la columna directament,
+        # ja que estem operant sobre una columna de primer nivell (F.col)
+        return F.aggregate(
+            F.col(array_path),
+            initial_acc,
+            merge_logic,
+            finish_logic
+        )
+
+    # @data_transformer_method()
+    # def resolve_idems(self, df: TracedDataFrame) -> TracedDataFrame:
+    #     """
+    #     For fields marked with accepted_idem in the schema, replace the values
+    #     'idem', 'id', 'id.' with the value of the predecessor record (previous row).
+    #     """
+    #     if self._schema is None:
+    #         raise ValueError("Must call use_schema() before.")
+    #     if "schema" in self._schema:
+    #         schema_to_use = self._schema["schema"]
+    #     else:
+    #         schema_to_use = self._schema
+    #     props = schema_to_use.get("properties", {})
+    #
+    #     fields_info = self._collect_idems_for_spark(schema_to_use)
+    #     if not fields_info:
+    #         return df
+    #
+    #     # Window: partition by publication/date, order by entry_id (or numeric id if not present)
+    #     part_cols = ["publication_name", "publication_date"]
+    #     order_col = F.col("entry_id")
+    #     w = Window.partitionBy(part_cols).orderBy(order_col)
+    #
+    #     lag_cols_to_drop = []
+    #
+    #     for path, field_schema, meta in fields_info:
+    #         parts = path.split(".")
+    #         if len(parts) == 1:
+    #             # Top-level scalar field
+    #             col_name = parts[0]
+    #             if col_name not in df.columns:
+    #                 continue
+    #             lag_col = F.lag(F.col(col_name)).over(w)
+    #             expr = F.when(
+    #                 F.trim(F.lower(F.col(col_name))).isin(*self.IDEM_VALUES),
+    #                 lag_col
+    #             ).otherwise(F.col(col_name))
+    #             df = df.withColumn(col_name, expr)
+    #         else:
+    #             # Array field (path = "array_col.idem_field" or "array_col" for simple)
+    #             array_col = meta["array_col"] if meta else parts[0]
+    #             if array_col not in df.columns:
+    #                 continue
+    #
+    #             lag_col_name = f"_lag_resolve_{array_col}"
+    #             if lag_col_name not in df.columns:
+    #                 df = df.withColumn(lag_col_name, F.lag(F.col(array_col)).over(w))
+    #                 lag_cols_to_drop.append(lag_col_name)
+    #
+    #             items_type = meta.get("items_type", "object") if meta else "object"
+    #
+    #             if items_type == "simple":
+    #                 resolved = self._build_resolve_idem_expr_for_array_simple(
+    #                     array_col, lag_col_name
+    #                 )
+    #                 df = df.withColumn(array_col, resolved)
+    #             elif items_type == "object":
+    #                 idem_field = meta.get("idem_field", parts[1])
+    #                 struct_fields = meta.get("struct_fields", [])
+    #                 if not struct_fields:
+    #                     continue
+    #                 resolved = self._build_resolve_idem_expr_for_array_struct(
+    #                     array_col, idem_field, struct_fields, lag_col_name
+    #                 )
+    #                 df = df.withColumn(array_col, resolved)
+    #             # Nested arrays (inner_array) skipped for now
+    #
+    #     for c in lag_cols_to_drop:
+    #         if c in df.columns:
+    #             df = df.drop(c)
+    #
+    #     return df
 
     @block_transformer_method
     def cleaning(self, df: DataFrame | TracedDataFrame) -> TracedDataFrame:
@@ -735,7 +1120,7 @@ class PortadaCleaning(DeltaDataLayer):
         return ship_entries_df
 
     def save_ship_entries(self, ship_entries_df: TracedDataFrame) -> TracedDataFrame:
-        self.write_delta("ship_entries", mode="overwrite",
+        self.write_delta("ship_entries",df=ship_entries_df, mode="overwrite",
                          partition_by=["publication_name", "publication_date_year", "publication_date_month"])
         return ship_entries_df
 
