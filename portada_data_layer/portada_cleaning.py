@@ -706,8 +706,7 @@ class PortadaCleaning(DeltaDataLayer):
         """)
 
     def read_raw_entities(self, entity: str):
-        container_path = self.__resolve_container_path("known_entities", entity, process_level_dir=self._process_level_dirs_[self.RAW_PROCESS_LEVEL])
-        df = self.read_delta(*container_path)
+        df = self.read_delta("known_entities", entity, process_level_dir=self._process_level_dirs_[self.RAW_PROCESS_LEVEL])
         return df
 
     def read_raw_entries(self, *container_path, user: str = None, publication_name: str = None, y: int | str = None, m: int | str = None,
@@ -1243,6 +1242,7 @@ class BoatFactCleaning(PortadaCleaning):
         if from_port_of_calls:
             df_exploded = df_entries.select(
                 "entry_id",
+                "temp_key",
                 F.posexplode("travel_port_of_call_list").alias("port_idx", "port_of_call_item")
             )
             df_port_of_calls = df_exploded.select(
@@ -1250,7 +1250,7 @@ class BoatFactCleaning(PortadaCleaning):
                 "temp_key",
                 F.lit("travel_port_of_call_list").alias("field_origin"),
                 "port_idx",
-                F.col("port_of_call_item.port_of_call_place").alias("port_name")
+                F.col("port_of_call_item.port_of_call_place").alias("citation")
             )
             df_port_of_calls = df_port_of_calls.withColumn(
                 "id",
@@ -1258,12 +1258,11 @@ class BoatFactCleaning(PortadaCleaning):
             )
         if from_arrival_port:
             df_port_arrival = df_entries.select(
-                F.col("entry_id").alias("id"),
                 "entry_id",
                 "temp_key",
                 F.lit("travel_arrival_port").alias("field_origin"),
                 F.lit(0).alias("port_idx"),
-                F.col("travel_arrival_port").alias("port_name")
+                F.col("travel_arrival_port").alias("citation")
             )
             df_port_arrival = df_port_arrival.withColumn(
                 "id",
@@ -1271,7 +1270,6 @@ class BoatFactCleaning(PortadaCleaning):
             )
         if from_departure_port:
             df_port_departure = df_entries.select(
-                F.col("entry_id").alias("id"),
                 "entry_id",
                 "temp_key",
                 F.lit("travel_departure_port").alias("field_origin"),
@@ -1309,7 +1307,7 @@ class BoatFactCleaning(PortadaCleaning):
         return df_ship_entry
 
     @staticmethod
-    def extract_ship_tons_unit(df_entries):
+    def extract_ship_tons_units(df_entries):
         df_ship_tons_unit = df_entries.select(
             F.col("entry_id").alias("id"),
             "entry_id",
@@ -1320,7 +1318,7 @@ class BoatFactCleaning(PortadaCleaning):
         return df_ship_tons_unit
 
     @staticmethod
-    def extract_ship_flag(df_entries):
+    def extract_ship_flags(df_entries):
         df_ship_flag = df_entries.select(
             F.col("entry_id").alias("id"),
             "entry_id",
@@ -1331,7 +1329,7 @@ class BoatFactCleaning(PortadaCleaning):
         return df_ship_flag
 
     @staticmethod
-    def extract_master_role(df_entries):
+    def extract_master_roles(df_entries):
         df_master_role = df_entries.select(
             F.col("entry_id").alias("id"),
             "entry_id",
@@ -1342,11 +1340,12 @@ class BoatFactCleaning(PortadaCleaning):
         return df_master_role
 
     @staticmethod
-    def extract_cargo_comodity_and_unit(df_entries):
+    def extract_cargo_comodities_and_units(df_entries):
         # 1. Primer nivell: Explotem la llista de comerciants (cargo_list)
         # Fem servir posexplode per mantenir l'ordre dels comerciants
         df_merchants = df_entries.select(
             "entry_id",  # El teu camp identificador original
+            "temp_key",
             F.posexplode("cargo_list").alias("merchant_idx", "merchant_struct")
         )
 
@@ -1354,31 +1353,33 @@ class BoatFactCleaning(PortadaCleaning):
         # Extraiem el nom del comerciant i explotem el seu array intern de càrrega
         df_cargo = df_merchants.select(
             "entry_id",
+            "temp_key",
             "merchant_idx",
             F.posexplode("merchant_struct.cargo").alias("cargo_idx", "c")
         )
 
-        df_comodity = df_cargo.select(
+        df_comodity_and_unit = df_cargo.select(
             "entry_id",
             "temp_key",
-            F.lit("cargo_list.cargo.cargo_per_merchant_list").alias("field_origin"),
+            F.lit("cargo_list").alias("field_origin"),
             "merchant_idx",
             "cargo_idx",
             F.col("c.cargo_commodity").alias("cargo_commodity_citation"),
             F.col("c.cargo_unit").alias("cargo_unit_citation")
         )
-        df_comodity = df_comodity.withColumn(
+        df_comodity_and_unit = df_comodity_and_unit.withColumn(
             "id",
             F.concat("entry_id", F.lit("-"), "field_origin", F.lit("-"), "merchant_idx", F.lit("-"), "cargo_idx")
         )
 
-        return df_comodity
+        return df_comodity_and_unit
 
 
     @staticmethod
-    def extract_cargo_merchant(df_entries):
+    def extract_cargo_merchants(df_entries):
         df_merchants = df_entries.select(
             "entry_id",  # El teu camp identificador original
+            "temp_key",
             F.posexplode("cargo_list").alias("merchant_idx", "merchant_struct")
         )
 
@@ -1398,7 +1399,7 @@ class BoatFactCleaning(PortadaCleaning):
 
 
     @staticmethod
-    def extract_ship_agent(df_entries):
+    def extract_ship_agents(df_entries):
         df_ship_agent = df_entries.select(
             F.col("entry_id").alias("id"),
             "entry_id",
@@ -1410,7 +1411,7 @@ class BoatFactCleaning(PortadaCleaning):
 
 
     @staticmethod
-    def extract_broker(df_entries):
+    def extract_brokers(df_entries):
         df_broker = df_entries.select(
             F.col("entry_id").alias("id"),
             "entry_id",
@@ -1421,11 +1422,11 @@ class BoatFactCleaning(PortadaCleaning):
         return df_broker
 
     @staticmethod
-    def extract_master(df_entries):
+    def extract_masters(df_entries):
        return BoatFactCleaning._extract_single_entry(df_entries)
 
     @staticmethod
-    def extract_ship(df_entries):
+    def extract_ships(df_entries):
         return BoatFactCleaning._extract_single_entry(df_entries)
 
     @staticmethod
@@ -1442,7 +1443,7 @@ class BoatFactCleaning(PortadaCleaning):
             F.col("ship_flag").alias("ship_flag_citation"),
             F.col("ship_tons_capacity").alias("ship_tons_capacity_citation"),
             F.col("ship_name").alias("ship_name_citation"),
-            F.col("master_rol").alias("master_rol_citation"),
+            F.col("master_role").alias("master_role_citation"),
             F.col("master_name").alias("master_name_citation"),
             F.lit("single_ship_entry_fields").alias("field_origin"),
         )
@@ -1454,9 +1455,14 @@ class BoatFactCleaning(PortadaCleaning):
         if df_entities is None:
             raise ValueError("No known entities found")
         df_voices = df_entities.select(
+            "name",  # El teu camp identificador original
+            F.posexplode("voices").alias("voice_idx", "voice")
+        )
+        df_voices = df_voices.select(
             F.concat(F.col("name"), F.lit("-"), F.col("voice")).alias("id"),
             F.col("name"),
-            F.lit("voice").alias("field_origin"),
+            F.col("voice_idx"),
+            F.lit("voices").alias("field_origin"),
             F.col("voice")
         )
         return df_voices
