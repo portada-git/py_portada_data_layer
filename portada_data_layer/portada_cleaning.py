@@ -1436,36 +1436,36 @@ class BoatFactCleaning(PortadaCleaning):
 
     @staticmethod
     def extract_masters(df_entries):
-    """
-    Extract the masters citations in newspapers from the given DataFrame.
+        """
+        Extract the masters citations in newspapers from the given DataFrame.
 
-    Parameters
-    ----------
-    df_entries : DataFrame
-        The DataFrame containing the masters to be extracted.
+        Parameters
+        ----------
+        df_entries : DataFrame
+            The DataFrame containing the masters to be extracted.
 
-    Returns
-    -------
-    DataFrame
-        A DataFrame containing the extracted masters citations.
-    """
-       return BoatFactCleaning._extract_single_entry(df_entries)
+        Returns
+        -------
+        DataFrame
+            A DataFrame containing the extracted masters citations.
+        """
+        return BoatFactCleaning._extract_single_entry(df_entries)
 
     @staticmethod
     def extract_ships(df_entries):
-    """
-    Extract the ships citations in newspapers from the given DataFrame.
+        """
+        Extract the ships citations in newspapers from the given DataFrame.
 
-    Parameters
-    ----------
-    df_entries : DataFrame
-        The DataFrame containing the ships to be extracted.
+        Parameters
+        ----------
+        df_entries : DataFrame
+            The DataFrame containing the ships to be extracted.
 
-    Returns
-    -------
-    DataFrame
-        The DataFrame containing the extracted ships.
-    """
+        Returns
+        -------
+        DataFrame
+            The DataFrame containing the extracted ships.
+        """
         return BoatFactCleaning._extract_single_entry(df_entries)
 
     @staticmethod
