@@ -1366,6 +1366,7 @@ class BoatFactCleaning(PortadaCleaning):
             "cargo_idx",
             F.col("c.cargo_commodity").alias("cargo_commodity_citation"),
             F.col("c.cargo_unit").alias("cargo_unit_citation")
+            F.concat("c.cargo_commodity", F.lit("-"), "c.cargo_unit").alias("citation")
         )
         df_comodity_and_unit = df_comodity_and_unit.withColumn(
             "id",
