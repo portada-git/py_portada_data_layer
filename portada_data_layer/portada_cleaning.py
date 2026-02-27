@@ -1412,6 +1412,19 @@ class BoatFactCleaning(PortadaCleaning):
 
     @staticmethod
     def extract_brokers(df_entries):
+        """
+        Extract brokers from a DataFrame of entries.
+
+        Parameters
+        ----------
+        df_entries : pyspark.sql.DataFrame
+            A DataFrame containing entries.
+
+        Returns
+        -------
+        pyspark.sql.DataFrame
+            A DataFrame containing brokers.
+        """
         df_broker = df_entries.select(
             F.col("entry_id").alias("id"),
             "entry_id",
@@ -1423,14 +1436,41 @@ class BoatFactCleaning(PortadaCleaning):
 
     @staticmethod
     def extract_masters(df_entries):
+    """
+    Extract the masters citations in newspapers from the given DataFrame.
+
+    Parameters
+    ----------
+    df_entries : DataFrame
+        The DataFrame containing the masters to be extracted.
+
+    Returns
+    -------
+    DataFrame
+        A DataFrame containing the extracted masters citations.
+    """
        return BoatFactCleaning._extract_single_entry(df_entries)
 
     @staticmethod
     def extract_ships(df_entries):
+    """
+    Extract the ships citations in newspapers from the given DataFrame.
+
+    Parameters
+    ----------
+    df_entries : DataFrame
+        The DataFrame containing the ships to be extracted.
+
+    Returns
+    -------
+    DataFrame
+        The DataFrame containing the extracted ships.
+    """
         return BoatFactCleaning._extract_single_entry(df_entries)
 
     @staticmethod
     def _extract_single_entry(df_entries):
+
         df_to_return = df_entries.select(
             F.col("entry_id").alias("id"),
             "entry_id",
@@ -1449,15 +1489,52 @@ class BoatFactCleaning(PortadaCleaning):
         )
         return df_to_return
 
-    def get_known_entity_voices(self, known_entity=None, df_entities = None):
+    def get_known_entity_voices(self, known_entity: str = None, df_entities: DataFrame = None) -> DataFrame:
+        """
+        Given a known entity, return a DataFrame with the voices associated with each name.
+        If no known entity is provided, use the df_entities provided.
+
+        Parameters
+        ----------
+        known_entity : str
+            The known entity to extract voices from.
+        df_entities : DataFrame, optional
+            The DataFrame containing the known entities to extract voices from.
+
+        Returns
+        -------
+        DataFrame
+            A DataFrame with the voices associated with each name.
+        """
         if known_entity is not None:
             df_entities = self.read_delta("known_entities", known_entity)
         if df_entities is None:
             raise ValueError("No known entities found")
+        # Select the columns of interest
         df_voices = df_entities.select(
             "name",  # El teu camp identificador original
             F.posexplode("voices").alias("voice_idx", "voice")
         )
+        # Create a new column with the concatenation of the name and the voice idx
+        df_voices = df_voices.select(
+            F.concat(F.col("name"), F.lit("-"), F.col("voice")).alias("id"),
+            F.col("name"),
+            F.col("voice_idx"),
+            F.lit("voices").alias("field_origin"),
+            F.col("voice")
+        )
+        return df_voices
+    def get_known_entity_voices(self, known_entity:str =None, df_entities = None):
+        if known_entity is not None:
+            df_entities = self.read_delta("known_entities", known_entity)
+        if df_entities is None:
+            raise ValueError("No known entities found")
+        # Select the columns of interest
+        df_voices = df_entities.select(
+            "name",  # El teu camp identificador original
+            F.posexplode("voices").alias("voice_idx", "voice")
+        )
+        # Create a new column with the concatenation of the name and the voice idx
         df_voices = df_voices.select(
             F.concat(F.col("name"), F.lit("-"), F.col("voice")).alias("id"),
             F.col("name"),
