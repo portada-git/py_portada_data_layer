@@ -547,11 +547,11 @@ class BoatFactIngestion(NewsExtractionIngestion):
     __container_path = "ship_entries"
     def __init__(self, builder=None):
         super().__init__(builder=builder)
-        if builder is not None:
-            patcher = BoatFactPatcherDataLayer(builder=builder)
-            patcher.patch_if_needed()
-        else:
-            raise PatchError("No builder specified. Patch checking is not possible.")
+
+    def start_session(self):
+        super().start_session()
+        patcher = BoatFactPatcherDataLayer(cfg_json=self.get_configuration())
+        patcher.patch_if_needed()
 
 
     def ingest(self, *container_path, local_path: str, user: str ):

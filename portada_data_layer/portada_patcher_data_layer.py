@@ -50,7 +50,7 @@ class PortadaPatcherDataLayer(DeltaDataLayer):
     def __init__(self, builder=None, cfg_json: dict = None):
         super().__init__(builder=builder, cfg_json=cfg_json)
         self._current_process_level = 1
-        self._client_db_satate_manager = None
+        self._client_db_state_manager = None
         self.delta_data_version_manager_params = None
 
     def set_delta_data_version_manager_params(self, host: str = None, port: str = None, db: int = 3):
@@ -62,7 +62,7 @@ class PortadaPatcherDataLayer(DeltaDataLayer):
         return self
 
     def delta_data_version_manager(self):
-        if self._client_db_satate_manager is None:
+        if self._client_db_state_manager is None:
             if self.delta_data_version_manager_params is None:
                 if self.sequencer_params is None:
                     return None
@@ -70,13 +70,13 @@ class PortadaPatcherDataLayer(DeltaDataLayer):
                     host = self.sequencer_params["host"]
                     port = self.sequencer_params["port"]
                     db = self.sequencer_params["db"]
-                    self._client_db_satate_manager = RadisDeltaDataLayerVersionManager(host, port)
+                    self._client_db_state_manager = RadisDeltaDataLayerVersionManager(host, port)
             else:
                 host = self.delta_data_version_manager_params["host"]
                 port = self.delta_data_version_manager_params["port"]
                 db = self.delta_data_version_manager_params["db"]
-                self._client_db_satate_manager = RadisDeltaDataLayerVersionManager(host, port, db)
-        return self._client_db_satate_manager
+                self._client_db_state_manager = RadisDeltaDataLayerVersionManager(host, port, db)
+        return self._client_db_state_manager
 
     def get_last_data_version_value(self):
         ddvm = self.delta_data_version_manager()
@@ -92,7 +92,7 @@ class PortadaPatcherDataLayer(DeltaDataLayer):
             if ddvm is None:
                 return self._set_delta_data_lastversion("ship_entries", version)
             else:
-                return self._client_db_satate_manager.set_version("ship_entries", version)
+                return self._client_db_state_manager.set_version("ship_entries", version)
         except Exception as e:
             raise PatchErrorSettingVersion(e, version)
 

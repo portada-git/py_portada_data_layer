@@ -1854,10 +1854,11 @@ class BoatFactCleaning(PortadaCleaning):
     def __init__(self, builder=None, cfg_json: dict = None):
         super().__init__(builder=builder, cfg_json=cfg_json)
         self.__container_path = "ship_entries"
-        if builder is not None:
-            patcher = BoatFactPatcherDataLayer(builder=builder)
-            patcher.patch_if_needed()
 
+    def start_session(self):
+        super().start_session()
+        patcher = BoatFactPatcherDataLayer(cfg_json=self.get_configuration())
+        patcher.patch_if_needed()
 
     def save_original_values_of_ship_entries(self, ship_entries_df: TracedDataFrame) -> TracedDataFrame:
         self.write_delta("original_data", self.__container_path, df=ship_entries_df, mode="merge",
