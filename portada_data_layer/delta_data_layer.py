@@ -770,6 +770,7 @@ class DeltaDataLayer(BaseDeltaDataLayer):
                  - write_delta(("bronze", "portada.masters"), df) will be resolved as <delta_data_base_path>/bronze/portada/masters
         :param df:
         :param mode:  mode to write the DataFrame in the delta table. Accepted options:
+            * 'merge' : merge new data from df to existent data and update it.
             * `append`: Append contents of this :class:`DataFrame` to existing data.
             * `overwrite`: Overwrite existing data.
             * `error` or `errorifexists`: Throw an exception if data already exists.
@@ -792,14 +793,29 @@ class DeltaDataLayer(BaseDeltaDataLayer):
             df_large_name = "UNKNOWN"
             df = TracedDataFrame(df, table_name=tn, df_name=source_path, df_version=source_version)
 
+        is_new = False
         path = self._resolve_path(*table_path)
         target_path = self._resolve_relative_path(path)
-        logger.info(f"Writing Delta → {path}")
-        if partition_by is None:
-            original_df.write.format("delta").mode(mode).save(path)
-        else:
-            original_df.write.format("delta").mode(mode).partitionBy(partition_by).save(path)
-        version = self.get_delta_metatable(path).history(1).collect()[0]['version']
+        version = -1
+        if mode == "merge":
+            if not self.is_delta_table(*table_path):
+               mode = "overwrite"
+            else:
+                delta_table = self.get_delta_table(*table_path)
+                delta_table.alias("current").merge(
+                    source=df.toSparkDataFrame().alias("new"),
+                    condition="current.entry_id=new.entry_id"
+                ).whenMatchedUpdateAll().whenNotMatchedInsertAll().execute()
+                version = delta_table.history(1).collect()[0]['version']
+        if mode != "merge":
+            is_new = not self.path_exists(path)
+            if partition_by is None:
+                original_df.write.format("delta").mode(mode).save(path)
+            else:
+                original_df.write.format("delta").mode(mode).partitionBy(partition_by).save(path)
+            version = self.get_delta_metatable(path).history(1).collect()[0]['version']
+
+        logger.info(f"Writing Delta → {target_path}")
         if self.log_storage or self._save_lineage_on_store or df.save_lineage_on_store:
             if hasattr(self, "metadata"):
                 metadata = self.metadata
@@ -816,7 +832,7 @@ class DeltaDataLayer(BaseDeltaDataLayer):
                 data_layer=self,
                 num_records=original_df.count(),
                 mode=mode,
-                new=not self.path_exists(path),
+                new=is_new,
                 table_name=tn,
                 df_name=df_name,
                 df_large_name=df_large_name,
@@ -895,6 +911,26 @@ class DeltaDataLayer(BaseDeltaDataLayer):
             else:
                 raise e
         return None if df is None else TracedDataFrame(df, table_name=tn, df_name= name, df_version=version)
+
+    def is_delta_table(self, *table_path):
+        path = self._resolve_path(*table_path)
+        return DeltaTable.isDeltaTable(self.spark, path)
+
+    def get_delta_table(self, *table_path) -> DeltaTable:
+        """
+       Load and return a delta table.
+       table_path is the *container_path of the table to read and can be any of the following forms:
+           1. dict or list. Examples: read_delta("portada", "ships") or read_delta(["portada", "ships"]). The table *container_path will be resolved as <delta_data_base_path>/portada/ships
+           2. Only the table name or a sequence of strings. Examples:
+               - read_delta("ships"). This case will be resolved as <delta_data_base_path>/ships
+               - read_delta("portada", "ships") will be resolved as <delta_data_base_path>/portada/ships
+           3. String, sequence of strings, dict or list with items including dots as separator. Examples:
+               - read_delta("portada.masters") will be resolved as <delta_data_base_path>/portada/masters
+               - read_delta(("bronze", "portada.masters")) will be resolved as <delta_data_base_path>/bronze/portada/masters
+        :param table_path:
+        :return: DeltaTable type
+        """
+        return self.get_delta_metatable(*table_path)
 
     def get_delta_metatable(self, *table_path) -> DeltaTable:
         """

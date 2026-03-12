@@ -9,6 +9,7 @@ portada_data_layer/portada_cleaning.py
 portada_data_layer/portada_delta_builder.py
 portada_data_layer/portada_delta_common.py
 portada_data_layer/portada_ingestion.py
+portada_data_layer/portada_patcher_data_layer.py
 portada_data_layer/traced_data_frame.py
 py_portada_data_layer.egg-info/PKG-INFO
 py_portada_data_layer.egg-info/SOURCES.txt

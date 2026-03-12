@@ -2,7 +2,9 @@ from .data_lake_metadata_manager import DataLakeMetadataManager, enable_storage_
     disable_storage_log_for_method, enable_storage_log_for_class, disable_storage_log_for_class, enable_field_lineage_log, disable_field_lineage_log, \
     disable_field_lineage_log_for_method, enable_field_lineage_log_for_method, enable_field_lineage_log_for_class, disable_field_lineage_log_for_class, \
     block_transformer_method, block_transformer
+from .traced_data_frame import TracedDataFrame
 from .delta_data_layer import BaseDeltaDataLayer, DeltaDataLayer, FileSystemTaskExecutor
 from .portada_delta_builder import PortadaBuilder, DeltaDataLayerBuilder
 from .portada_ingestion import PortadaIngestion
-from .traced_data_frame import TracedDataFrame
+from .portada_cleaning import PortadaCleaning, BoatFactCleaning
+from .portada_patcher_data_layer import PortadaPatcherDataLayer

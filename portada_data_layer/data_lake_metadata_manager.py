@@ -642,7 +642,7 @@ class DataLakeMetadataManager(PathConfigDeltaDataLayer):
         """
         Logs duplicate detection.
         Saves duplicate records as a separate Delta table,
-        and creates a summary entry in the main log with their location.
+        and creates a summary field in the main log with their location.
         """
         # # Nom de subdirectori basat en data i publicació
         # safe_pub = publication.replace(" ", "_").lower()

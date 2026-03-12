@@ -8,6 +8,7 @@ from portada_data_layer.boat_fact_model import BoatFactDataModel
 from portada_data_layer.data_lake_metadata_manager import DataLakeMetadataManager, enable_storage_log_for_class, \
     block_transformer_method, data_transformer_method, enable_field_lineage_log_for_class
 from portada_data_layer.delta_data_layer import DeltaDataLayer, FileSystemTaskExecutor
+from portada_data_layer.portada_patcher_data_layer import BoatFactPatcherDataLayer, PatchError
 from portada_data_layer.traced_data_frame import TracedDataFrame
 from pyspark.sql import Row, functions as F
 from pyspark.sql.functions import col, year, month, dayofmonth
@@ -144,49 +145,7 @@ class PortadaIngestion(DeltaDataLayer):
 class NewsExtractionIngestion(PortadaIngestion):
     def __init__(self, builder=None):
         super().__init__(builder=builder)
-        # self.get_single_value_of_udf = None
-        # self.get_struct_value_of_udf=None
         self.generate_uid_udf = None
-        self._register_udfs()
-
-    def _register_udfs(self):
-        """Register UDF to extract values from structured fields as boat fact data model."""
-
-        # # @F.udf(returnType=StringType())
-        # def get_single_value_of(value):
-        #     if isinstance(value, Row):
-        #         value = value.asDict(recursive=True)
-        #     elif isinstance(value, str):
-        #         if value.startswith("{") or value.startswith("["):
-        #             value = json.loads(value)
-        #     return BoatFactDataModel.get_single_value_of(value)
-        #
-        # self.register_udfs("get_single_value_of_udf", get_single_value_of, StringType())
-
-        # def get_struct_value_of(value):
-        #     if isinstance(value, Row):
-        #         value = value.asDict(recursive=True)
-        #     elif isinstance(value, str):
-        #         if value.startswith("{") or value.startswith("["):
-        #             value = json.loads(value)
-        #     return BoatFactDataModel.get_struct_value_of(value)
-        #
-        # self.register_udfs(
-        #     "get_struct_value_of_udf",
-        #     get_struct_value_of, StructType(
-        #         [
-        #             StructField(BoatFactDataModel.DEFAULT_VALUE_FIELD, StringType(), True),
-        #             StructField(BoatFactDataModel.ORIGINAL_VALUE_FIELD, StringType(), True),
-        #             StructField(BoatFactDataModel.CALCULATED_VALUE_FIELD, StringType(), True),
-        #         ]
-        #     )
-        # )
-
-        # @F.udf(StringType())
-        # def generate_uid():
-        #     return str(uuid.uuid4())
-        #
-        # self.generate_uid_udf = generate_uid
 
     @data_transformer_method(
         description="Extract values from original files and organize them by news publication metadata.")
@@ -271,9 +230,35 @@ class NewsExtractionIngestion(PortadaIngestion):
 
             # If file exists, load it and detect duplicates
             if self.json_file_exist(full_path):
+                # Identifiquem els textos que ja han arribat de nou
+                new_texts = subset.select("parsed_text").distinct()
+
                 existing_df = self.read_json(full_path)
                 existing_df = existing_df.localCheckpoint()
-                merged_df = subset.unionByName(existing_df, allowMissingColumns=True).dropDuplicates(["parsed_text"])
+                # Recuperem els IDs existents per als textos que ja tenim
+                # Creem un mapping de parsed_text -> entry_id (l'ID vell)
+                id_mapping = existing_df.select(
+                    F.col("parsed_text").alias("old_text"),
+                    F.col("entry_id").alias("old_id")
+                )
+
+                # 2. Ajuntem el subset amb el mapping per recuperar l'ID si el text coincideix
+                subset = subset.join(
+                    id_mapping,
+                    subset.parsed_text == id_mapping.old_text,
+                    how="left"
+                ).withColumn(
+                    "entry_id",
+                    F.coalesce(F.col("old_id"), F.col("entry_id"))  # Si hi ha ID vell, l'usem; si no, mantenim el nou
+                ).drop("old_text", "old_id")
+
+                # Del dataframe existent, eliminem els que coincideixen amb els nous
+                # "Elimina de existing_df tot el que estigui a new_texts"
+                existing_df_filtered = existing_df.join(new_texts, on="parsed_text", how="left_anti")
+
+                # 3. Ara la unió és segura: no hi ha duplicats entre els dos DFs
+                # I ens assegurem que el que queda és el contingut del subset
+                merged_df = subset.unionByName(existing_df_filtered, allowMissingColumns=True)
                 duplicates = subset.count() + existing_df.count() - merged_df.count()
                 regs += merged_df.count()
                 if duplicates > 0:
@@ -294,14 +279,49 @@ class NewsExtractionIngestion(PortadaIngestion):
                     )
                 df_list.append(merged_df)
                 self.write_json(full_path, df=merged_df, mode="overwrite")
+                self.__update_state(*container_path, df=merged_df)
             else:
                 regs += subset.count()
                 df_list.append(subset)
                 self.write_json(full_path, df=subset, mode="overwrite")
+                self.__update_state(*container_path, df=subset)
 
         logger.info(f"{regs} entries was saved")
 
         return df_list
+
+    def __update_state(self, *container_path, df):
+        ## ACTUALITZANT L'ESTAT
+        state_path = self._resolve_path(*container_path, process_level_dir="states")
+        new_status_df = df.select(
+            F.col("entry_id"),
+            F.lit(False).alias("is_cleaned")
+        ).distinct()
+        if self.path_exists(state_path):  # O parquet_file_exist
+            # 2. Llegim l'estat actual
+            existing_state_df = self.spark.read.parquet(state_path)
+
+            existing_state_df.localCheckpoint()
+
+            # 3. ELIMINEM de l'estat vell els IDs que acaben d'arribar
+            # Així, si un ID ja hi era amb is_new=False, l'esborrem de la versió vella
+            state_without_updates = existing_state_df.join(
+                new_status_df,
+                on="entry_id",
+                how="left_anti"
+            )
+
+            # 4. UNIM: Registres vells no modificats + Registres nous/actualitzats
+            final_state_df = state_without_updates.unionByName(new_status_df)
+        else:
+            # Si és la primera vegada, l'estat és simplement la ingesta actual
+            final_state_df = new_status_df
+
+        # 5. Guardem l'estat actualitzat
+        final_state_df.write.mode("overwrite").parquet(state_path)
+
+        return final_state_df
+
 
     def read_raw_data(self, *container_path, user: str = None, publication_name: str = None, y: int | str = None, m: int | str = None,
                       d: int | str = None, edition: str = None):
@@ -525,20 +545,44 @@ class KnownEntitiesIngestion(PortadaIngestion):
 
 class BoatFactIngestion(NewsExtractionIngestion):
     __container_path = "ship_entries"
+    def __init__(self, builder=None):
+        super().__init__(builder=builder)
+        if builder is not None:
+            patcher = BoatFactPatcherDataLayer(builder=builder)
+            patcher.patch_if_needed()
+        else:
+            raise PatchError("No builder specified. Patch checking is not possible.")
 
-    def ingest(self, local_path: str, user: str ):
-        return super().ingest(self.__container_path, local_path=local_path, user=user)
 
-    def save_raw_data(self, data: dict | list = None, user:str = None, source_path: str = None, **kwargs):
-        return super().save_raw_data(self.__container_path, user=user, data=data, source_path=source_path, **kwargs)
+    def ingest(self, *container_path, local_path: str, user: str ):
+        if len(container_path)>0:
+            cp = container_path
+        else:
+            cp = (self.__container_path,)
+        return super().ingest(*cp, local_path=local_path, user=user)
 
-    def read_raw_data(self, publication_name: str = None, y: int | str = None, m: int | str = None, d: int | str = None,
+    def save_raw_data(self, *container_path, data: dict | list = None, user:str = None, source_path: str = None, **kwargs):
+        if len(container_path) > 0:
+            cp = container_path
+        else:
+            cp = (self.__container_path,)
+        return super().save_raw_data(*cp, user=user, data=data, source_path=source_path, **kwargs)
+
+    def read_raw_data(self, *container_path, publication_name: str = None, y: int | str = None, m: int | str = None, d: int | str = None,
                       edition: str = None, user: str = None, **kwargs):
-        return super().read_raw_data(self.__container_path, user=user, publication_name=publication_name, y=y, m=m, d=d,
+        if len(container_path) > 0:
+            cp = container_path
+        else:
+            cp = (self.__container_path,)
+        return super().read_raw_data(*cp, user=user, publication_name=publication_name, y=y, m=m, d=d,
                                      edition=edition)
 
-    def get_missing_dates_from_a_newspaper(self, publication_name: str, start_date: str = None,
+    def get_missing_dates_from_a_newspaper(self, *container_path, publication_name: str, start_date: str = None,
                                            end_date: str = None, date_and_edition_list: dict | str = None):
-        return super().get_missing_dates_from_a_newspaper(self.__container_path, publication_name=publication_name,
+        if len(container_path) > 0:
+            cp = container_path
+        else:
+            cp = (self.__container_path,)
+        return super().get_missing_dates_from_a_newspaper(*cp, publication_name=publication_name,
                                                           start_date=start_date, end_date=end_date,
                                                           date_and_edition_list=date_and_edition_list)

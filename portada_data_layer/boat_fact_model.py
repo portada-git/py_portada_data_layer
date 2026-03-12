@@ -9,13 +9,13 @@ from pyspark.sql.types import StructField
 logger = logging.getLogger("portada_data.boat_fact_data_model")
 
 class BoatFactDataModel(dict):
+    BOAT_FACT_MODEL_FIELD= "boat_fact_model"
     CALCULATED_VALUE_FIELD = "calculated_value"
     DEFAULT_VALUE_FIELD = "default_value"
     ORIGINAL_VALUE_FIELD = "original_value"
     STACKED_VALUE_FIELD = "stacked_value"
     DETAILED_VALUE_FIELD = "detailed_value"
     EXTRACTION_SOURCE_METHOD_FIELD = "extraction_source_method"
-    # MORE_EXTRACTED_VALUES_FIELD = "more_extracted_values"
     PUBLICATION_DATE_FIELD = "publication_date"
     PUBLICATION_NAME_FIELD = "publication_name"
 
@@ -76,6 +76,7 @@ class BoatFactDataModel(dict):
                     self.DEFAULT_VALUE_FIELD: dv,
                     self.ORIGINAL_VALUE_FIELD: ov,
                     self.CALCULATED_VALUE_FIELD:cv,
+                    self.BOAT_FACT_MODEL_FIELD: None
                 }
             else:
                 ret[key] = json.dumps(self[key]) if (isinstance(self[key], dict) or isinstance(self[key], list))  else self[key]
@@ -84,18 +85,30 @@ class BoatFactDataModel(dict):
                     self.DEFAULT_VALUE_FIELD: None,
                     self.ORIGINAL_VALUE_FIELD: ret[key],
                     self.CALCULATED_VALUE_FIELD: None,
+                    self.BOAT_FACT_MODEL_FIELD: None
                 }
         if BoatFactDataModel.PUBLICATION_DATE_FIELD in ret and (
                 isinstance(ret[BoatFactDataModel.PUBLICATION_DATE_FIELD], int)
                 or isinstance(ret[BoatFactDataModel.PUBLICATION_DATE_FIELD], str) and re.match("^[-\d]\d*?\.?\d*?$", ret[BoatFactDataModel.PUBLICATION_DATE_FIELD])):
             ret[BoatFactDataModel.PUBLICATION_DATE_FIELD] = datetime.datetime.fromtimestamp(int(ret[BoatFactDataModel.PUBLICATION_DATE_FIELD])/1000.0).strftime('%Y-%m-%d')
             ret[f"{BoatFactDataModel.PUBLICATION_DATE_FIELD}_{self.EXTRACTION_SOURCE_METHOD_FIELD}"] = "boat_fact_model"
-        ret["entry_id"] = f"{ret[BoatFactDataModel.PUBLICATION_NAME_FIELD]}_{id}"
+            if ret.get(f"{BoatFactDataModel.PUBLICATION_DATE_FIELD}_{self.DETAILED_VALUE_FIELD}") is None:
+                ret[f"{BoatFactDataModel.PUBLICATION_DATE_FIELD}_{self.DETAILED_VALUE_FIELD}"] = {
+                    self.DEFAULT_VALUE_FIELD: None,
+                    self.ORIGINAL_VALUE_FIELD: None,
+                    self.CALCULATED_VALUE_FIELD: None,
+                    self.BOAT_FACT_MODEL_FIELD: ret[BoatFactDataModel.PUBLICATION_DATE_FIELD]
+                }
+            else:
+                ret[f"{BoatFactDataModel.PUBLICATION_DATE_FIELD}_{self.DETAILED_VALUE_FIELD}"][self.BOAT_FACT_MODEL_FIELD] = ret[BoatFactDataModel.PUBLICATION_DATE_FIELD]
+
+        ret["entry_id"] = f"{ret[BoatFactDataModel.PUBLICATION_NAME_FIELD]}_{id:010}"
         ret[f"entry_id_{self.EXTRACTION_SOURCE_METHOD_FIELD}"] = "boat_fact_model"
         ret[f"entry_id_{self.DETAILED_VALUE_FIELD}"] = {
             self.DEFAULT_VALUE_FIELD: None,
             self.ORIGINAL_VALUE_FIELD: None,
             self.CALCULATED_VALUE_FIELD: None,
+            self.BOAT_FACT_MODEL_FIELD: None
         }
         return ret
 
