@@ -102,8 +102,8 @@ class BoatFactDataModel(dict):
             else:
                 ret[f"{BoatFactDataModel.PUBLICATION_DATE_FIELD}_{self.DETAILED_VALUE_FIELD}"][self.BOAT_FACT_MODEL_FIELD] = ret[BoatFactDataModel.PUBLICATION_DATE_FIELD]
 
-        # ret["entry_id"] = f"{ret[BoatFactDataModel.PUBLICATION_NAME_FIELD]}_{id:010}"
-        ret["entry_id"] = f"{ret[BoatFactDataModel.PUBLICATION_NAME_FIELD]}_{id:05}"
+        ret["entry_id"] = f"{ret[BoatFactDataModel.PUBLICATION_NAME_FIELD]}_{id:010}"
+        # ret["entry_id"] = f"{ret[BoatFactDataModel.PUBLICATION_NAME_FIELD]}_{id:09}"
         ret[f"entry_id_{self.EXTRACTION_SOURCE_METHOD_FIELD}"] = "boat_fact_model"
         ret[f"entry_id_{self.DETAILED_VALUE_FIELD}"] = {
             self.DEFAULT_VALUE_FIELD: None,
