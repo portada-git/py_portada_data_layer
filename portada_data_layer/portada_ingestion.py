@@ -279,48 +279,19 @@ class NewsExtractionIngestion(PortadaIngestion):
                     )
                 df_list.append(merged_df)
                 self.write_json(full_path, df=merged_df, mode="overwrite")
-                self.__update_state(*container_path, df=merged_df)
+                self._update_state(*container_path, df=merged_df)
             else:
                 regs += subset.count()
                 df_list.append(subset)
                 self.write_json(full_path, df=subset, mode="overwrite")
-                self.__update_state(*container_path, df=subset)
+                self._update_state(*container_path, df=subset)
 
         logger.info(f"{regs} entries was saved")
 
         return df_list
 
-    def __update_state(self, *container_path, df):
-        ## ACTUALITZANT L'ESTAT
-        state_path = self._resolve_path(*container_path, process_level_dir="states")
-        new_status_df = df.select(
-            F.col("entry_id"),
-            F.lit(False).alias("is_cleaned")
-        ).distinct()
-        if self.path_exists(state_path):  # O parquet_file_exist
-            # 2. Llegim l'estat actual
-            existing_state_df = self.spark.read.parquet(state_path)
-
-            existing_state_df.localCheckpoint()
-
-            # 3. ELIMINEM de l'estat vell els IDs que acaben d'arribar
-            # Així, si un ID ja hi era amb is_new=False, l'esborrem de la versió vella
-            state_without_updates = existing_state_df.join(
-                new_status_df,
-                on="entry_id",
-                how="left_anti"
-            )
-
-            # 4. UNIM: Registres vells no modificats + Registres nous/actualitzats
-            final_state_df = state_without_updates.unionByName(new_status_df)
-        else:
-            # Si és la primera vegada, l'estat és simplement la ingesta actual
-            final_state_df = new_status_df
-
-        # 5. Guardem l'estat actualitzat
-        final_state_df.write.mode("overwrite").parquet(state_path)
-
-        return final_state_df
+    def _update_state(self, *container_path, df, value: bool = False):
+        return super()._update_state(*container_path, df=df, value=False)
 
 
     def read_raw_data(self, *container_path, user: str = None, publication_name: str = None, y: int | str = None, m: int | str = None,

@@ -979,6 +979,43 @@ class DeltaDataLayer(BaseDeltaDataLayer):
         df.createOrReplaceTempView(name)
         logger.info(f"Temporary view named '{name}' was registered.")
 
+    def _update_state(self, *container_path, df, value: bool):
+        ## ACTUALITZANT L'ESTAT
+        state_path = self._resolve_path(*container_path, process_level_dir="states")
+        new_status_df = df.select(
+            F.col("entry_id"),
+            F.lit(value).alias("is_cleaned")
+        ).distinct()
+        if new_status_df.count() == 0:
+            return new_status_df
+
+        if self.path_exists(state_path):  # O parquet_file_exist
+            # 2. Llegim l'estat actual
+            existing_state_df = self.spark.read.parquet(state_path)
+
+            existing_state_df.cache()
+            existing_state_df.count()
+
+            # 3. ELIMINEM de l'estat vell els IDs que acaben d'arribar
+            # Així, si un ID ja hi era amb is_new=False, l'esborrem de la versió vella
+            state_without_updates = existing_state_df.join(
+                new_status_df,
+                on="entry_id",
+                how="left_anti"
+            )
+            if state_without_updates.count() > 0:
+                # 4. UNIM: Registres vells no modificats + Registres nous/actualitzats
+                final_state_df = state_without_updates.unionByName(new_status_df)
+            else:
+                final_state_df = new_status_df
+        else:
+            # Si és la primera vegada, l'estat és simplement la ingesta actual
+            final_state_df = new_status_df
+
+        # 5. Guardem l'estat actualitzat
+        final_state_df.write.mode("overwrite").parquet(state_path)
+
+        return final_state_df
 
 # def run_pipe(pipe_process_struct):
 

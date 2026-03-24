@@ -166,15 +166,7 @@ class BoatFactPatcherDataLayer(PortadaPatcherDataLayer):
         if df_original is None:
             return None
 
-        df = df_original.withColumn(
-            "entry_id",
-            F.concat(
-                F.split(F.col("entry_id"), "_")[0],
-                F.lit("_"),
-                F.lpad(F.split(F.col("entry_id"), "_")[1], 10, "0")
-            )
-        )
-
+        df = df_original
         df = df.withColumn("publication_date_value", F.to_date("publication_date", "yyyy-MM-dd"))
         df = df.withColumn("publication_date_year", year(col("publication_date_value")))
         df = df.withColumn("publication_date_month", month(col("publication_date_value")))
@@ -185,31 +177,73 @@ class BoatFactPatcherDataLayer(PortadaPatcherDataLayer):
         # durant el bucle, les rutes deixarien d'existir i Spark llançaria SparkFileNotFoundException.
         df = df.localCheckpoint()
 
-        grouped = df.select(
-            "publication_name",
-            "publication_date_year",
-            "publication_date_month",
-            "publication_date_day",
-            "publication_edition"
-        ).distinct().orderBy("publication_name","publication_date_year", "publication_date_month", "publication_date_day", "publication_edition")
+        to_update_groups = df.filter(F.length("entry_id") < 13) \
+            .select("publication_name", "publication_date_year", "publication_date_month", "publication_date_day", "publication_edition") \
+            .distinct().collect()
 
-        base_path = f"{self._resolve_path(self.__container_path, process_level_dir=self._process_level_dirs_[self.RAW_PROCESS_LEVEL])}"
-        for row in grouped.collect():
-            pub_name = row["publication_name"]
-            year_ = row["publication_date_year"]
-            month_ = row["publication_date_month"]
-            day_ = row["publication_date_day"]
-            edition = row["publication_edition"]
-            full_path = os.path.join(base_path, pub_name.lower(), f"{year_:04d}", f"{month_:02d}", f"{day_:02d}", edition.lower())
+        df = df.withColumn(
+            "entry_id",
+            F.concat(
+                F.split(F.col("entry_id"), "_")[0],
+                F.lit("_"),
+                F.lpad(F.split(F.col("entry_id"), "_")[1], 10, "0")
+            )
+        )
+
+        for row in to_update_groups:
+            # Construcció de ruta (més neta amb f-strings)
+            full_path = os.path.join(
+                base_path,
+                row["publication_name"].lower(),
+                f"{row['publication_date_year']:04d}",
+                f"{row['publication_date_month']:02d}",
+                f"{row['publication_date_day']:02d}",
+                row["publication_edition"].lower()
+            )
 
             subset = df.filter(
-                (col("publication_name") == pub_name) &
-                (col("publication_date_year") == year_) &
-                (col("publication_date_month") == month_) &
-                (col("publication_date_day") == day_) &
-                (col("publication_edition") == edition)
+                (F.col("publication_name") == row["publication_name"]) &
+                (F.col("publication_date_year") == row["publication_date_year"]) &
+                (F.col("publication_date_month") == row["publication_date_month"]) &
+                (F.col("publication_date_day") == row["publication_date_day"]) &
+                (F.col("publication_edition") == row["publication_edition"])
             )
             subset.write.mode("overwrite").json(full_path)
+
+        # grouped = df.select(
+        #     "publication_name",
+        #     "publication_date_year",
+        #     "publication_date_month",
+        #     "publication_date_day",
+        #     "publication_edition"
+        # ).distinct().orderBy("publication_name","publication_date_year", "publication_date_month", "publication_date_day", "publication_edition")
+        #
+        # base_path = f"{self._resolve_path(self.__container_path, process_level_dir=self._process_level_dirs_[self.RAW_PROCESS_LEVEL])}"
+        # for row in grouped.collect():
+        #     pub_name = row["publication_name"]
+        #     year_ = row["publication_date_year"]
+        #     month_ = row["publication_date_month"]
+        #     day_ = row["publication_date_day"]
+        #     edition = row["publication_edition"]
+        #     full_path = os.path.join(base_path, pub_name.lower(), f"{year_:04d}", f"{month_:02d}", f"{day_:02d}", edition.lower())
+        #
+        #     subset = df.filter(
+        #         (col("publication_name") == pub_name) &
+        #         (col("publication_date_year") == year_) &
+        #         (col("publication_date_month") == month_) &
+        #         (col("publication_date_day") == day_) &
+        #         (col("publication_edition") == edition)
+        #     )
+        #     subset_original = df_original.filter(
+        #         (F.length(col("entry_id"))<13) &
+        #         (col("publication_name") == pub_name) &
+        #         (col("publication_date_year") == year_) &
+        #         (col("publication_date_month") == month_) &
+        #         (col("publication_date_day") == day_) &
+        #         (col("publication_edition") == edition)
+        #     )
+        #     if subset_original.count() > 0:
+        #         subset.write.mode("overwrite").json(full_path)
             
         return None
 
