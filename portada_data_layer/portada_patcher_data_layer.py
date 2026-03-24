@@ -27,6 +27,12 @@ class RadisDeltaDataLayerVersionManager:
     def set_version(self, table_name: str, version: str):
         self.client.set(f"{self.__version_key}:{table_name}", version)
 
+    def ping(self):
+        try:
+            return self.client.ping()
+        except Exception:
+            return False
+
 class PatchError(Exception):
     def __init__(self, message: str="PatchE error setting version"):
         self.__message = message
@@ -76,7 +82,9 @@ class PortadaPatcherDataLayer(DeltaDataLayer):
                 port = self.delta_data_version_manager_params["port"]
                 db = self.delta_data_version_manager_params["db"]
                 self._client_db_state_manager = RadisDeltaDataLayerVersionManager(host, port, db)
-        return self._client_db_state_manager
+        if self._client_db_state_manager.ping():
+            return self._client_db_state_manager
+        return None
 
     def get_last_data_version_value(self):
         ddvm = self.delta_data_version_manager()

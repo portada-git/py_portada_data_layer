@@ -522,6 +522,8 @@ class BoatFactIngestion(NewsExtractionIngestion):
     def start_session(self):
         super().start_session()
         patcher = BoatFactPatcherDataLayer(cfg_json=self.get_configuration())
+        if self.sequencer_params is not None:
+            patcher.set_delta_data_version_manager_params(host=self.sequencer_params["host"], port=self.sequencer_params["port"])
         patcher.patch_if_needed()
 
 

@@ -29,6 +29,11 @@ class RedisSequencer:
         nv = self.client.incrby(key, increment)
         return nv - increment
 
+    def ping(self):
+        try:
+            return self.client.ping()
+        except Exception:
+            return False
 
 # ==============================================================
 # CLASS: PathConfigDeltaDataLayer
@@ -454,7 +459,9 @@ class BaseDeltaDataLayer(ConfigDeltaDataLayer):
                 return None
             else:
                 self._client_db_sequencer = RedisSequencer(self.sequencer_params["host"], self.sequencer_params["port"], self.sequencer_params["db"])
-        return self._client_db_sequencer
+        if self._client_db_sequencer.ping():
+            return self._client_db_sequencer
+        return None
 
     def set_sequencer_params(self, host: str, port: str, db: int = 1):
         self.sequencer_params = {"host": host, "port": port, "db": db}
