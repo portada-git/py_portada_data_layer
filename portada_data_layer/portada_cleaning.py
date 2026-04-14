@@ -96,8 +96,28 @@ class PortadaCleaning(DeltaDataLayer):
                 )
         return df
 
-    def read_raw_entities(self, entity: str):
+    def read_entries(self, *container_path) -> TracedDataFrame:
+        ship_entries_df = self.read_delta(*container_path)
+        return ship_entries_df
+
+    def read_entities(self, entity:str) -> TracedDataFrame:
+        df = self.read_delta("known_entities", entity)
+        return df
+
+    def read_raw_entities(self, entity: str, force_all=False):
         df = self.read_delta("known_entities", entity, process_level_dir=self._process_level_dirs_[self.RAW_PROCESS_LEVEL])
+        if df is not None:
+            logger.info(f"{0 if df is None else df.count()} entities were read")
+        if not force_all:
+            state_path = self._resolve_path("known_entities", entity, process_level_dir="states")
+            if self.path_exists(state_path):
+                state_df = self.spark.read.parquet(state_path)
+            else:
+                state_df = self.spark.createDataFrame(data={}, schema=StructType(
+                    [StructField("name", StringType(), True), StructField("is_cleaned", BooleanType(), True), ]))
+            state_df = state_df.filter(F.col("is_cleaned") == True).select("name")
+
+            df = df.join(state_df, on="name", how="left_anti")
         return df
 
     def read_raw_entries(self, *container_path, force_all=False):
@@ -107,7 +127,7 @@ class PortadaCleaning(DeltaDataLayer):
 
         df = self.read_json(path, has_extension=True)
         if df is not None:
-            logger.info(f"{0 if df is None else df.count()} entries was read")
+            logger.info(f"{0 if df is None else df.count()} entries were read")
 
         if not force_all:
             state_path = self._resolve_path(*container_path, process_level_dir="states")
@@ -119,6 +139,28 @@ class PortadaCleaning(DeltaDataLayer):
 
             df = df.join(state_df, on="entry_id", how="left_anti")
         return df
+
+    def save_entities(self, entity: str, df: TracedDataFrame, key_id_name="name", is_cleaned=False) -> TracedDataFrame:
+        self.write_delta("known_entities", entity, df=df, mode="merge", key_id_name=key_id_name)
+        if is_cleaned:
+            self._update_state("known_entities", entity, df=df, key_name="name")
+        return df
+
+    def read_original_values_of_entries(self, *container_path) -> TracedDataFrame:
+        ship_entries_df = self.read_delta("original_data", *container_path)
+        return ship_entries_df
+
+
+    def save_original_values_of_entries(self, *container_path, entries_df: TracedDataFrame, key_id_name: str, partition_by:list = None) -> TracedDataFrame:
+        self.write_delta("original_data", *container_path, df=entries_df, mode="merge", key_id_name=key_id_name, partition_by=partition_by)
+        return entries_df
+
+    def save_entries(self, *container_path, entries_df: TracedDataFrame, key_id_name: str, partition_by:list = None, is_cleaned=False) -> TracedDataFrame:
+        self.write_delta(*container_path, df=entries_df, mode="merge", key_id_name=key_id_name, partition_by=partition_by)
+        if is_cleaned:
+            self._update_state(*container_path, df=entries_df, key_name=key_id_name)
+        return entries_df
+
 
     @data_transformer_method()
     def normalize_field_structure(self, df: TracedDataFrame) -> TracedDataFrame:
@@ -149,7 +191,7 @@ class PortadaCleaning(DeltaDataLayer):
         return df.select(*selects)
 
     @data_transformer_method()
-    def normalize_field_value(self, df: TracedDataFrame) -> TracedDataFrame:
+    def clean_field_values_from_schema(self, df: TracedDataFrame) -> TracedDataFrame:
         if self._schema is None:
             raise ValueError("Must call use_schema() before.")
         properties = self._schema.get("properties", {})
@@ -360,16 +402,19 @@ class PortadaCleaning(DeltaDataLayer):
         return col_expr
 
     @data_transformer_method(description="flatten characters for string fields")
-    def flatten_string_characters(self, df: TracedDataFrame) -> TracedDataFrame:
+    def flatten_string_characters(self, df: TracedDataFrame, schema: dict = None) -> TracedDataFrame:
         """
         Aplana caràcters dels camps string: minúscules i eliminació de diacrítics bàsics
         (àáâãäå->a, èéêë->e, ìíîï->i, òóôõö->o, ùúûü->u, ç->c, ñ->n, ...).
         S'aplica recursivament en structs/arrays segons schema.properties.
         """
-        if self._schema is None:
+        if schema is None:
+            schema = self._schema
+
+        if schema is None:
             raise ValueError("Must call use_schema() before.")
 
-        _, properties = self.get_schema_and_properties(self._schema)
+        _, properties = self.get_schema_and_properties(schema)
         if not properties:
             return df
 
@@ -821,27 +866,44 @@ class PortadaCleaning(DeltaDataLayer):
         df = df.withColumn(top_col, new_cargo_list)
         return df
 
-    @block_transformer_method
-    def cleaning(self, df: DataFrame | TracedDataFrame) -> TracedDataFrame:
-        # 1.- prune values
-        df = self.prune_unaccepted_fields(df)
+    def cleaning_entities(self, entity: str, df: DataFrame | TracedDataFrame) -> TracedDataFrame:
+        # 1.- Normalize string types
+        # df = self.normalize_strings_for_entities(df)
+        # 2.- Save cleaned values
+        self.save_entities(entity=entity, df=df, is_cleaned=True)
+        return df
+
+    def cleaning_entries(self, df: DataFrame | TracedDataFrame, saving_original_data: bool = True) -> TracedDataFrame:
+        # 1.- Completar la estructura aceptada sin eliminar campos no aceptados
+        df = self.complete_accepted_structure(df)
         # 2.- Normalize structure
         df = self.normalize_field_structure(df)
         # 3.- save original values
-        df = self.save_original_values_of_ship_entries(df)
-        # 4.- Normalize values
-        df = self.normalize_field_value(df)
-        # 6.- Resolve idem/id/id. with the value of the predecessor record
+        # if saving_original_data:
+        #     df = self.save_original_values_of_ship_entries(df)
+        # 4.- For null fields, fill fields from schema instructions
+        df = self.fill_with_schema(df)
+        # 5.- prune unaccepted fields
+        df = self.prune_unaccepted_fields(df)
+        # 6.- simplify field structure with single values for original fields
+        df = self.simplify_field_structure(df)
+        # 7.- Resolve idem/id/id. with the value of the predecessor record
         df = self.resolve_idems(df)
-        # # 7.- Convert values form string to corrected type
-        # df = self.convert_string_to_schematype(df) - Numero en letras a número
-        # # 8.- Save cleaned values
-        # self.save_ship_entries(df)
+        # 8.- Normalize values
+        df = self.clean_field_values_from_schema(df)
+        # 9.- If null or error, calculate values from schema instructions
+        df = self.calculate_from_schema(df)
+        # 10.- Convert values form string to corrected type
+        df = self.string_to_type_from_schema(df)
+        # 11.- Normalize string types
+        # df = self.normalize_strings_for_ship_entries(df)
+        # 12.- Save cleaned values
+        # df = self.save_ship_entries(df, is_cleaned=True)
         return df
 
     #### -------------------- Auxiliar methods -------------------------- ###
-    def _update_state(self, *container_path, df, value: bool = True):
-        return super()._update_state(*container_path, df=df, value=True)
+    def _update_state(self, *container_path, df, key_name:str, value: bool = True):
+        return super()._update_state(*container_path, df=df, key_name=key_name, value=True)
 
     @staticmethod
     def get_schema_and_properties(schema: dict) -> tuple:
@@ -1657,6 +1719,7 @@ class PortadaCleaning(DeltaDataLayer):
         final_col = PortadaCleaning._calc_resolve_param(params.get("final_date"))
         return F.datediff(final_col.cast("date"), origin_col.cast("date"))
 
+
 @registry_to_portada_builder
 class BoatFactCleaning(PortadaCleaning):
     FLAG_ENTITY = 'flag'
@@ -1667,28 +1730,42 @@ class BoatFactCleaning(PortadaCleaning):
     UNIT_ENTITY = 'unit'
     PORT_ENTITY = 'port'
     MASTER_ROLE_ENTITY = 'master_role'
+    ENTITY_LIST = [FLAG_ENTITY, SHIP_TONS_ENTITY, TRAVEL_DURATION_ENTITY, COMODITY_ENTITY, SHIP_TYPE_ENTITY, UNIT_ENTITY, PORT_ENTITY, MASTER_ROLE_ENTITY]
 
     def __init__(self, builder=None, cfg_json: dict = None):
         super().__init__(builder=builder, cfg_json=cfg_json)
         self.__container_path = "ship_entries"
+        self.redis_params = None
+
+    def set_redis_params(self, host, port, db=3):
+        self.redis_params = {"host": host, "port": port, "db": db}
 
     def start_session(self):
         super().start_session()
         patcher = BoatFactPatcherDataLayer(cfg_json=self.get_configuration())
-        if self.sequencer_params is not None:
+        if self.redis_params is not None:
+            patcher.set_delta_data_version_manager_params(host=self.redis_params["host"], port=self.redis_params["port"], db=self.redis_params["db"])
+        elif self.sequencer_params is not None:
             patcher.set_delta_data_version_manager_params(host=self.sequencer_params["host"], port=self.sequencer_params["port"])
         patcher.patch_if_needed()
 
+    def read_original_values_of_ship_entries(self) -> TracedDataFrame:
+        return self.read_original_values_of_entries(self.__container_path)
+
+
     def save_original_values_of_ship_entries(self, ship_entries_df: TracedDataFrame) -> TracedDataFrame:
-        self.write_delta("original_data", self.__container_path, df=ship_entries_df, mode="merge",
-                         partition_by=["publication_name", "publication_date", "publication_edition"])
+        self.save_original_values_of_entries(self.__container_path, entries_df=ship_entries_df, key_id_name="entry_id",
+                                             partition_by=["publication_name", "publication_date", "publication_edition"])
         return ship_entries_df
+        # self.write_delta("original_data", self.__container_path, df=ship_entries_df, mode="merge",
+        #                  partition_by=["publication_name", "publication_date", "publication_edition"])
+        # return ship_entries_df
 
     def save_ship_entries(self, ship_entries_df: TracedDataFrame, is_cleaned=False) -> TracedDataFrame:
-        self.write_delta(self.__container_path,df=ship_entries_df, mode="merge",
+        self.save_entries(self.__container_path, entries_df=ship_entries_df, key_id_name="entry_id",
                          partition_by=["publication_name", "publication_date", "publication_edition"])
         if is_cleaned:
-            self._update_state(self.__container_path, df=ship_entries_df)
+            self._update_state(self.__container_path, df=ship_entries_df, key_name="entry_id")
         return ship_entries_df
 
     def read_ship_entries(self) -> TracedDataFrame:
@@ -1702,6 +1779,38 @@ class BoatFactCleaning(PortadaCleaning):
             cp = (self.__container_path,)
         ship_entries_df = super().read_raw_entries(cp, force_all=force_all)
         return ship_entries_df
+
+    def normalize_strings_for_ship_entries(self, ship_entries_df: TracedDataFrame) -> TracedDataFrame:
+        return self.flatten_string_characters(ship_entries_df)
+
+    def normalize_strings_for_entities(self, df: TracedDataFrame) -> TracedDataFrame:
+        schema = """{
+  "title": "known_entity",
+  "type": "object",
+  "properties": {
+    "name": {
+      "type": "string",
+      "description": "Identificador único de la entidad",
+      "nullable": false,
+      "for_cleaning":["not_cleanable"]
+    },
+    "voices": {
+      "type": "array",
+      "description": "Lista de voces de la entidad.",
+      "items": {
+        "type": "string"
+      }
+    }
+  },
+  "required": [
+    "name",
+    "voices"
+  ],
+  "additionalProperties": false
+}
+"""
+        df = df.withColumn("voices_original_value", F.col("voices").cast("string"))
+        return self.flatten_string_characters(df=df, schema=json.loads(schema))
 
     @staticmethod
     def extract_ports(df_entries, from_departure_port = True, from_port_of_calls = True, from_arrival_port = True):
@@ -1827,7 +1936,7 @@ class BoatFactCleaning(PortadaCleaning):
         df_comodity_and_unit = df_cargo.select(
             "entry_id",
             "temp_key",
-            F.lit("cargo_list").alias("field_origin"),
+            F.lit("cargo_list.cargo").alias("field_origin"),
             "merchant_idx",
             "cargo_idx",
             F.col("col.cargo_commodity").alias("cargo_commodity_citation"),
@@ -1841,6 +1950,74 @@ class BoatFactCleaning(PortadaCleaning):
 
         return df_comodity_and_unit
 
+    @staticmethod
+    def extract_cargo_comodities(df_entries):
+        # 1. First level: explode the list of merchants (cargo_list)
+        # Use posexplode to preserve order
+        df_merchants = df_entries.select(
+            "entry_id",  # Your original id field
+            "temp_key",
+            F.posexplode("cargo_list").alias("merchant_idx", "merchant_struct")
+        )
+
+        # 2. Second level: explode the cargo list inside each merchant
+        # Extract merchant name and explode their inner cargo array
+        df_cargo = df_merchants.select(
+            "entry_id",
+            "temp_key",
+            "merchant_idx",
+            F.posexplode("merchant_struct.cargo").alias("cargo_idx", "col")
+        )
+
+        df_comodity = df_cargo.select(
+            "entry_id",
+            "temp_key",
+            F.lit("cargo_list.cargo.cargo_commodity").alias("field_origin"),
+            "merchant_idx",
+            "cargo_idx",
+            F.col("col.cargo_commodity").alias("citation"),
+        )
+        df_comodity = df_comodity.withColumn(
+            "id",
+            F.concat("entry_id", F.lit("-"), "field_origin", F.lit("-"), "merchant_idx", F.lit("-"), "cargo_idx")
+        )
+
+        return df_comodity
+
+    @staticmethod
+    def extract_cargo_units(df_entries):
+        # 1. First level: explode the list of merchants (cargo_list)
+        # Use posexplode to preserve order
+        df_merchants = df_entries.select(
+            "entry_id",  # Your original id field
+            "temp_key",
+            F.posexplode("cargo_list").alias("merchant_idx", "merchant_struct")
+        )
+
+        # 2. Second level: explode the cargo list inside each merchant
+        # Extract merchant name and explode their inner cargo array
+        df_cargo = df_merchants.select(
+            "entry_id",
+            "temp_key",
+            "merchant_idx",
+            F.posexplode("merchant_struct.cargo").alias("cargo_idx", "col")
+        )
+
+        df_units = df_cargo.select(
+            "entry_id",
+            "temp_key",
+            F.lit("cargo_list.cargo.cargo_unit").alias("field_origin"),
+            "merchant_idx",
+            "cargo_idx",
+            F.col("col.cargo_unit").alias("citation"),
+        )
+        df_units = df_units.withColumn(
+            "id",
+            F.concat("entry_id", F.lit("-"), "field_origin", F.lit("-"), "merchant_idx", F.lit("-"), "cargo_idx")
+        )
+
+        return df_units
+
 
     @staticmethod
     def extract_cargo_merchants(df_entries):
@@ -1853,7 +2030,7 @@ class BoatFactCleaning(PortadaCleaning):
         df_merchants = df_merchants.select(
             "entry_id",
             "temp_key",
-            F.lit("cargo_list.cargo.cargo_merchant_name").alias("field_origin"),
+            F.lit("cargo_list.cargo_merchant_name").alias("field_origin"),
             "merchant_idx",
             F.col("merchant_struct.cargo_merchant_name").alias("citation")
         )

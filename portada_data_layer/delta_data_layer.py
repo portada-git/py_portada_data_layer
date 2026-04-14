@@ -322,7 +322,7 @@ class ConfigDeltaDataLayer(PathConfigDeltaDataLayer):
             process_level_dir = f'{process_level_dir.rstrip("/")}/'
 
         if len(table_path) == 1 and re.match(r"\w+://.*", table_path[0]):
-            p = re.compile(f"{self.protocol}{self.base_path}/(.*)")
+            p = re.compile(f"{self.protocol}{self.base_path}/{self._project_data_name}/(.*)")
             ret = re.sub(p, "\\g<1>", table_path[0], 0)
         else:
             table_path = '.'.join(map(str, table_path)).split('.')
@@ -764,7 +764,8 @@ class DeltaDataLayer(BaseDeltaDataLayer):
 
         return TracedDataFrame(original_df, table_name=tn, df_name=target_path, df_version=-1)
 
-    def write_delta(self, *table_path, df: DataFrame | TracedDataFrame, mode: str = "overwrite", partition_by:list = None):
+    def write_delta(self, *table_path, df: DataFrame | TracedDataFrame, mode: str = "overwrite",
+                    partition_by:list = None, key_id_name: str = "entry_id") -> DataFrame | TracedDataFrame:
         """
         Write the dataframe df to delta table addressed by table_path.
         :param table_path: can be any of the following forms:
@@ -811,7 +812,7 @@ class DeltaDataLayer(BaseDeltaDataLayer):
                 delta_table = self.get_delta_table(*table_path)
                 delta_table.alias("current").merge(
                     source=df.toSparkDataFrame().alias("new"),
-                    condition="current.entry_id=new.entry_id"
+                    condition=f"current.{key_id_name}=new.{key_id_name}"
                 ).whenMatchedUpdateAll().whenNotMatchedInsertAll().execute()
                 version = delta_table.history(1).collect()[0]['version']
         if mode != "merge":
@@ -986,11 +987,11 @@ class DeltaDataLayer(BaseDeltaDataLayer):
         df.createOrReplaceTempView(name)
         logger.info(f"Temporary view named '{name}' was registered.")
 
-    def _update_state(self, *container_path, df, value: bool):
+    def _update_state(self, *container_path, df, key_name: str, value: bool):
         ## ACTUALITZANT L'ESTAT
         state_path = self._resolve_path(*container_path, process_level_dir="states")
         new_status_df = df.select(
-            F.col("entry_id"),
+            F.col(key_name),
             F.lit(value).alias("is_cleaned")
         ).distinct()
         if new_status_df.count() == 0:
@@ -1007,7 +1008,7 @@ class DeltaDataLayer(BaseDeltaDataLayer):
             # Així, si un ID ja hi era amb is_new=False, l'esborrem de la versió vella
             state_without_updates = existing_state_df.join(
                 new_status_df,
-                on="entry_id",
+                on=key_name,
                 how="left_anti"
             )
             if state_without_updates.count() > 0:

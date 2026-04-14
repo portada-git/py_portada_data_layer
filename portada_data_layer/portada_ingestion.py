@@ -290,8 +290,8 @@ class NewsExtractionIngestion(PortadaIngestion):
 
         return df_list
 
-    def _update_state(self, *container_path, df, value: bool = False):
-        return super()._update_state(*container_path, df=df, value=False)
+    def _update_state(self, *container_path, df, key_name: str = "entry_id", value: bool = False):
+        return super()._update_state(*container_path, df=df, key_name="entry_id",value=False)
 
 
     def read_raw_data(self, *container_path, user: str = None, publication_name: str = None, y: int | str = None, m: int | str = None,
