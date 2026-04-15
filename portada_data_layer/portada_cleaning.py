@@ -344,6 +344,51 @@ class PortadaCleaning(DeltaDataLayer):
         spark_type, _ = PortadaCleaning.json_schema_to_spark_type(schema, primitive_types_as_strings=False)
         return PortadaCleaning._cast_column_to_schema_type(col_expr, spark_type)
 
+    @staticmethod
+    def _reorder_by_json_schema(col_expr: F.Column, schema: dict) -> F.Column:
+        """
+        Rebuild object/array columns to enforce deterministic field order from JSON schema.
+        Primitive values are returned as-is to avoid altering idem semantics.
+        """
+        t = schema.get("type")
+        if t == "object":
+            props = schema.get("properties", {})
+            fields = []
+            for name, sub_schema in props.items():
+                fields.append(
+                    PortadaCleaning._reorder_by_json_schema(col_expr.getField(name), sub_schema).alias(name)
+                )
+            return F.struct(*fields)
+        if t == "array":
+            items_schema = schema.get("items", {})
+            return F.transform(
+                col_expr,
+                lambda x: PortadaCleaning._reorder_by_json_schema(x, items_schema),
+            )
+        return col_expr
+
+    @staticmethod
+    def _reorder_by_spark_type(col_expr: F.Column, spark_type):
+        """
+        Rebuild object/array columns following an existing Spark type field order.
+        Used to keep compatibility with parent struct types after canonical idem processing.
+        """
+        if isinstance(spark_type, StructType):
+            fields = []
+            for field in spark_type.fields:
+                fields.append(
+                    PortadaCleaning._reorder_by_spark_type(col_expr.getField(field.name), field.dataType).alias(
+                        field.name
+                    )
+                )
+            return F.struct(*fields)
+        if isinstance(spark_type, ArrayType):
+            return F.transform(
+                col_expr,
+                lambda x: PortadaCleaning._reorder_by_spark_type(x, spark_type.elementType),
+            )
+        return col_expr
+
     @data_transformer_method(description="cast current fields to schema types")
     def string_to_type_from_schema(self, df: TracedDataFrame) -> TracedDataFrame:
         """
@@ -714,9 +759,14 @@ class PortadaCleaning(DeltaDataLayer):
         seed = F.col(seed_col_name)
 
         if items_type == "object":
-            all_fields = list(meta["items_schema"].get("properties", {}).keys())
-            # No fer cast: el tipus del seed (del DataFrame) pot divergir del schema JSON i Spark falla
-            initial_acc = F.array(seed)
+            items_schema = meta["items_schema"]
+            all_fields = list(items_schema.get("properties", {}).keys())
+            seed_canonical = PortadaCleaning._reorder_by_json_schema(seed, items_schema)
+            arr_canonical = F.transform(
+                arr_col,
+                lambda x: PortadaCleaning._reorder_by_json_schema(x, items_schema),
+            )
+            initial_acc = F.array(seed_canonical)
 
             def merge_struct(acc, el):
                 prev = F.element_at(acc, -1)
@@ -741,10 +791,20 @@ class PortadaCleaning(DeltaDataLayer):
                 # Traiem el seed (primer element) i mantenim la resta
                 return F.slice(acc, 2, F.size(acc) - 1)
 
-            new_array = F.when(
-                arr_col.isNotNull() & (F.size(arr_col) > 0),
-                F.aggregate(arr_col, initial_acc, merge_struct, finish_struct),
-            ).otherwise(arr_col)
+            new_array_canonical = F.when(
+                arr_canonical.isNotNull() & (F.size(arr_canonical) > 0),
+                F.aggregate(arr_canonical, initial_acc, merge_struct, finish_struct),
+            ).otherwise(arr_canonical)
+
+            original_arr_type = None
+            try:
+                original_arr_type = df.schema[array_path].dataType
+            except Exception:
+                original_arr_type = None
+            if isinstance(original_arr_type, ArrayType):
+                new_array = PortadaCleaning._reorder_by_spark_type(new_array_canonical, original_arr_type)
+            else:
+                new_array = new_array_canonical
 
             df = df.withColumn(array_path, new_array)
         else:
@@ -799,6 +859,11 @@ class PortadaCleaning(DeltaDataLayer):
         all_fields = list(items_schema.get("properties", {}).keys())
         merchant_type = df.schema[top_col].dataType.elementType
         empty_merchant_list = F.expr(f"cast(array() as array<{merchant_type.simpleString()}>)")
+        child_array_type = None
+        if isinstance(merchant_type, StructType):
+            child_field = next((f for f in merchant_type.fields if f.name == child_array_name), None)
+            if child_field and isinstance(child_field.dataType, ArrayType):
+                child_array_type = child_field.dataType
 
         def finish_inner(acc):
             return F.slice(acc, 2, F.size(acc) - 1)
@@ -816,7 +881,8 @@ class PortadaCleaning(DeltaDataLayer):
             r_seed = acc.getField("row_seed")
             # Seed per al primer element de cargo: primer item de cargo_list -> row; sinó -> item anterior
             seed_inner = F.when(F.size(list_so_far) == 0, r_seed).otherwise(last_cargo)
-            initial_inner = F.array(seed_inner)
+            seed_inner_canonical = PortadaCleaning._reorder_by_json_schema(seed_inner, items_schema)
+            initial_inner = F.array(seed_inner_canonical)
 
             def merge_inner(acc_inner, el):
                 prev = F.element_at(acc_inner, -1)
@@ -842,10 +908,17 @@ class PortadaCleaning(DeltaDataLayer):
                 return F.flatten(F.array(acc_inner, F.array(F.struct(*struct_parts))))
 
             inner_arr = merchant.getField(child_array_name)
-            transformed_cargo = F.when(
-                inner_arr.isNotNull() & (F.size(inner_arr) > 0),
-                F.aggregate(inner_arr, initial_inner, merge_inner, finish_inner),
-            ).otherwise(inner_arr)
+            inner_arr_canonical = F.transform(
+                inner_arr,
+                lambda x: PortadaCleaning._reorder_by_json_schema(x, items_schema),
+            )
+            transformed_cargo_canonical = F.when(
+                inner_arr_canonical.isNotNull() & (F.size(inner_arr_canonical) > 0),
+                F.aggregate(inner_arr_canonical, initial_inner, merge_inner, finish_inner),
+            ).otherwise(inner_arr_canonical)
+            transformed_cargo = transformed_cargo_canonical
+            if isinstance(child_array_type, ArrayType):
+                transformed_cargo = PortadaCleaning._reorder_by_spark_type(transformed_cargo_canonical, child_array_type)
             new_merchant = merchant.withField(child_array_name, transformed_cargo)
             new_last_cargo = F.coalesce(F.element_at(transformed_cargo, -1), last_cargo)
             new_list = F.flatten(F.array(list_so_far, F.array(new_merchant)))
