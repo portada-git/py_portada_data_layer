@@ -118,7 +118,7 @@ class PortadaPatcherDataLayer(DeltaDataLayer):
         path = self._resolve_path(table_name, process_level_dir="data_versions")
         if self.path_exists(table_name, process_level_dir="data_versions"):
             deltaTable = DeltaTable.forPath(self.spark, path)
-            deltaTable.update(set={"value": version})
+            deltaTable.update(set={"value": F.lit(version)})
         else:
             df = self.spark.createDataFrame([(version,)], ["value"])
             df.write.format("delta").mode("overwrite").save(path)

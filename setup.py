@@ -1,7 +1,7 @@
 from setuptools import setup
 
 setup(name='py_portada_data_layer',
-      version='0.2.08',
+      version='0.2.09',
       description='Data layer for portada project for ETL process',
       author='PortADa team',
       author_email='jcbportada@gmail.com',
