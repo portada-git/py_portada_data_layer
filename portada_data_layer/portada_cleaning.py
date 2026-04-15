@@ -146,8 +146,18 @@ class PortadaCleaning(DeltaDataLayer):
             self._update_state("known_entities", entity, df=df, key_name="name")
         return df
 
-    def read_original_values_of_entries(self, *container_path) -> TracedDataFrame:
+    def read_original_values_of_entries(self, *container_path, force_all=False) -> TracedDataFrame:
         ship_entries_df = self.read_delta("original_data", *container_path)
+        if not force_all:
+            state_path = self._resolve_path(*container_path, process_level_dir="states")
+            if self.path_exists(state_path):
+                state_df = self.spark.read.parquet(state_path)
+            else:
+                state_df = self.spark.createDataFrame(data={}, schema=StructType(
+                    [StructField("entry_id", StringType(), True), StructField("is_cleaned", BooleanType(), True), ]))
+            state_df = state_df.filter(F.col("is_cleaned") == True).select("entry_id")
+
+            ship_entries_df = ship_entries_df.join(state_df, on="entry_id", how="left_anti")
         return ship_entries_df
 
 
@@ -1822,8 +1832,8 @@ class BoatFactCleaning(PortadaCleaning):
             patcher.set_delta_data_version_manager_params(host=self.sequencer_params["host"], port=self.sequencer_params["port"])
         patcher.patch_if_needed()
 
-    def read_original_values_of_ship_entries(self) -> TracedDataFrame:
-        return self.read_original_values_of_entries(self.__container_path)
+    def read_original_values_of_ship_entries(self, force_all=False) -> TracedDataFrame:
+        return self.read_original_values_of_entries(self.__container_path, force_all=force_all)
 
 
     def save_original_values_of_ship_entries(self, ship_entries_df: TracedDataFrame) -> TracedDataFrame:
