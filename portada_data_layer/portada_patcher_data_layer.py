@@ -4,9 +4,10 @@ Mòdul Portada Patcher Data Layer: capa per aplicar patches o correccions sobre 
 
 import logging
 import os
-from pyspark.sql import functions as F
+from pyspark.sql import functions as F, Window
 from pyspark.sql.functions import col, year, month, dayofmonth
 
+from portada_data_layer import FileSystemTaskExecutor
 from portada_data_layer.delta_data_layer import DeltaDataLayer
 from portada_data_layer.portada_delta_common import registry_to_portada_builder
 from delta.tables import DeltaTable
@@ -50,8 +51,8 @@ class PatchErrorSettingVersion(PatchError):
 
 
 class PortadaPatcherDataLayer(DeltaDataLayer):
-    __delta_data_version__ = "v1"
-    """Capa per aplicar patches o correccions sobre dataframes segons regles o schema."""
+    __delta_data_version__ = "v2"
+    """Capa per aplicar patches o correccions sobre dataframes segons regles o schema_path."""
 
     def __init__(self, builder=None, cfg_json: dict = None):
         super().__init__(builder=builder, cfg_json=cfg_json)
@@ -160,6 +161,91 @@ class BoatFactPatcherDataLayer(PortadaPatcherDataLayer):
         self._patch_functions = [
             self._patch_v0_to_v1, #0
         ]
+
+    def _patch_v1_to_v2(self):
+        apub = ["bd", "bp", "db", "dm", "en","gm", "lp", "sm"]
+        if not self.is_initialized():
+            error_msg = "BoatFactPatcherDataLayer instance is not initialized. start_spark() method must be called first."
+            logger.error(error_msg)
+            raise ValueError(error_msg)
+
+        fs = FileSystemTaskExecutor(self.get_configuration())
+        fs.start_session()
+        base_path = f"{self._resolve_path("known_entities", "original_files", process_level_dir=self._process_level_dirs_[self.RAW_PROCESS_LEVEL])}"
+        ingested_file_path = f"{self._resolve_path("ingested_files", "known_entities", process_level_dir=self._process_level_dirs_[self.RAW_PROCESS_LEVEL])}"
+        if fs.path_exists(base_path):
+            fs.rename(f"{base_path}", f"{ingested_file_path}")
+
+        base_path = f"{self._resolve_path(self.__container_path, process_level_dir=self._process_level_dirs_[self.RAW_PROCESS_LEVEL])}"
+        ingested_file_path = f"{self._resolve_path("ingested_files", self.__container_path, process_level_dir=self._process_level_dirs_[self.RAW_PROCESS_LEVEL])}"
+
+        if fs.path_exists(base_path):
+            dlist = fs.subdirs_list(base_path)
+            for d in dlist:
+                if not d in apub:
+                    fs.rename(f"{base_path}/{d}", f"{ingested_file_path}/{d}")
+
+        base_path = f"{self._resolve_path(self.__container_path, process_level_dir=self._process_level_dirs_[self.RAW_PROCESS_LEVEL])}"
+        base_dir = os.path.join(base_path, "*", "*", "*", "*", "*")
+        path = os.path.join(base_dir, "*.json")
+        df_original = self.read_json(path, has_extension=True)
+        if df_original is None:
+            return None
+
+        # 2. Definim les finestres per identificar repeticions i numerar-les
+        finestra_comptatge = Window.partitionBy("entry_id")
+        finestra_sequencial = Window.partitionBy("entry_id").orderBy("publication_date")
+
+        # 3. Afegim columnes temporals de control
+        df_control = df_original \
+            .withColumn("total_repeticions", F.count("entry_id").over(finestra_comptatge)) \
+            .withColumn("index_correlatiu", F.row_number().over(finestra_sequencial))
+
+        # 4. SEPARACIÓ: Filtrem ÚNICAMENT els fitxers/files afectats i apliquem la modificació
+        df_afectats = df_control.filter(F.col("total_repeticions") > 1).drop("total_repeticions", "index_correlatiu")  # Netegem columnes temporals
+
+        df = df_control.localCheckpoint()
+
+        to_update_groups = df_afectats.select(
+            "publication_name",
+            "publication_date_year",
+            "publication_date_month",
+            "publication_date_day",
+            "publication_edition"
+        ).distinct().collect()
+
+        for row in to_update_groups:
+            # Construcció de ruta (més neta amb f-strings)
+            full_path = os.path.join(
+                base_path,
+                row["publication_name"].lower(),
+                f"{row['publication_date_year']:04d}",
+                f"{row['publication_date_month']:02d}",
+                f"{row['publication_date_day']:02d}",
+                row["publication_edition"].lower()
+            )
+
+            subset = df.filter(
+                (F.col("publication_name") == row["publication_name"]) &
+                (F.col("publication_date_year") == row["publication_date_year"]) &
+                (F.col("publication_date_month") == row["publication_date_month"]) &
+                (F.col("publication_date_day") == row["publication_date_day"]) &
+                (F.col("publication_edition") == row["publication_edition"])
+            )
+            subset = subset.withColumn(
+                "entry_id",
+                F.when(
+                    subset.total_repeticions > 1,
+                    F.concat(
+                        F.split(F.col("entry_id"), "_")[0],
+                        F.lit("_"),
+                        F.lpad(F.split(F.col("entry_id"), "_")[1], 10, "0"),
+                        F.lit("_"), F.col("index_correlatiu")
+                    )
+                ).otherwise(F.col("entry_id"))
+            ).drop("total_repeticions", "index_correlatiu")
+            subset.write.mode("overwrite").json(full_path)
+        return None
 
     def _patch_v0_to_v1(self):
         if not self.is_initialized():

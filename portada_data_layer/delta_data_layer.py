@@ -572,15 +572,15 @@ class BaseDeltaDataLayer(ConfigDeltaDataLayer):
             :class:`pyspark.sql.types.DataType.simpleString`, except that top level struct type can
             omit the ``struct<>``.
 
-            When ``schema`` is a list of column names, the type of each column
+            When ``schema_path`` is a list of column names, the type of each column
             will be inferred from ``data``.
 
-            When ``schema`` is ``None``, it will try to infer the schema (column names and types)
+            When ``schema_path`` is ``None``, it will try to infer the schema_path (column names and types)
             from ``data``, which should be an RDD of either :class:`Row`,
             :class:`namedtuple`, or :class:`dict`.
 
-            When ``schema`` is :class:`pyspark.sql.types.DataType` or a datatype string, it must
-            match the real data, or an exception will be thrown at runtime. If the given schema is
+            When ``schema_path`` is :class:`pyspark.sql.types.DataType` or a datatype string, it must
+            match the real data, or an exception will be thrown at runtime. If the given schema_path is
             not :class:`pyspark.sql.types.StructType`, it will be wrapped into a
             :class:`pyspark.sql.types.StructType` as its only field, and the field name will be
             "value". Each record will also be wrapped into a tuple, which can be converted to row
@@ -589,7 +589,7 @@ class BaseDeltaDataLayer(ConfigDeltaDataLayer):
             the sample ratio of rows used for inferring. The first few rows will be used
             if ``samplingRatio`` is ``None``.
         verify_schema : bool, optional
-            verify data types of every row against schema. Enabled by default.
+            verify data types of every row against schema_path. Enabled by default.
 
         Returns
         -------
@@ -684,6 +684,15 @@ class DeltaDataLayer(BaseDeltaDataLayer):
         self.log_storage = False
         self.source_path = None
         self._save_lineage_on_store = False
+        if builder is not None:
+            self._use_redis_metadata = builder._use_redis_metadata
+        elif cfg_json is not None:
+            self._use_redis_metadata = cfg_json.get("_use_redis_metadata", True)
+
+    def get_configuration(self):
+        ret = super().get_configuration()
+        ret["_use_redis_metadata"] = self._use_redis_metadata
+        return ret
 
     def write_json(self, *table_path, df: DataFrame | TracedDataFrame, mode: str = "overwrite",
                    process_level_dir: str = None, has_extension=False):
@@ -1125,6 +1134,12 @@ class FileSystemTaskExecutor(BaseDeltaDataLayer):
             if f.isDirectory()
         ]
         return subdirs
+
+    def rename(self, origin_path, destination_path):
+        jvm_orig_path = self._jvm.Path(origin_path)
+        jvm_dest_path = self._jvm.Path(destination_path)
+        exit = self._fs.rename(jvm_orig_path, jvm_dest_path)
+        return exit
 
 
 # ==============================================================

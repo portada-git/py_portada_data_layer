@@ -1,6 +1,8 @@
+import csv
 import datetime
 import json
 import re
+from pyexpat import ExpatError
 
 from pyspark.sql.types import StringType, StructType, StructField, ArrayType
 
@@ -8,6 +10,7 @@ from portada_data_layer.boat_fact_model import BoatFactDataModel
 from portada_data_layer.data_lake_metadata_manager import DataLakeMetadataManager, enable_storage_log_for_class, \
     block_transformer_method, data_transformer_method, enable_field_lineage_log_for_class
 from portada_data_layer.delta_data_layer import DeltaDataLayer, FileSystemTaskExecutor
+from portada_data_layer.portada_delta_common import registry_to_portada_builder, BoatFactConstants
 from portada_data_layer.portada_patcher_data_layer import BoatFactPatcherDataLayer, PatchError
 from portada_data_layer.traced_data_frame import TracedDataFrame
 from pyspark.sql import Row, functions as F
@@ -99,8 +102,20 @@ class PortadaIngestion(DeltaDataLayer):
                 try:
                     with open(local_path) as f:
                         data = xmldoc.parse(f.read())
-                except Exception as e:
-                    raise e
+                except ExpatError as e:
+                    try:
+                        with open(local_path) as f:
+                            reader = csv.reader(f)
+                            data_list = list(reader)
+                            fields = [f.lower() for f in data_list[0]]
+                            data = []
+                            for item in data_list[1:]:
+                                row = {}
+                                for i, field in enumerate(fields):
+                                    row[field] = item[i]
+                                data.append(row)
+                    except Exception as e:
+                        raise e
                 # raise
         except Exception as e:
             logger.error(f"Error reading file {local_path}: {e}")
@@ -112,11 +127,11 @@ class PortadaIngestion(DeltaDataLayer):
         try:
             file_extension = os.path.splitext(local_path)[1][1:]
             if user is None:
-                dest_path = fs_exec.copy_from_local(*container_path,
+                dest_path = fs_exec.copy_from_local("ingested_files", *container_path,
                                                 file_name_dest=fs_exec.date_random_file_name_generator(file_extension),
                                                 src_path=local_path, remove_local=remove_local)
             else:
-                dest_path = fs_exec.copy_from_local(*container_path, user,
+                dest_path = fs_exec.copy_from_local("ingested_files", *container_path, user,
                                                 file_name_dest=fs_exec.date_random_file_name_generator(file_extension),
                                                 src_path=local_path, remove_local=remove_local)
             dp = self._resolve_relative_path(dest_path)
@@ -407,21 +422,139 @@ class NewsExtractionIngestion(PortadaIngestion):
         else:
             raise Exception(f"The container {'/'.join(p0)} doesn't exist.")
 
+@registry_to_portada_builder
+class ReviewedEntriesIngestion(PortadaIngestion):
+    __first_container_path = "reviewed_entries"
+    REVIEWED_ENTRY_TYPES = BoatFactConstants.REVIEWED_ENTRY_TYPES
+
+    def __resolve_container_path(self, *container_path, is_cargo = False):
+        second_path = self.REVIEWED_ENTRY_TYPES[1] if is_cargo else self.REVIEWED_ENTRY_TYPES[0]
+        if len(container_path) > 0 and (isinstance(container_path[0], list) or isinstance(container_path[0], tuple)):
+            container_path = container_path[0]
+        if len(container_path) > 0 and isinstance(container_path[0], str) and not container_path[0].startswith(
+                self.__first_container_path):
+            container_path = list(container_path)
+            container_path.insert(0, self.__first_container_path)
+        if len(container_path) > 1:
+            if isinstance(container_path[1], str) and not container_path[1].startswith(
+                second_path):
+                container_path = list(container_path)
+                container_path.insert(1, second_path)
+        elif len(container_path) == 1:
+            container_path = list(container_path)
+            container_path.insert(1, second_path)
+        else:   # len(container_path) == 0
+            if is_cargo:
+                container_path = (self.__first_container_path,self.REVIEWED_ENTRY_TYPES[1])
+            else:
+                container_path = (self.__first_container_path,self.REVIEWED_ENTRY_TYPES[0])
+        return container_path
+
+    def copy_ingested_raw_data(self, *container_path, local_path: str, return_dest_path=False,
+                               remove_local: bool = True, is_cargo = False):
+        container_path = self.__resolve_container_path(*container_path, is_cargo=is_cargo)
+        # container_path.insert(1, "original_files")
+        return super().copy_ingested_raw_data(*container_path, local_path=local_path,
+                                              return_dest_path=return_dest_path, remove_local=remove_local)
+
+    def save_raw_data(self, *container_path, data: dict | list = None, source_path: str = None, is_cargo=False, **kwargs):
+        super().save_raw_data(*container_path, data=data, **kwargs)
+        container_path = self.__resolve_container_path(*container_path, is_cargo=is_cargo)
+        if data is None:
+            raise ValueError("A DataFrame or JSON list must be passed.")
+
+        if isinstance(data, dict) and "source_path" in data:
+            source_path = self._resolve_relative_path(data["source_path"])
+            p = re.compile(f"{self.project_name}/{self._process_level_dirs_[self._current_process_level]}/(.*)")
+            tn = re.sub(p, "\\g<1>", source_path, 0)
+            data = data["data_csv"]
+        else:
+            data = data
+            if source_path is None:
+                tn = "UNKNOWN"
+                source_path = "UNKNOWN"
+            else:
+                source_path = self._resolve_relative_path(source_path)
+                p = re.compile(f"{self.project_name}/{self._process_level_dirs_[self._current_process_level]}/(.*)")
+                tn = re.sub(p, "\\g<1>", source_path, 0)
+
+        length = len(data)
+        if length == 0:
+            return []
+
+        df = TracedDataFrame(
+            df=self.spark.createDataFrame(data),
+            table_name=tn,
+            df_name=source_path,
+        )
+
+        if is_cargo:
+            df = df.select(
+                "temp_key",
+                "cargo_merchant_id",
+                "cargo_commodity_id",
+                "rev_cargo_merchant_name",
+                "rev_cargo_commodity",
+                "rev_cargo_unit"
+            )
+        else:
+            df = df.select(
+                "temp_key",
+                "rev_travel_departure_date",
+                "rev_travel_duration_value",
+                "rev_travel_duration_unit",
+                "rev_travel_departure_port",
+                "rev_travel_arrival_date",
+                "rev_ship_type",
+                "rev_ship_name",
+                "rev_ship_tons_capacity",
+                "rev_ship_tons_unit",
+                "rev_ship_flag",
+                "rev_master_role",
+                "rev_master_name"
+            )
+
+        if not self.is_initialized():
+            error_msg = "ReviewedEntriesIngestion instance is not initializer. start_spark() method must be called first."
+            logger.error(error_msg)
+            raise ValueError(error_msg)
+
+        base_path = f"{self._resolve_path(*container_path)}"
+        self.write_delta(base_path, df=df, mode="overwrite")
+        return df
+
+    def copy_ingested_reviewed_entries(self,local_path: str, return_dest_path=False, is_cargo=False):
+        return self.copy_ingested_raw_data(local_path=local_path,
+                                           return_dest_path=return_dest_path, is_cargo=is_cargo)
+
+    @data_transformer_method(
+        description="Extract values from original files and save as delta format.")
+    def save_raw_reviewed_entries(self, data: dict | list = None, is_cargo=False):
+        return self.save_raw_data(data=data, is_cargo=is_cargo)
+
+    def read_raw_data(self, *container_path, is_cargo=False):
+        container_path= self.__resolve_container_path(*container_path, is_cargo=is_cargo)
+        df = self.read_delta(*container_path)
+        return df
+
+    def read_raw_reviewed_entries(self, is_cargo=False):
+        return self.read_raw_data(is_cargo=is_cargo)
+
 
 class KnownEntitiesIngestion(PortadaIngestion):
     __first_container_path = "known_entities"
-    FLAG_ENTITY = 'flag'
-    SHIP_TONS_ENTITY = 'ship_tons'
-    TRAVEL_DURATION_ENTITY = 'travel_duration'
-    COMODITY_ENTITY = 'comodity'
-    SHIP_TYPE_ENTITY = 'ship_type'
-    UNIT_ENTITY = 'unit'
-    PORT_ENTITY = 'port'
-    MASTER_ROLE_ENTITY = 'master_role'
+    FLAG_ENTITY = BoatFactConstants.FLAG_ENTITY
+    SHIP_TONS_ENTITY = BoatFactConstants.SHIP_TONS_ENTITY
+    TRAVEL_DURATION_ENTITY = BoatFactConstants.TRAVEL_DURATION_ENTITY
+    COMODITY_ENTITY = BoatFactConstants.COMMODITY_ENTITY
+    SHIP_TYPE_ENTITY = BoatFactConstants.SHIP_TYPE_ENTITY
+    UNIT_ENTITY = BoatFactConstants.UNIT_ENTITY
+    PORT_ENTITY = BoatFactConstants.PORT_ENTITY
+    MASTER_ROLE_ENTITY = BoatFactConstants.MASTER_ROLE_ENTITY
 
 
     def __resolve_container_path(self, *container_path):
-        if len(container_path) > 0 and isinstance(container_path[0], list) or isinstance(container_path[0], tuple):
+        if len(container_path) > 0 and (isinstance(container_path[0], list) or isinstance(container_path[0], tuple)):
             container_path = container_path[0]
         if len(container_path) > 0 and isinstance(container_path[0], str) and not container_path[0].startswith(
                 self.__first_container_path):
@@ -433,7 +566,7 @@ class KnownEntitiesIngestion(PortadaIngestion):
 
     def copy_ingested_raw_data(self, *container_path, local_path: str, return_dest_path=False, remove_local: bool = True):
         container_path = self.__resolve_container_path(*container_path)
-        container_path.insert(1, "original_files")
+        # container_path.insert(1, "original_files")
         return super().copy_ingested_raw_data(*container_path, local_path=local_path,
                                               return_dest_path=return_dest_path, remove_local= remove_local)
 
@@ -524,8 +657,11 @@ class BoatFactIngestion(NewsExtractionIngestion):
         patcher = BoatFactPatcherDataLayer(cfg_json=self.get_configuration())
         if self.sequencer_params is not None:
             patcher.set_delta_data_version_manager_params(host=self.sequencer_params["host"], port=self.sequencer_params["port"])
-        patcher.patch_if_needed()
-
+            patcher.patch_if_needed()
+        elif not self._use_redis_metadata:
+            patcher.patch_if_needed()
+        else:
+            raise ValueError("No redis params or sequencer params set")
 
     def ingest(self, *container_path, local_path: str, user: str ):
         if len(container_path)>0:

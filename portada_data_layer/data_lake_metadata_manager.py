@@ -883,7 +883,7 @@ class DataLakeMetadataManager(PathConfigDeltaDataLayer):
         """
         Reads the internal metadata of a Delta Lake table.
         Returns a dictionary with:
-        - "detail": table schema and properties
+        - "detail": table schema_path and properties
         - "history": operation history (up to last 20 by default)
         """
         try:

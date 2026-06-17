@@ -165,6 +165,10 @@ class AbstractDeltaDataLayerBuilder(PortadaDeltaConstants):
 # ==============================================================
 class DeltaDataLayerBuilder(AbstractDeltaDataLayerBuilder):
 
+    def __init__(self, json_config=None, json_extended_classes=None):
+        super().__init__(json_config=json_config)
+        self._use_redis_metadata = False
+
     def build(self, type:str = None) -> "DeltaDataLayer":
         """Constructs and returns a DeltaDataLayer initialized with this constructor."""
         delta_layer = DeltaDataLayer(builder=self)
@@ -183,6 +187,7 @@ class PortadaBuilder(DeltaDataLayerBuilder):
     def __init__(self, json_config=None, json_extended_classes=None):
         super().__init__(json_config=json_config)
         self.__classes_to_build = json_extended_classes
+        self._use_redis_metadata = True
 
     """
     Builder to configure Spark + Delta Lake with a fluid and flexible API.
@@ -199,6 +204,10 @@ class PortadaBuilder(DeltaDataLayerBuilder):
         ...
         layer.close()
     """
+
+    def use_redis_metadata(self, use_redis_metadata: bool):
+        self._use_redis_metadata = use_redis_metadata
+        return self
 
     def build(self, type:str = None, as_config_layer:dict = None) -> "PortadaIngestion":
         """Constructs and returns a DeltaDataLayer initialized with this constructor."""
