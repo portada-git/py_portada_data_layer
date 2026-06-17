@@ -1947,8 +1947,9 @@ class BoatFactCleaning(PortadaCleaning, BoatFactCitationExtractor, BoatFactVoice
         else:
             cp = ("reviewed_entries", self.__container_path,)
         df = self.read_delta(*cp, process_level_dir=self._process_level_dirs_[self.RAW_PROCESS_LEVEL])
-        if df is not None:
-            logger.info(f"{0 if df is None else df.count()} reviewed_entries were read")
+        if df is None:
+            return df
+        logger.info(f"{0 if df is None else df.count()} reviewed_entries were read")
         if not force_all:
             state_path = self._resolve_path(*cp, process_level_dir="states")
             if not self.path_exists(state_path):
@@ -1970,8 +1971,9 @@ class BoatFactCleaning(PortadaCleaning, BoatFactCitationExtractor, BoatFactVoice
         else:
             cp = ("reviewed_entries", BoatFactConstants.CARGO_SHIP_ENTRIES,)
         df = self.read_delta(*cp, process_level_dir=self._process_level_dirs_[self.RAW_PROCESS_LEVEL])
-        if df is not None:
-            logger.info(f"{0 if df is None else df.count()} reviewed_entries were read")
+        if df is None:
+            return df
+        logger.info(f"{0 if df is None else df.count()} reviewed_entries were read")
         if not force_all:
             df = df.withColumn("id", F.concat(df.temp_key, F.lit("_"), df.cargo_merchant_id, F.lit("_"),
                                               df.cargo_commodity_id))
