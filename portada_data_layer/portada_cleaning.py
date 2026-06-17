@@ -1956,7 +1956,7 @@ class BoatFactCleaning(PortadaCleaning, BoatFactCitationExtractor, BoatFactVoice
                 #     [StructField("temp_key", StringType(), True), StructField("is_cleaned", BooleanType(), True), ]))
                 return df
             state_df = self.spark.read.parquet(state_path)
-            state_df = state_df.filter(F.col("is_cleaned") == True).select("name")
+            state_df = state_df.filter(F.col("is_cleaned") == True).select("temp_key")
 
             df = df.join(state_df, on="temp_key", how="left_anti")
         return df
@@ -1982,7 +1982,7 @@ class BoatFactCleaning(PortadaCleaning, BoatFactCitationExtractor, BoatFactVoice
                 #      StructField("is_cleaned", BooleanType(), True), ]))
                 return df
             state_df = self.spark.read.parquet(state_path)
-            state_df = state_df.filter(F.col("is_cleaned") == True).select("name")
+            state_df = state_df.filter(F.col("is_cleaned") == True).select("id")
 
             df = df.join(state_df, on="id", how="left_anti")
             df.drop("id")
