@@ -1,4 +1,4 @@
-from typing import Union, Tuple
+from typing import Sequence, Union
 
 from pyspark.sql import DataFrame, functions as F
 
@@ -89,6 +89,19 @@ class BoatFactCitationExtractor:
             F.col("ship_tons_unit").alias("citation")
         )
         return df_ship_tons_unit
+
+    @staticmethod
+    def extract_travel_duration(df_entries) -> Union[DataFrame, TracedDataFrame]:
+        """Extract travel duration unit citations (entity ``travel_duration``)."""
+        df_travel_duration = df_entries.select(
+            F.col("entry_id").alias("id"),
+            "entry_id",
+            "temp_key",
+            F.lit("travel_duration_unit").alias("field_origin"),
+            F.col("travel_duration_value").alias("travel_duration_value_citation"),
+            F.col("travel_duration_unit").alias("citation"),
+        )
+        return df_travel_duration
 
     @staticmethod
     def extract_ship_flags(df_entries) -> Union[DataFrame, TracedDataFrame]:

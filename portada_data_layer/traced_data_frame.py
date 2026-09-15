@@ -71,6 +71,12 @@ class TracedDataFrame:
             return wrapper
         return attr
 
+    def __getitem__(self, item):
+        result = self._df[item]
+        if isinstance(result, DataFrame):
+            return self.update_result(self._df, result, "select", (item,), {})
+        return result
+
     @property
     def name(self):
         if self._name:

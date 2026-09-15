@@ -8,3 +8,4 @@ from .portada_delta_builder import PortadaBuilder, DeltaDataLayerBuilder
 from .portada_ingestion import PortadaIngestion
 from .portada_cleaning import PortadaCleaning, BoatFactCleaning
 from .portada_patcher_data_layer import PortadaPatcherDataLayer
+from .portada_linker_with_splink import PortadaLinkerWithSplink

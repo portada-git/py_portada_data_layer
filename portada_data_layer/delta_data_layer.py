@@ -1102,6 +1102,36 @@ class FileSystemTaskExecutor(BaseDeltaDataLayer):
         )
         return fs.exists(self._jvm.org.apache.hadoop.fs.Path(path))
 
+    def _fs_for_path(self, path: str):
+        """Return a Hadoop FileSystem instance bound to the URI of ``path``."""
+        if self._jvm is None or self._sc is None:
+            self._fs = self._init_fs()
+        hadoop_conf = self._sc._jsc.hadoopConfiguration()
+        return self._jvm.org.apache.hadoop.fs.FileSystem.get(
+            self._jvm.org.apache.hadoop.fs.Path(path).toUri(), hadoop_conf
+        )
+
+    def delete(self, path: str, recursive: bool = True) -> bool:
+        """Delete a file or directory on the Hadoop FileSystem."""
+        fs = self._fs_for_path(path)
+        jpath = self._jvm.Path(path)
+        if not fs.exists(jpath):
+            return False
+        return bool(fs.delete(jpath, recursive))
+
+    def mkdirs(self, path: str) -> bool:
+        """Create directory (and parents) on the Hadoop FileSystem."""
+        fs = self._fs_for_path(path)
+        return bool(fs.mkdirs(self._jvm.Path(path)))
+
+    def list_status(self, path: str):
+        """List file statuses under ``path`` (non-recursive)."""
+        fs = self._fs_for_path(path)
+        jpath = self._jvm.Path(path)
+        if not fs.exists(jpath):
+            return []
+        return list(fs.listStatus(jpath))
+
     def is_delta_table_type(self, path: str):
         """
         Checks if a file or directory exists for any protocol supported by Hadoop.
@@ -1122,9 +1152,7 @@ class FileSystemTaskExecutor(BaseDeltaDataLayer):
         """
         Returns subdirectories within an HDFS *container_path (without using os.listdir).
         """
-        fs = self._jvm.org.apache.hadoop.fs.FileSystem.get(
-            self._jsc.hadoopConfiguration()
-        )
+        fs = self._fs_for_path(base_path)
         path = self._jvm.org.apache.hadoop.fs.Path(base_path)
         status = fs.listStatus(path)
 
@@ -1136,10 +1164,10 @@ class FileSystemTaskExecutor(BaseDeltaDataLayer):
         return subdirs
 
     def rename(self, origin_path, destination_path):
+        fs = self._fs_for_path(origin_path)
         jvm_orig_path = self._jvm.Path(origin_path)
         jvm_dest_path = self._jvm.Path(destination_path)
-        exit = self._fs.rename(jvm_orig_path, jvm_dest_path)
-        return exit
+        return bool(fs.rename(jvm_orig_path, jvm_dest_path))
 
 
 # ==============================================================

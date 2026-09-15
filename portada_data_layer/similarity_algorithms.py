@@ -2,7 +2,7 @@ import os
 import re
 import unicodedata
 from abc import ABC, abstractmethod
-from typing import Dict, Any, Tuple, Optional, Iterator, Union, List
+from typing import Dict, Any, Tuple, Optional, Iterator, Union, List, Literal
 import pandas as pd
 import numpy as np
 from pyspark.sql import DataFrame
@@ -33,6 +33,23 @@ def instantiate_similarity_algorithms(name: str, col_a: str, col_b: str, output_
     raise ValueError(f"Unknown similarity algorithm {name}")
 
 
+def _normalize_text_value(text: Any) -> Optional[str]:
+    if text is None:
+        return None
+    if isinstance(text, float):
+        if pd.isna(text) or np.isnan(text):
+            return None
+        if text.is_integer():
+            return str(int(text))
+        return str(text)
+    if isinstance(text, (int, np.integer)):
+        return str(text)
+    if not isinstance(text, str):
+        text = str(text)
+    text = text.strip()
+    return text if text else None
+
+
 def _levenshtein_distance(a: str, b: str) -> int:
     if a == b:
         return 0
@@ -51,13 +68,75 @@ def _levenshtein_distance(a: str, b: str) -> int:
 
 
 def _levenshtein_ratio(a: Optional[str], b: Optional[str]) -> float:
+    a = _normalize_text_value(a)
+    b = _normalize_text_value(b)
     if a is None or b is None:
         return 0.0
     max_len = max(len(a), len(b), 1)
     return 1.0 - (_levenshtein_distance(a, b) / max_len)
 
 
+def _extract_root(
+    text: Optional[str], max_suffix_length: int, min_root_length: int
+) -> Optional[str]:
+    text = _normalize_text_value(text)
+    if text is None:
+        return None
+    if len(text) <= min_root_length:
+        return text
+    root_len = max(len(text) - max_suffix_length, min_root_length)
+    return text[:root_len]
+
+
+def _root_column_expr(
+    text_col: str, max_suffix_length: int, min_root_length: int
+) -> F.Column:
+    col = F.col(text_col)
+    # substring() Python API only accepts int literals for length; use SQL expr instead.
+    root_len_sql = (
+        f"cast(greatest(length(`{text_col}`) - {max_suffix_length}, "
+        f"{min_root_length}) as int)"
+    )
+    return F.when(
+        F.length(col) <= F.lit(min_root_length),
+        col,
+    ).otherwise(
+        F.expr(f"substring(`{text_col}`, 1, {root_len_sql})")
+    )
+
+def _portada_levenshtein_ratio(a: Optional[str], b: Optional[str], plur:list[str] = None) -> float:
+    def longest_suffix_index(cad:str, lc:list[str]):
+        candidats = [
+            (i, s)
+            for i, s in enumerate(lc)
+            if cad.endswith(s)
+        ]
+
+        if not candidats:
+            return None
+
+        return max(candidats, key=lambda x: len(x[1]))[0]
+
+    if plur is None:
+        plur = ["os", "es", "s"]
+    a = _normalize_text_value(a)
+    b = _normalize_text_value(b)
+    if a is None or b is None:
+        return 0.0
+    i = longest_suffix_index(a, plur)
+    if i is not None:
+        ca = a[:len(a)-len(plur[i])]
+    else:
+        ca = a
+    i = longest_suffix_index(b, plur)
+    if i is not None:
+        cb = b[:len(b)-len(plur[i])]
+    else:
+        cb = b
+    return _levenshtein_ratio(ca, cb)
+
 def _char_ngrams(text: Optional[str], n: int) -> set[str]:
+    text = _normalize_text_value(text)
     if text is None or n <= 0:
         return set()
     padded = f"  {text}  "
@@ -77,6 +156,7 @@ def _ngram_jaccard(a: Optional[str], b: Optional[str], n: int) -> float:
 
 
 def _dmetaphone_codes(text: Optional[str]) -> tuple[str, str]:
+    text = _normalize_text_value(text)
     if text is None:
         return ("", "")
     import phonetics
@@ -86,6 +166,8 @@ def _dmetaphone_codes(text: Optional[str]) -> tuple[str, str]:
 
 
 def _dmetaphone_similarity(a: Optional[str], b: Optional[str]) -> float:
+    a = _normalize_text_value(a)
+    b = _normalize_text_value(b)
     if a is None or b is None:
         return 0.0
     codes_a = _dmetaphone_codes(a)
@@ -128,7 +210,144 @@ def _normalize_spark_identifier(name: str) -> str:
     return name
 
 
+LinkerPreprocessSide = Literal["citation", "voice"]
+
+
+class LinkerPreprocessCache:
+    """Cache preprocessed algorithm columns keyed by unified output_name text."""
+
+    def __init__(self, output_name: str) -> None:
+        self.output_name = output_name
+        self._citation_features: Optional[DataFrame] = None
+        self._voice_features: Optional[DataFrame] = None
+        self._udfs_registered = False
+
+    def _features_for_side(self, side: LinkerPreprocessSide) -> Optional[DataFrame]:
+        return self._citation_features if side == "citation" else self._voice_features
+
+    def _set_features_for_side(self, side: LinkerPreprocessSide, df: DataFrame) -> None:
+        if side == "citation":
+            self._citation_features = df
+        else:
+            self._voice_features = df
+
+    @staticmethod
+    def _to_linker_base(df: DataFrame, field_col: str, output_name: str, source_dataset: str) -> DataFrame:
+        uid = SimilarityAlgorithm.UNIQUE_ID_COLUMN_NAME
+        src = SimilarityAlgorithm.SOURCE_DATASET_COLUMN_NAME
+        work = df
+        if uid not in work.columns:
+            work = work.withColumn(uid, F.col("id"))
+        if src not in work.columns:
+            work = work.withColumn(src, F.lit(source_dataset))
+        return work.withColumn(output_name, F.col(field_col)).select(uid, src, output_name)
+
+    @property
+    def udfs_registered(self) -> bool:
+        return self._udfs_registered
+
+    def register_udfs(
+        self,
+        algorithms: List["SimilarityAlgorithm"],
+        citation_seed: DataFrame,
+        voice_seed: DataFrame,
+    ) -> None:
+        if self._udfs_registered or not algorithms:
+            return
+        citation_work = citation_seed.limit(1)
+        voice_work = voice_seed.limit(1)
+        for alg in algorithms:
+            citation_work, voice_work = alg.pre_process_data(citation_work, voice_work)
+        self._udfs_registered = True
+
+    def _run_preprocess_pipeline(
+        self,
+        df_base: DataFrame,
+        side: LinkerPreprocessSide,
+        algorithms: List["SimilarityAlgorithm"],
+        partner_seed: DataFrame,
+    ) -> DataFrame:
+        if side == "citation":
+            work = df_base
+            for alg in algorithms:
+                work, _ = alg.pre_process_data(work, None)
+            return work
+        partner = partner_seed.limit(1)
+        work = df_base
+        for alg in algorithms:
+            partner, work = alg.pre_process_data(partner, work)
+        return work
+
+    def _merge_feature_cache(
+        self,
+        existing: Optional[DataFrame],
+        new_rows: DataFrame,
+    ) -> DataFrame:
+        if existing is None:
+            return new_rows
+        return existing.unionByName(new_rows, allowMissingColumns=True).dropDuplicates([self.output_name])
+
+    def ensure_side_cached(
+        self,
+        df_raw: DataFrame,
+        field_col: str,
+        source_dataset: str,
+        side: LinkerPreprocessSide,
+        algorithms: List["SimilarityAlgorithm"],
+        partner_seed: DataFrame,
+    ) -> None:
+        if not algorithms:
+            return
+        unique = SimilarityAlgorithm.force_unique(df_raw, field_col)
+        base = self._to_linker_base(unique, field_col, self.output_name, source_dataset)
+        cache = self._features_for_side(side)
+        if cache is None:
+            missing = base
+        else:
+            missing = base.join(cache.select(self.output_name), self.output_name, "left_anti")
+
+        if missing.limit(1).count() == 0:
+            return
+
+        missing_keys = missing.select(self.output_name).distinct()
+        to_compute = base.join(missing_keys, self.output_name, "inner")
+        computed = self._run_preprocess_pipeline(to_compute, side, algorithms, partner_seed)
+        derived_cols = [
+            c
+            for c in computed.columns
+            if c
+            not in (
+                SimilarityAlgorithm.UNIQUE_ID_COLUMN_NAME,
+                SimilarityAlgorithm.SOURCE_DATASET_COLUMN_NAME,
+                self.output_name,
+            )
+        ]
+        new_cache_rows = computed.select(self.output_name, *derived_cols).dropDuplicates(
+            [self.output_name]
+        )
+        self._set_features_for_side(side, self._merge_feature_cache(cache, new_cache_rows))
+
+    def lookup_linker_rows(
+        self,
+        df_raw: DataFrame,
+        field_col: str,
+        source_dataset: str,
+        side: LinkerPreprocessSide,
+        linker_cols: List[str],
+    ) -> DataFrame:
+        cache = self._features_for_side(side)
+        if cache is None:
+            raise ValueError(f"Preprocessor cache for side '{side}' is empty; call ensure_side_cached first")
+        unique = SimilarityAlgorithm.force_unique(df_raw, field_col)
+        base = self._to_linker_base(unique, field_col, self.output_name, source_dataset)
+        derived_cols = [c for c in cache.columns if c != self.output_name]
+        enriched = base.join(cache, on=self.output_name, how="left")
+        return enriched.select(*linker_cols)
+
+
 class SimilarityAlgorithm(ABC):
+    UNIQUE_ID_COLUMN_NAME = "unique_id"
+    SOURCE_DATASET_COLUMN_NAME = "source_dataset"
     def __init__(self, col_a: str, col_b: str, output_name: str, thresholds: list, **nargs):
         self.col_a = col_a
         self.col_b = col_b
@@ -141,26 +360,102 @@ class SimilarityAlgorithm(ABC):
         pass
 
     @staticmethod
-    def force_unique_citations(df_citations: DataFrame, col_name) -> Union[DataFrame, Optional[DataFrame]]:
-        df_a_unique = df_citations.dropDuplicates([col_name])
+    def force_unique(df: DataFrame, col_name) -> Union[DataFrame, Optional[DataFrame]]:
+        df_a_unique = df.dropDuplicates([col_name])
         return df_a_unique
 
 
     def pre_process_data(self, df_a: DataFrame, df_b: Optional[DataFrame] = None) -> Tuple[DataFrame, Optional[DataFrame]]:
-        if "comparing_data_type" in df_a.columns:
-            return df_a, df_b
-        if not "unique_id" in df_a.columns:
-            df_a = df_a.withColumn("unique_id", F.col("id"))
+        changed_a = False
+        changed_b = False
+        if not SimilarityAlgorithm.UNIQUE_ID_COLUMN_NAME in df_a.columns:
+            df_a = df_a.withColumn(SimilarityAlgorithm.UNIQUE_ID_COLUMN_NAME, F.col("id"))
+            changed_a = True
         if self.col_a in df_a.columns:
             df_a = df_a.withColumn(f"{self.output_name}", F.col(self.col_a))
             df_a = df_a.drop(self.col_a)
+            changed_a = True
+        if not SimilarityAlgorithm.SOURCE_DATASET_COLUMN_NAME in df_a.columns:
+            df_a = df_a.withColumn(SimilarityAlgorithm.SOURCE_DATASET_COLUMN_NAME, F.lit(self.col_a))
+            changed_a = True
+        if changed_a:
+            df_a = df_a.select(SimilarityAlgorithm.UNIQUE_ID_COLUMN_NAME, SimilarityAlgorithm.SOURCE_DATASET_COLUMN_NAME, f"{self.output_name}")
         if df_b is not None:
-            if not "unique_id" in df_b.columns:
-                df_b = df_b.withColumn("unique_id", F.col("id"))
+            if not SimilarityAlgorithm.UNIQUE_ID_COLUMN_NAME in df_b.columns:
+                df_b = df_b.withColumn(SimilarityAlgorithm.UNIQUE_ID_COLUMN_NAME, F.col("id"))
+                changed_b = True
             if self.col_b in df_b.columns:
                 df_b = df_b.withColumn(f"{self.output_name}", F.col(self.col_b))
                 df_b = df_b.drop(self.col_b)
+                changed_b = True
+            if not SimilarityAlgorithm.SOURCE_DATASET_COLUMN_NAME in df_b.columns:
+                df_b = df_b.withColumn(SimilarityAlgorithm.SOURCE_DATASET_COLUMN_NAME, F.lit(self.col_b))
+                changed_b = True
+            if changed_b:
+                df_b = df_b.select(SimilarityAlgorithm.UNIQUE_ID_COLUMN_NAME, SimilarityAlgorithm.SOURCE_DATASET_COLUMN_NAME, f"{self.output_name}")
         return df_a, df_b
+
+@registry_to_portada_similarity_algorithms
+class LevenshteinJaroWinAlgorithm(SimilarityAlgorithm):
+    def __init__(
+        self,
+        col_a: str,
+        col_b: str,
+        output_name: str,
+        thresholds: list,
+        lev_weight: float = None,
+        jaro_weight: float = None,
+        **nargs,
+    ):
+        super().__init__(col_a, col_b, output_name, thresholds, **nargs)
+        self._lev_weight, self._jaro_weight = self._resolve_weights(lev_weight, jaro_weight)
+
+    @staticmethod
+    def _resolve_weights(lev_weight: Optional[float], jaro_weight: Optional[float]) -> Tuple[float, float]:
+        if lev_weight is None and jaro_weight is None:
+            return 0.4, 0.6
+        if lev_weight is None:
+            jaro_weight = float(jaro_weight)
+            return 1.0 - jaro_weight, jaro_weight
+        if jaro_weight is None:
+            lev_weight = float(lev_weight)
+            return lev_weight, 1.0 - lev_weight
+
+        lev_weight = float(lev_weight)
+        jaro_weight = float(jaro_weight)
+        total = lev_weight + jaro_weight
+        if total <= 0:
+            raise ValueError("lev_weight and jaro_weight must sum to a positive value")
+        return lev_weight / total, jaro_weight / total
+
+    def _levenshtein_similarity_sql(self) -> str:
+        col = self.output_name
+        return (
+            f"(1.0 - (levenshtein({col}_l, {col}_r) / "
+            f"cast(greatest(length({col}_l), length({col}_r), 1) as double)))"
+        )
+
+    def _weighted_score_sql(self) -> str:
+        col = self.output_name
+        lev_sim = self._levenshtein_similarity_sql()
+        jaro_sim = f"jaro_winkler({col}_l, {col}_r)"
+        return (
+            f"(({self._lev_weight} * {lev_sim}) + "
+            f"({self._jaro_weight} * {jaro_sim}))"
+        )
+
+    def get_splink_configuration(self) -> List[Any]:
+        return [
+            {
+                "sql_condition": f"{self._weighted_score_sql()} >= {thr}",
+                "label_for_charts": (
+                    f"Weighted Levenshtein+Jaro "
+                    f"({self._lev_weight:.2f}/{self._jaro_weight:.2f}) >= {thr}"
+                ),
+            }
+            for thr in self.thresholds
+        ]
+
 
 
 @registry_to_portada_similarity_algorithms
@@ -174,6 +469,56 @@ class LevenshteinAlgorithm(SimilarityAlgorithm):
                 "label_for_charts": f"Levenshtein Similarity >= {thr}"
             } for thr in self.thresholds]
         return  r
+
+
+@registry_to_portada_similarity_algorithms
+class RootLevenshteinAlgorithm(SimilarityAlgorithm):
+    def __init__(
+        self,
+        col_a: str,
+        col_b: str,
+        output_name: str,
+        thresholds: list,
+        max_suffix_length: int,
+        min_root_length: int,
+        **nargs,
+    ):
+        super().__init__(col_a, col_b, output_name, thresholds, **nargs)
+        if max_suffix_length < 0:
+            raise ValueError("max_suffix_length must be >= 0")
+        if min_root_length < 1:
+            raise ValueError("min_root_length must be >= 1")
+        self.max_suffix_length = int(max_suffix_length)
+        self.min_root_length = int(min_root_length)
+        self.output_derived_col = f"{output_name}_root"
+
+    def pre_process_data(self, df_a: DataFrame, df_b: Optional[DataFrame] = None) -> Tuple[DataFrame, Optional[DataFrame]]:
+        df_a, df_b = super().pre_process_data(df_a, df_b)
+        root_expr = _root_column_expr(
+            self.output_name, self.max_suffix_length, self.min_root_length
+        )
+        df_a = _enrich_with_distinct_expression(
+            df_a, self.output_name, self.output_derived_col, root_expr
+        )
+        if df_b is not None:
+            df_b = _enrich_with_distinct_expression(
+                df_b, self.output_name, self.output_derived_col, root_expr
+            )
+        return df_a, df_b
+
+    def get_splink_configuration(self) -> List[Any]:
+        col = self.output_derived_col
+        return [
+            {
+                "sql_condition": (
+                    f"1.0 - (levenshtein({col}_l, {col}_r) / "
+                    f"cast(greatest(length({col}_l), length({col}_r), 1) as double)) >= {thr}"
+                ),
+                "label_for_charts": f"Root Levenshtein Similarity >= {thr}",
+            }
+            for thr in self.thresholds
+        ]
+
 
 @registry_to_portada_similarity_algorithms
 class JaroWinklerAlgorithm(SimilarityAlgorithm):

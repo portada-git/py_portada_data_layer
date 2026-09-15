@@ -4,7 +4,7 @@ import json
 import re
 from pyexpat import ExpatError
 
-from pyspark.sql.types import StringType, StructType, StructField, ArrayType
+from pyspark.sql.types import StringType, StructType, StructField, ArrayType, BooleanType
 
 from portada_data_layer.boat_fact_model import BoatFactDataModel
 from portada_data_layer.data_lake_metadata_manager import DataLakeMetadataManager, enable_storage_log_for_class, \
@@ -21,7 +21,64 @@ import logging
 import xmltodict as xmldoc
 import yaml as yamldoc
 
+_RAW_GROUP_KEY_COLS = ("_gk_pub", "_gk_y", "_gk_m", "_gk_d", "_gk_ed")
+_RAW_PARTITION_COLS = ("_pub", "_y", "_m", "_d", "_ed")
+
 logger = logging.getLogger("portada_data.delta_data_layer.boat_fact_ingestion")
+
+
+def _stringify_boolean_schema(data_type):
+    """Return a schema like data_type but with every boolean replaced by string."""
+    if isinstance(data_type, BooleanType):
+        return StringType()
+    if isinstance(data_type, StructType):
+        return StructType(
+            [
+                StructField(f.name, _stringify_boolean_schema(f.dataType), f.nullable)
+                for f in data_type.fields
+            ]
+        )
+    if isinstance(data_type, ArrayType):
+        return ArrayType(
+            _stringify_boolean_schema(data_type.elementType),
+            containsNull=data_type.containsNull,
+        )
+    return data_type
+
+
+def _schema_has_boolean(data_type) -> bool:
+    if isinstance(data_type, BooleanType):
+        return True
+    if isinstance(data_type, StructType):
+        return any(_schema_has_boolean(f.dataType) for f in data_type.fields)
+    if isinstance(data_type, ArrayType):
+        return _schema_has_boolean(data_type.elementType)
+    return False
+
+
+def _cast_booleans_to_string_df(df):
+    """
+    Cast boolean columns (including nested struct/array fields) to string so unionByName
+    stays compatible when IA extraction uses strings and older JSON used booleans.
+    """
+    if df is None:
+        return df
+    for field in df.schema.fields:
+        if not _schema_has_boolean(field.dataType):
+            continue
+        target = _stringify_boolean_schema(field.dataType)
+        if isinstance(field.dataType, BooleanType):
+            df = df.withColumn(field.name, F.col(field.name).cast("string"))
+        else:
+            df = df.withColumn(
+                field.name,
+                F.from_json(F.to_json(F.col(field.name)), target),
+            )
+    return df
+
+
+def _align_for_union_by_name(df_left, df_right):
+    return _cast_booleans_to_string_df(df_left), _cast_booleans_to_string_df(df_right)
 
 
 @enable_storage_log_for_class
@@ -59,6 +116,28 @@ class PortadaIngestion(DeltaDataLayer):
             logger.error(f"Error during classification/deduplication: {e}")
             raise
         logger.info("Ingestion process completed successfully.")
+
+    @block_transformer_method
+    def ingest_fast(self, *container_path, local_path: str, user: str):
+        """Like ``ingest`` but uses ``fast_save_raw_data`` for classification/dedup."""
+        if not os.path.exists(local_path):
+            raise FileNotFoundError(f"Ingest file not found: {local_path}")
+
+        logger.info(f"Starting fast ingestion process for {local_path}")
+        data, dest_path = self.copy_ingested_raw_data(
+            *container_path, local_path=local_path, user=user, return_dest_path=True
+        )
+        try:
+            self.fast_save_raw_data(
+                *container_path,
+                data={"source_path": dest_path, "data_json_array": data},
+                user=user,
+            )
+            logger.info("Fast classification/deduplication completed successfully.")
+        except Exception as e:
+            logger.error(f"Error during fast classification/deduplication: {e}")
+            raise
+        logger.info("Fast ingestion process completed successfully.")
 
     @data_transformer_method(description="Copy the original file to the FileSystem (HDFS/S3/file)")
     def copy_ingested_raw_data(self, *container_path, local_path: str, return_dest_path=False, user: str = None, remove_local: bool = True,  **kwargs):
@@ -147,6 +226,9 @@ class PortadaIngestion(DeltaDataLayer):
         return data
 
     def save_raw_data(self, *container_path, data: dict | list = None, user: str = None, source_path: str = None,  **kwargs):
+        pass
+
+    def fast_save_raw_data(self, *container_path, data: dict | list = None, user: str = None, source_path: str = None, **kwargs):
         pass
 
     def read_raw_data(self, *container_path, user: str = None, **kwargs):
@@ -273,13 +355,17 @@ class NewsExtractionIngestion(PortadaIngestion):
 
                 # 3. Ara la unió és segura: no hi ha duplicats entre els dos DFs
                 # I ens assegurem que el que queda és el contingut del subset
-                merged_df = subset.unionByName(existing_df_filtered, allowMissingColumns=True)
+                subset_u, existing_u = _align_for_union_by_name(subset, existing_df_filtered)
+                merged_df = subset_u.unionByName(existing_u, allowMissingColumns=True)
                 duplicates = subset.count() + existing_df.count() - merged_df.count()
                 regs += merged_df.count()
                 if duplicates > 0:
                     duplicated_df = existing_df.join(merged_df, on="entry_id", how="left_anti")
-                    duplicated_df = subset.join(duplicated_df.select("parsed_text"), on="parsed_text",
-                                                how="left").unionByName(duplicated_df, allowMissingColumns=True)
+                    dup_left = subset.join(
+                        duplicated_df.select("parsed_text"), on="parsed_text", how="left"
+                    )
+                    dup_left, dup_right = _align_for_union_by_name(dup_left, duplicated_df)
+                    duplicated_df = dup_left.unionByName(dup_right, allowMissingColumns=True)
                     metadata.log_duplicates(
                         data_layer=self,
                         action=DataLakeMetadataManager.DELETE_DUPLICATES_ACTION,
@@ -304,6 +390,341 @@ class NewsExtractionIngestion(PortadaIngestion):
         logger.info(f"{regs} entries was saved")
 
         return df_list
+
+    @data_transformer_method(
+        description="Fast vectorized save of ship entries organized by publication metadata.")
+    def fast_save_raw_data(
+        self,
+        *container_path,
+        data: dict | list = None,
+        user: str = None,
+        source_path: str = None,
+        **kwargs,
+    ):
+        """Same contract as ``save_raw_data``, without a Spark job per group.
+
+        Merges against existing raw JSON in one pass, writes all touched partitions
+        through a staging directory, then promotes them to the canonical layout
+        ``publication/yyyy/mm/dd/edition/``. Updates cleaning state once at the end.
+        """
+        super().fast_save_raw_data(*container_path, data=data, user=user, **kwargs)
+        if data is None:
+            raise ValueError("A DataFrame or JSON list must be passed.")
+        if not self.is_initialized():
+            raise ValueError(
+                "PortadaIngestion instance is not initializer. start_spark() method must be called first."
+            )
+
+        data_json_array, source_path, tn, source_version = self._parse_save_raw_payload(
+            data, source_path
+        )
+        if len(data_json_array) == 0:
+            return []
+
+        df = self._build_incoming_raw_df(
+            data_json_array, table_name=tn, source_path=source_path, user=user
+        )
+        base_path = f"{self._resolve_path(*container_path, process_level_dir=self.raw_subdir)}"
+        existing = self._read_all_existing_raw(base_path)
+        # Break lineage to on-disk JSON before overwrite/promote deletes those part files.
+        # Otherwise later actions on merged/duplicates_df raise SparkFileNotFoundException.
+        if existing is not None:
+            existing = existing.localCheckpoint(eager=True)
+
+        merged, duplicates_df = self._merge_incoming_with_existing_raw(df, existing)
+        merged = merged.persist()
+        try:
+            regs = merged.count()
+            if duplicates_df is not None:
+                duplicates_df = duplicates_df.localCheckpoint(eager=True)
+            self._write_raw_partitions_fast(merged, base_path)
+            self._log_duplicates_batch(
+                duplicates_df=duplicates_df,
+                source_path=source_path,
+                source_version=source_version,
+                target_path=base_path,
+                uploaded_by=user,
+            )
+            self._update_state(*container_path, df=merged)
+        finally:
+            merged.unpersist()
+
+        logger.info("%s entries was saved (fast_save_raw_data)", regs)
+        return [merged]
+
+    def _parse_save_raw_payload(self, data: dict | list, source_path: str | None):
+        source_version = -1
+        if isinstance(data, dict):
+            data_json_array = data["data_json_array"]
+            source_path = self._resolve_relative_path(data["source_path"])
+            p = re.compile(
+                f"{self.project_name}/{self._process_level_dirs_[self._current_process_level]}/(.*)"
+            )
+            tn = re.sub(p, "\\g<1>", source_path, 0)
+        else:
+            data_json_array = data
+            if source_path is None:
+                tn = "UNKNOWN"
+                source_path = "UNKNOWN"
+            else:
+                source_path = self._resolve_relative_path(source_path)
+                p = re.compile(
+                    f"{self.project_name}/{self._process_level_dirs_[self._current_process_level]}/(.*)"
+                )
+                tn = re.sub(p, "\\g<1>", source_path, 0)
+        return data_json_array, source_path, tn, source_version
+
+    def _build_incoming_raw_df(
+        self,
+        data_json_array: list,
+        table_name: str,
+        source_path: str,
+        user: str | None,
+    ) -> TracedDataFrame:
+        start_counter = self.get_sequence_value(
+            "entry_ships",
+            BoatFactDataModel(data_json_array[0])["publication_name"].lower(),
+            increment=len(data_json_array),
+        )
+        df = TracedDataFrame(
+            df=self.spark.read.json(
+                self.spark.sparkContext.parallelize(
+                    [
+                        json.dumps(BoatFactDataModel(obj).reformat(i))
+                        for i, obj in enumerate(data_json_array, start_counter)
+                    ]
+                )
+            ),
+            table_name=table_name,
+            df_name=source_path,
+        )
+        if user is not None:
+            df = df.withColumn("uploaded_by", F.lit(user))
+        df = df.withColumn("publication_date_value", F.to_date("publication_date", "yyyy-MM-dd"))
+        df = df.withColumn("publication_date_year", year(col("publication_date_value")))
+        df = df.withColumn("publication_date_month", month(col("publication_date_value")))
+        df = df.withColumn("publication_date_day", dayofmonth(col("publication_date_value")))
+        return df.drop("publication_date_value")
+
+    @staticmethod
+    def _with_raw_group_keys(df):
+        return (
+            df.withColumn("_gk_pub", F.lower(F.col("publication_name")))
+            .withColumn("_gk_y", F.col("publication_date_year").cast("int"))
+            .withColumn("_gk_m", F.col("publication_date_month").cast("int"))
+            .withColumn("_gk_d", F.col("publication_date_day").cast("int"))
+            .withColumn("_gk_ed", F.lower(F.col("publication_edition")))
+        )
+
+    def _read_all_existing_raw(self, base_path: str):
+        path = os.path.join(base_path, "*", "*", "*", "*", "*", "*.json")
+        return self.read_json(path, has_extension=True)
+
+    def _merge_incoming_with_existing_raw(self, incoming_df, existing_df):
+        incoming = self._with_raw_group_keys(incoming_df)
+        if existing_df is None:
+            return incoming.drop(*_RAW_GROUP_KEY_COLS), None
+
+        existing = self._with_raw_group_keys(existing_df)
+        group_keys = list(_RAW_GROUP_KEY_COLS)
+        batch_groups = incoming.select(*group_keys).distinct()
+        existing_in_batch = existing.join(batch_groups, on=group_keys, how="inner")
+
+        id_mapping = existing_in_batch.select(
+            F.col("_gk_pub").alias("_map_pub"),
+            F.col("_gk_y").alias("_map_y"),
+            F.col("_gk_m").alias("_map_m"),
+            F.col("_gk_d").alias("_map_d"),
+            F.col("_gk_ed").alias("_map_ed"),
+            F.col("parsed_text").alias("old_text"),
+            F.col("entry_id").alias("old_id"),
+        )
+        incoming = (
+            incoming.join(
+                id_mapping,
+                on=[
+                    incoming["_gk_pub"] == id_mapping["_map_pub"],
+                    incoming["_gk_y"] == id_mapping["_map_y"],
+                    incoming["_gk_m"] == id_mapping["_map_m"],
+                    incoming["_gk_d"] == id_mapping["_map_d"],
+                    incoming["_gk_ed"] == id_mapping["_map_ed"],
+                    incoming["parsed_text"] == id_mapping["old_text"],
+                ],
+                how="left",
+            )
+            .withColumn("entry_id", F.coalesce(F.col("old_id"), F.col("entry_id")))
+            .drop(
+                "_map_pub",
+                "_map_y",
+                "_map_m",
+                "_map_d",
+                "_map_ed",
+                "old_text",
+                "old_id",
+            )
+        )
+
+        new_texts = incoming.select(*group_keys, "parsed_text")
+        existing_kept = existing_in_batch.join(
+            new_texts, on=group_keys + ["parsed_text"], how="left_anti"
+        )
+        replaced = existing_in_batch.join(
+            new_texts, on=group_keys + ["parsed_text"], how="inner"
+        )
+
+        incoming_u, existing_u = _align_for_union_by_name(incoming, existing_kept)
+        merged = incoming_u.unionByName(existing_u, allowMissingColumns=True)
+        return merged.drop(*_RAW_GROUP_KEY_COLS), replaced.drop(*_RAW_GROUP_KEY_COLS)
+
+    def _write_raw_partitions_fast(self, merged_df, base_path: str):
+        staging_path = f"{base_path.rstrip('/')}/_fast_ingest_staging"
+        fs_ex = self._hadoop_fs_executor()
+        if fs_ex.path_exists(staging_path):
+            fs_ex.delete(staging_path, recursive=True)
+
+        out = (
+            merged_df.withColumn("_pub", F.lower(F.col("publication_name")))
+            .withColumn(
+                "_y", F.format_string("%04d", F.col("publication_date_year").cast("int"))
+            )
+            .withColumn(
+                "_m", F.format_string("%02d", F.col("publication_date_month").cast("int"))
+            )
+            .withColumn(
+                "_d", F.format_string("%02d", F.col("publication_date_day").cast("int"))
+            )
+            .withColumn("_ed", F.lower(F.col("publication_edition")))
+        )
+        (
+            out.repartition(*_RAW_PARTITION_COLS)
+            .write.mode("overwrite")
+            .partitionBy(*_RAW_PARTITION_COLS)
+            .json(staging_path)
+        )
+        self._promote_staged_json_partitions(fs_ex, staging_path, base_path)
+        if fs_ex.path_exists(staging_path):
+            fs_ex.delete(staging_path, recursive=True)
+
+    def _hadoop_fs_executor(self) -> FileSystemTaskExecutor:
+        fs_ex = FileSystemTaskExecutor(self.get_configuration())
+        if fs_ex.spark is None:
+            fs_ex.spark = self.spark
+        if fs_ex._jvm is None or fs_ex._fs is None:
+            fs_ex._fs = fs_ex._init_fs()
+        return fs_ex
+
+    def _promote_staged_json_partitions(
+        self, fs_ex: FileSystemTaskExecutor, staging_path: str, base_path: str
+    ):
+        """Move Spark partition dirs ``_pub=x/_y=yyyy/...`` to canonical ``x/yyyy/...`` via Hadoop FS."""
+        leaf_dirs = self._list_staging_leaf_dirs(fs_ex, staging_path)
+        staging_prefix = staging_path.rstrip("/") + "/"
+        base_prefix = base_path.rstrip("/")
+
+        for leaf in leaf_dirs:
+            leaf_norm = leaf.rstrip("/")
+            if not leaf_norm.startswith(staging_prefix.rstrip("/")):
+                # Handle URI forms where toString() may differ slightly; compare by path tail.
+                rel = leaf_norm.split("_fast_ingest_staging/", 1)[-1]
+            else:
+                rel = leaf_norm[len(staging_prefix) :]
+
+            parts = []
+            skip = False
+            for segment in rel.split("/"):
+                if not segment:
+                    continue
+                if "=" not in segment:
+                    skip = True
+                    break
+                parts.append(segment.split("=", 1)[1])
+            if skip or not parts:
+                logger.warning("Skipping unexpected staging path during promote: %s", leaf)
+                continue
+
+            dest = f"{base_prefix}/{'/'.join(parts)}"
+            parent = dest.rsplit("/", 1)[0]
+            fs_ex.mkdirs(parent)
+            if fs_ex.path_exists(dest):
+                fs_ex.delete(dest, recursive=True)
+            if not fs_ex.rename(leaf_norm, dest):
+                raise RuntimeError(f"Failed to promote staging partition {leaf_norm} -> {dest}")
+
+    def _list_staging_leaf_dirs(self, fs_ex: FileSystemTaskExecutor, staging_path: str) -> list[str]:
+        """Return staging directories that contain Spark ``part-*`` data files."""
+        leaves: list[str] = []
+
+        def walk(path_str: str) -> None:
+            statuses = fs_ex.list_status(path_str)
+            has_part = False
+            subdirs: list[str] = []
+            for st in statuses:
+                name = st.getPath().getName()
+                child = st.getPath().toString()
+                if st.isDirectory():
+                    subdirs.append(child)
+                elif name.startswith("part-"):
+                    has_part = True
+            if has_part:
+                leaves.append(path_str.rstrip("/"))
+                return
+            for sub in subdirs:
+                walk(sub)
+
+        if fs_ex.path_exists(staging_path):
+            walk(staging_path)
+        return leaves
+
+    def _log_duplicates_batch(
+        self,
+        duplicates_df,
+        source_path: str,
+        source_version: int,
+        target_path: str,
+        uploaded_by: str | None,
+    ):
+        if duplicates_df is None or duplicates_df.limit(1).count() == 0:
+            return
+
+        metadata = DataLakeMetadataManager(self.get_configuration())
+        dup_base = metadata._resolve_path("metadata/duplicates_records")
+        (
+            duplicates_df.write.partitionBy(
+                "publication_name",
+                "publication_date_year",
+                "publication_date_month",
+                "publication_date_day",
+                "publication_edition",
+            )
+            .mode("append")
+            .format(metadata.format)
+            .save(dup_base)
+        )
+        num_dups = duplicates_df.count()
+        # Avoid collecting thousands of ids into the driver; keep a short sample.
+        sample_ids = [
+            r["entry_id"]
+            for r in duplicates_df.select("entry_id").limit(100).collect()
+        ]
+        entry = Row(
+            log_id=str(uuid.uuid4()),
+            timestamp=datetime.datetime.now(datetime.timezone.utc).isoformat(),
+            process=self.transformer_name,
+            stage=self.current_process_level,
+            source_path=metadata._resolve_relative_path(source_path),
+            source_version=source_version,
+            target_path=metadata._resolve_relative_path(target_path),
+            target_version=-1,
+            action=DataLakeMetadataManager.DELETE_DUPLICATES_ACTION,
+            publication="*",
+            date="*",
+            edition="*",
+            uploaded_by=uploaded_by,
+            duplicates=num_dups,
+            duplicate_ids=sample_ids,
+            duplicates_filter="fast_save_raw_data batch",
+        )
+        metadata._write_log([entry], "duplicates_log", partitionBy=("publication",))
 
     def _update_state(self, *container_path, df, key_name: str = "entry_id", value: bool = False):
         return super()._update_state(*container_path, df=df, key_name="entry_id",value=False)
@@ -670,12 +1091,35 @@ class BoatFactIngestion(NewsExtractionIngestion):
             cp = (self.__container_path,)
         return super().ingest(*cp, local_path=local_path, user=user)
 
+    def ingest_fast(self, *container_path, local_path: str, user: str):
+        if len(container_path) > 0:
+            cp = container_path
+        else:
+            cp = (self.__container_path,)
+        return super().ingest_fast(*cp, local_path=local_path, user=user)
+
     def save_raw_data(self, *container_path, data: dict | list = None, user:str = None, source_path: str = None, **kwargs):
         if len(container_path) > 0:
             cp = container_path
         else:
             cp = (self.__container_path,)
         return super().save_raw_data(*cp, user=user, data=data, source_path=source_path, **kwargs)
+
+    def fast_save_raw_data(
+        self,
+        *container_path,
+        data: dict | list = None,
+        user: str = None,
+        source_path: str = None,
+        **kwargs,
+    ):
+        if len(container_path) > 0:
+            cp = container_path
+        else:
+            cp = (self.__container_path,)
+        return super().fast_save_raw_data(
+            *cp, user=user, data=data, source_path=source_path, **kwargs
+        )
 
     def read_raw_data(self, *container_path, publication_name: str = None, y: int | str = None, m: int | str = None, d: int | str = None,
                       edition: str = None, user: str = None, **kwargs):
