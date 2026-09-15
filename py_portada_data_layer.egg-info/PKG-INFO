@@ -1,6 +1,6 @@
 Metadata-Version: 2.4
 Name: py_portada_data_layer
-Version: 0.2.15
+Version: 0.2.16
 Summary: Data layer for portada project for ETL process
 Home-page: https://github.com/portada-git/py_portada_data_layer
 Author: PortADa team
@@ -14,6 +14,14 @@ Requires-Dist: hdfs==2.7.0
 Requires-Dist: py4j
 Requires-Dist: pyyaml
 Requires-Dist: xmltodict
+Requires-Dist: redis
+Requires-Dist: text2vec
+Requires-Dist: sentence_transformers
+Requires-Dist: torch
+Requires-Dist: transformers
+Requires-Dist: splink[spark]>=4.0.0
+Requires-Dist: phonetics>=1.0.5
+Requires-Dist: fasttext-wheel>=0.9.2
 Dynamic: author
 Dynamic: author-email
 Dynamic: home-page

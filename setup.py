@@ -1,7 +1,7 @@
 from setuptools import setup
 
 setup(name='py_portada_data_layer',
-      version='0.2.15',
+      version='0.2.16',
       description='Data layer for portada project for ETL process',
       author='PortADa team',
       author_email='jcbportada@gmail.com',
@@ -16,6 +16,14 @@ setup(name='py_portada_data_layer',
         'py4j',
         'pyyaml',
         'xmltodict',
+        'redis',
+        'text2vec',
+        'sentence_transformers',
+        'torch',
+        'transformers',
+        'splink[spark]>=4.0.0',
+        'phonetics>=1.0.5',
+        'fasttext-wheel>=0.9.2'
       ],
       python_requires='>=3.12',
       zip_safe=False)
