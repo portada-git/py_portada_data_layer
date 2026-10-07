@@ -1,12 +1,12 @@
 Metadata-Version: 2.4
 Name: py_portada_data_layer
-Version: 0.3.1
+Version: 0.3.2
 Summary: Data layer for portada project for ETL process
 Home-page: https://github.com/portada-git/py_portada_data_layer
 Author: PortADa team
 Author-email: jcbportada@gmail.com
 License: MIT
-Requires-Python: >=3.12
+Requires-Python: >=3.10
 License-File: LICENSE
 Requires-Dist: pyspark==3.5.8
 Requires-Dist: delta-spark==3.2.1
