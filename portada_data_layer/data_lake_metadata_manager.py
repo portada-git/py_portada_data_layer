@@ -117,18 +117,20 @@ def __is_data_transformer(func, data_layer_key: str=None, dataframe_key: str = "
 
         resultat = func(*args, **kwargs)
 
+        # Do not call DataFrame.count() here: it materializes the full Spark plan and can
+        # hang on heavy transformers (e.g. delete_if_from_schema returning kept + deleted ids).
+        # Keep num_records=-1 unless the method sets it via log_process_info["num_records"].
         if isinstance(resultat, DataFrame):
             dataframes = [TracedDataFrame(resultat, table_name="UNKNOWN", transformer_name=previous_transformer_name)]
-            num_records = resultat.count()
-        if isinstance(resultat, TracedDataFrame):
+        elif isinstance(resultat, TracedDataFrame):
             dataframes = [resultat]
-            num_records = resultat.count()
         elif isinstance(resultat, (list, tuple)):
-            if len(resultat) >0 and isinstance(resultat[0], (DataFrame, TracedDataFrame)):
-                dataframes = [r if isinstance(r, TracedDataFrame) else TracedDataFrame(r, table_name="UNKNOWN", transformer_name=previous_transformer_name) for r in resultat]
-                num_records =0
-                for r in dataframes:
-                    num_records += dataframes[0].count()
+            if len(resultat) > 0 and isinstance(resultat[0], (DataFrame, TracedDataFrame)):
+                dataframes = [
+                    r if isinstance(r, TracedDataFrame)
+                    else TracedDataFrame(r, table_name="UNKNOWN", transformer_name=previous_transformer_name)
+                    for r in resultat
+                ]
             else:
                 num_records = len(resultat)
         final = datetime.now(UTC)

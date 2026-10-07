@@ -4,6 +4,7 @@ import random
 from delta import configure_spark_with_delta_pip
 from pyspark.sql import SparkSession, DataFrame
 from pyspark.sql import functions as F
+from pyspark.sql.types import StringType, StructField, StructType
 from delta.tables import DeltaTable
 from py4j.java_gateway import java_import
 from datetime import datetime
@@ -694,6 +695,60 @@ class DeltaDataLayer(BaseDeltaDataLayer):
         ret["_use_redis_metadata"] = self._use_redis_metadata
         return ret
 
+    def _save_log_storage(self, df: DataFrame | TracedDataFrame, path: str, mode: str = "overwrite"):
+        target_path = self._resolve_relative_path(path)
+        table_path = self._resolve_relative_path(path, contains_process_level=True, contains_project_name=True)
+        if isinstance(df, TracedDataFrame):
+            tn = df.table_name
+            source_path = df.df_name
+            source_version = df.df_version
+            df_name = df.name
+            df_large_name = df.large_name
+            original_df = df.toSparkDataFrame()
+        else:
+            tn = table_path
+            source_path = "UNKNOWN"
+            source_version = -1
+            original_df = df
+            df_name = "UNKNOWN"
+            df_large_name = "UNKNOWN"
+            df = TracedDataFrame(df, table_name=tn, df_name=source_path, df_version=source_version)
+
+        if self.log_storage or self._save_lineage_on_store or df.save_lineage_on_store:
+            if hasattr(self, "metadata"):
+                metadata = self.metadata
+            else:
+                from portada_data_layer.data_lake_metadata_manager import DataLakeMetadataManager
+                metadata = DataLakeMetadataManager(self.get_configuration())
+            if not self._transformer_process_name:
+                prev_tr_name = self._transformer_process_name
+                self._transformer_process_name = inspect.currentframe().f_back.f_code.co_name
+            else:
+                prev_tr_name = None
+
+            l_id = metadata.log_storage(
+                data_layer=self,
+                num_records=original_df.count(),
+                mode=mode,
+                new=not self.path_exists(path),
+                table_name=tn,
+                df_name=df_name,
+                df_large_name=df_large_name,
+                source_path=source_path,
+                source_version=source_version,
+                target_path=target_path,
+                target_version=-1,
+            )
+            if self._save_lineage_on_store or df.save_lineage_on_store:
+                metadata.log_field_lineage(
+                    data_layer=self,
+                    dataframe=df,
+                    stored_log_id=l_id
+                )
+
+            if prev_tr_name is not None:
+                self._transformer_process_name = prev_tr_name
+
     def write_json(self, *table_path, df: DataFrame | TracedDataFrame, mode: str = "overwrite",
                    process_level_dir: str = None, has_extension=False):
         """
@@ -869,6 +924,52 @@ class DeltaDataLayer(BaseDeltaDataLayer):
                 self._transformer_process_name = prev_tr_name
 
         return TracedDataFrame(original_df, table_name=tn, df_name=target_path, df_version=version)
+
+    def delete_delta_from_ids(self, *table_path, ids, key_id_name: str = "entry_id"):
+        """
+        Delete rows from a Delta table whose key column matches the given ids.
+
+        :param table_path: same path forms as ``write_delta``
+        :param ids: DataFrame/TracedDataFrame with ``key_id_name``, or a list/tuple of id values
+        :param key_id_name: name of the key column used for the delete match
+        """
+        if not self.is_delta_table(*table_path):
+            logger.info("delete_delta_from_ids: target is not a Delta table; skipping")
+            return
+
+        if ids is None:
+            return
+
+        if isinstance(ids, TracedDataFrame):
+            ids_df = ids.toSparkDataFrame()
+        elif isinstance(ids, DataFrame):
+            ids_df = ids
+        elif isinstance(ids, (list, tuple, set)):
+            id_list = list(ids)
+            if not id_list:
+                return
+            ids_df = self.spark.createDataFrame(
+                [(v,) for v in id_list],
+                schema=StructType([StructField(key_id_name, StringType(), True)]),
+            )
+        else:
+            raise TypeError(
+                f"ids must be a DataFrame, TracedDataFrame, or list/tuple/set; got {type(ids)}"
+            )
+
+        if key_id_name not in ids_df.columns:
+            raise ValueError(f"ids DataFrame must contain column '{key_id_name}'")
+
+        ids_df = ids_df.select(key_id_name).distinct().dropna()
+        if not ids_df.head(1):
+            return
+
+        delta_table = self.get_delta_table(*table_path)
+        delta_table.alias("t").merge(
+            ids_df.alias("d"),
+            f"t.{key_id_name} = d.{key_id_name}",
+        ).whenMatchedDelete().execute()
+        logger.info(f"Deleted matching rows from Delta → {self._resolve_relative_path(self._resolve_path(*table_path))}")
 
     def read_json(self, *table_path, process_level_dir=None, has_extension=False) -> TracedDataFrame:
         """
@@ -1140,13 +1241,24 @@ class FileSystemTaskExecutor(BaseDeltaDataLayer):
         """
         return self.path_exists(f"{path}/_delta_log")
 
-    def is_json_type(self, path: str):
+    def is_json_type(self, path: str) -> bool:
         """
         Checks if a file exists for any protocol supported by Hadoop and is a json type saved by spark.
         :param path: path to check as string
         :return: True o False if *container_path exists
         """
-        return self.path_exists(f"{path}/_SUCCESS")
+        # return self.path_exists(f"{path}/_SUCCESS")
+        return self.has_file_extension(path, "json")
+
+    def has_file_extension(self, base_path: str, extension: str):
+        fs = self._fs_for_path(base_path)
+        path = self._jvm.org.apache.hadoop.fs.Path(base_path)
+        status = fs.listStatus(path)
+        ret = False
+        for f in status:
+            ext = f.getPath().getName().split(".")[-1]
+            ret = ret or ext == extension
+        return ret
 
     def subdirs_list(self, base_path: str):
         """

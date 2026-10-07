@@ -47,28 +47,94 @@ class PortadaCleaning(DeltaDataLayer):
     def fill_with_schema(self, df: TracedDataFrame) -> TracedDataFrame:
         """
         Fill field content from other columns according to the 'fill_with' specs
-        in the JSON schema_path (replace, replace_if_not_exist, add_array_item, add_all_items).
+        in the JSON schema_path (replace, replace_if_not_exist, add_array_item,
+        add_all_items, add_array_from_list).
+
+        Specs with ``"lazy": true`` run in a second pass after all non-lazy specs,
+        so a later field can consume a value before another field's lazy rule mutates it.
         """
         if self._schema is None:
             raise ValueError("Must call use_schema() before.")
         props = self._schema_properties(self._schema)
+        eager_jobs = []
+        lazy_jobs = []
         for field_name, field_schema in props.items():
             fill_with = field_schema.get("fill_with")
             if fill_with is None:
                 continue
-            if isinstance(fill_with, list):
-                for spec in fill_with:
-                    if isinstance(spec, dict):
-                        df = self._fill_apply_one(df, field_name, field_schema, spec)
-            elif isinstance(fill_with, dict):
-                df = self._fill_apply_one(df, field_name, field_schema, fill_with)
+            specs = fill_with if isinstance(fill_with, list) else [fill_with]
+            for spec in specs:
+                if not isinstance(spec, dict):
+                    continue
+                job = (field_name, field_schema, spec)
+                if spec.get("lazy"):
+                    lazy_jobs.append(job)
+                else:
+                    eager_jobs.append(job)
+        for field_name, field_schema, spec in eager_jobs + lazy_jobs:
+            df = self._fill_apply_one(df, field_name, field_schema, spec)
         return df
+
+    def _empty_entry_ids_df(self) -> DataFrame:
+        """Return an empty DataFrame with a single ``entry_id`` string column."""
+        return self.spark.createDataFrame(
+            [],
+            schema=StructType([StructField("entry_id", StringType(), True)]),
+        )
+
+    @data_transformer_method(description="drop rows matching schema_path delete_if conditions")
+    def delete_if_from_schema(self, df: TracedDataFrame) -> tuple[TracedDataFrame, DataFrame]:
+        """
+        Drop rows that match the root-level ``delete_if`` condition(s) in the JSON schema.
+
+        ``delete_if`` uses the same condition format as ``fill_with`` (string SQL,
+        structured column/op/value, expr, and/or). It may be a single condition or
+        a list; if a list, a row is dropped when any condition matches (OR).
+
+        Null condition results are treated as False (rows with null predicate are kept).
+
+        :return: ``(df_kept, deleted_ids_df)`` where ``deleted_ids_df`` has distinct ``entry_id``.
+        """
+        if self._schema is None:
+            raise ValueError("Must call use_schema() before.")
+        schema_to_use, _ = self.get_schema_and_properties(self._schema)
+        delete_if = schema_to_use.get("delete_if")
+        if delete_if is None:
+            return df, self._empty_entry_ids_df()
+
+        specs = delete_if if isinstance(delete_if, list) else [delete_if]
+        existing_columns = set(df.columns)
+        to_delete = F.lit(False)
+        any_spec_applied = False
+        for spec in specs:
+            if spec is None:
+                continue
+            if not isinstance(spec, (dict, str)):
+                continue
+            required_columns = self._fill_required_columns_from_condition(spec)
+            if required_columns and not required_columns.issubset(existing_columns):
+                continue
+            cond_expr = self._fill_condition_expr(spec)
+            to_delete = to_delete | F.coalesce(cond_expr, F.lit(False))
+            any_spec_applied = True
+
+        if not any_spec_applied:
+            return df, self._empty_entry_ids_df()
+
+        df_deleted = df.filter(to_delete)
+        df_kept = df.filter(~to_delete)
+        if "entry_id" in existing_columns:
+            deleted_ids_df = df_deleted.select("entry_id").distinct()
+        else:
+            deleted_ids_df = self._empty_entry_ids_df()
+        return df_kept, deleted_ids_df
 
     @data_transformer_method(description="calculate null fields from schema_path calculable_if_null")
     def calculate_from_schema(self, df: TracedDataFrame) -> TracedDataFrame:
         """
-        For each field in the schema_path that has 'calculable_if_null', if the field is null or missing,
-        set it to the result of the defined operation (decrement_data or data_difference).
+        For each field in the schema_path that has 'calculable_if_null', if the field is null,
+        missing, or blank (empty/whitespace string), set it to the result of the defined
+        operation (decrement_data or data_difference).
         """
         if self._schema is None:
             raise ValueError("Must call use_schema() before.")
@@ -90,9 +156,13 @@ class PortadaCleaning(DeltaDataLayer):
             if field_name not in df.columns:
                 df = df.withColumn(field_name, computed)
             else:
+                col = F.col(field_name)
+                # Empty string is not Spark null; treat blank as missing so calculable_if_null runs
+                # after fill_with that clears invalid values with LIT('').
+                is_missing = col.isNull() | (F.trim(col.cast("string")) == "")
                 df = df.withColumn(
                     field_name,
-                    F.when(F.col(field_name).isNull(), computed).otherwise(F.col(field_name)),
+                    F.when(is_missing, computed).otherwise(col),
                 )
         return df
 
@@ -172,6 +242,9 @@ class PortadaCleaning(DeltaDataLayer):
             self._update_state(*container_path, df=entries_df, key_name=key_id_name)
         return entries_df
 
+    def delete_entries_by_ids(self, *container_path, ids, key_id_name: str):
+        """Delete rows from the Delta table at ``container_path`` whose key is in ``ids``."""
+        self.delete_delta_from_ids(*container_path, ids=ids, key_id_name=key_id_name)
 
     @data_transformer_method()
     def normalize_field_structure(self, df: TracedDataFrame) -> TracedDataFrame:
@@ -1015,6 +1088,8 @@ class PortadaCleaning(DeltaDataLayer):
         #     df = self.save_original_values_of_ship_entries(df)
         # 4.- For null fields, fill fields from schema_path instructions
         df = self.fill_with_schema(df)
+        # 4b.- Drop rows matching schema_path delete_if conditions
+        df, _deleted_ids = self.delete_if_from_schema(df)
         # 5.- prune unaccepted fields
         df = self.prune_unaccepted_fields(df)
         # 6.- simplify field structure with single values for original fields
@@ -1044,7 +1119,7 @@ class PortadaCleaning(DeltaDataLayer):
             schema = schema["schema_path"]
         properties = schema.get("properties", {})
         return schema, properties
-    
+
     @staticmethod
     def get_schema_root(schema: dict) -> dict:
         """Resolve schema_path root and return the 'properties' dict (field name -> field schema_path)."""
@@ -1349,6 +1424,10 @@ class PortadaCleaning(DeltaDataLayer):
             m = transform_mapping_with_params(m.get("not_paragraph_map", {}), params)
             return change_chars(c, m)
 
+        def not_parenthesis(c, m: dict = None, params: dict = None):
+            m = transform_mapping_with_params(m.get("not_parenthesis", {}), params)
+            return change_chars(c, m)
+
         params_for_cleaning_list = []
         alg_for_cleaning_list = []
         for item in for_cleaning_list:
@@ -1366,7 +1445,7 @@ class PortadaCleaning(DeltaDataLayer):
         else:
             params = None
 
-        processes = {"one_word": one_word, "not_digits": not_digit}
+        processes = {"one_word": one_word, "not_digits": not_digit, "not_parenthesis": not_parenthesis}
         if "paragraph" in alg_for_cleaning_list or "not_cleanable" in alg_for_cleaning_list:
             expr = col
         elif "accepted_abbreviations" in alg_for_cleaning_list or "accepted_idem" in alg_for_cleaning_list:
@@ -1675,7 +1754,7 @@ class PortadaCleaning(DeltaDataLayer):
         return out
 
     def _fill_apply_one(self, df: TracedDataFrame, field_name: str, field_schema: dict, spec: dict) -> TracedDataFrame:
-        """Apply a single fill_with spec (replace, replace_if_not_exist, add_array_item, add_all_items)."""
+        """Apply a single fill_with spec (replace, replace_if_not_exist, add_array_item, add_all_items, add_array_from_list)."""
         fill_type = spec.get("type", "replace")
         from_ref = spec.get("from")
         to_ref = spec.get("to", field_name)
@@ -1758,7 +1837,69 @@ class PortadaCleaning(DeltaDataLayer):
             )
             df = df.withColumn(field_name, F.when(cond_expr, new_array).otherwise(current))
 
+        elif fill_type == "add_array_from_list":
+            list_col = self._fill_resolve_from(from_ref)
+            new_items = self._fill_build_items_from_scalar_list(
+                field_schema, list_col, spec.get("to")
+            )
+            if new_items is None:
+                return df
+            try:
+                current_dtype = df.schema[field_name].dataType
+                if isinstance(current_dtype, ArrayType):
+                    new_items = new_items.cast(current_dtype)
+                    empty_arr = F.array().cast(current_dtype)
+                else:
+                    empty_arr = F.array()
+            except Exception:
+                empty_arr = F.array()
+            new_array = F.concat(F.coalesce(current, empty_arr), new_items)
+            df = df.withColumn(field_name, F.when(cond_expr, new_array).otherwise(current))
+
         return df
+
+    def _fill_build_items_from_scalar_list(
+        self, parent_schema: dict, list_col: F.Column, to_ref
+    ) -> F.Column | None:
+        """
+        Map each scalar in list_col to an array item struct.
+
+        ``to`` names which item property receives the scalar; other item properties
+        from the JSON schema are set to null.
+        """
+        items_schema = parent_schema.get("items", {}) if parent_schema else {}
+        item_props = items_schema.get("properties", {}) if isinstance(items_schema, dict) else {}
+        if not item_props:
+            return None
+
+        if to_ref is None:
+            to_fields = [next(iter(item_props.keys()))]
+        elif isinstance(to_ref, list):
+            to_fields = [t for t in to_ref if t]
+        elif isinstance(to_ref, str) and to_ref.strip():
+            to_fields = [to_ref.strip()]
+        else:
+            to_fields = [next(iter(item_props.keys()))]
+
+        if len(to_fields) != 1:
+            # v1: only a single target property per scalar element is supported
+            logger.warning(
+                "add_array_from_list supports a single 'to' field; got %s", to_fields
+            )
+            to_fields = to_fields[:1]
+
+        target_prop = to_fields[0]
+
+        def _item_struct(x: F.Column) -> F.Column:
+            fields = []
+            for prop_name in item_props.keys():
+                if prop_name == target_prop:
+                    fields.append(x.cast("string").alias(prop_name))
+                else:
+                    fields.append(F.lit(None).cast("string").alias(prop_name))
+            return F.struct(*fields)
+
+        return F.transform(list_col, _item_struct)
 
     def _fill_build_array_item_expr(self, parent_field: str, parent_schema: dict, spec: dict) -> F.Column:
         """
@@ -1824,22 +1965,35 @@ class PortadaCleaning(DeltaDataLayer):
         """
         Compute date = origin_date - decrement in decrement_unit.
         parameters: origin_date, decrement, decrement_unit (each string column name, LIT(...), or {type, value}).
-        Unit: 'd'/'days' -> days; 'h'/'hours' -> hours.
+        Unit is chosen by the first letter of the trimmed/lowercased unit string:
+        starts with 'h' -> hours; starts with 'd' -> days; otherwise days.
         """
         origin_col = PortadaCleaning._calc_resolve_param(params.get("origin_date"))
         decrement_col = PortadaCleaning._calc_resolve_param(params.get("decrement"))
         unit_col = PortadaCleaning._calc_resolve_param(params.get("decrement_unit"))
         decrement_int = F.floor(decrement_col).cast("int")
-        # When unit is days (d, days, d.): date_sub
+        # When unit is moths: date_sub
+        month_expr = F.date_sub(origin_col.cast("date"), decrement_int * 30)
+        # When unit is days: date_sub
         days_expr = F.date_sub(origin_col.cast("date"), decrement_int)
         # When unit is hours: timestamp - hours, then cast to date
         hours_expr = F.from_unixtime(
             F.to_timestamp(origin_col.cast("date")).cast("long") - decrement_int * 3600
         ).cast(DateType())
-        unit_lower = F.lower(F.trim(unit_col.cast("string")))
-        return F.when(unit_lower.isin("d", "days", "d."), days_expr).when(
-            unit_lower.isin("h", "hours", "h."), hours_expr
-        ).otherwise(days_expr)
+        # When unit is minutes: timestamp - minutes, then cast to date
+        mins_expr = F.from_unixtime(
+            F.to_timestamp(origin_col.cast("date")).cast("long") - decrement_int * 60
+        ).cast(DateType())
+        unit_norm = F.lower(F.trim(unit_col.cast("string")))
+        return (
+            F.when(unit_norm.startswith("h"), hours_expr)
+            .when(unit_norm.startswith("d"), days_expr)
+            .when(unit_norm.startswith("mes"), month_expr)
+            .when(unit_norm.startswith("mon"), month_expr)
+            .when(unit_norm.startswith("moi"), month_expr)
+            .when(unit_norm.startswith("m"), mins_expr)
+            .otherwise(F.lit(None).cast(DateType()))
+        )
 
     @staticmethod
     def _calc_data_difference(params: dict) -> F.Column:
@@ -1904,6 +2058,10 @@ class BoatFactCleaning(PortadaCleaning, BoatFactCitationExtractor, BoatFactVoice
         if is_cleaned:
             self._update_state(self.__container_path, df=ship_entries_df, key_name="entry_id")
         return ship_entries_df
+
+    def delete_ship_entries_by_ids(self, ids):
+        """Delete ship_entries rows whose ``entry_id`` is in ``ids``."""
+        self.delete_entries_by_ids(self.__container_path, ids=ids, key_id_name="entry_id")
 
     def read_ship_entries(self) -> TracedDataFrame:
         ship_entries_df = self.read_delta(self.__container_path)

@@ -601,6 +601,7 @@ class NewsExtractionIngestion(PortadaIngestion):
             .partitionBy(*_RAW_PARTITION_COLS)
             .json(staging_path)
         )
+        self._save_log_storage(out, base_path)
         self._promote_staged_json_partitions(fs_ex, staging_path, base_path)
         if fs_ex.path_exists(staging_path):
             fs_ex.delete(staging_path, recursive=True)
@@ -700,31 +701,68 @@ class NewsExtractionIngestion(PortadaIngestion):
             .format(metadata.format)
             .save(dup_base)
         )
-        num_dups = duplicates_df.count()
-        # Avoid collecting thousands of ids into the driver; keep a short sample.
-        sample_ids = [
-            r["entry_id"]
-            for r in duplicates_df.select("entry_id").limit(100).collect()
+
+        # One duplicates_log row per publication/date/edition so filtering works
+        # like DataLakeMetadataManager.log_duplicates.
+        group_cols = [
+            "publication_name",
+            "publication_date_year",
+            "publication_date_month",
+            "publication_date_day",
+            "publication_edition",
         ]
-        entry = Row(
-            log_id=str(uuid.uuid4()),
-            timestamp=datetime.datetime.now(datetime.timezone.utc).isoformat(),
-            process=self.transformer_name,
-            stage=self.current_process_level,
-            source_path=metadata._resolve_relative_path(source_path),
-            source_version=source_version,
-            target_path=metadata._resolve_relative_path(target_path),
-            target_version=-1,
-            action=DataLakeMetadataManager.DELETE_DUPLICATES_ACTION,
-            publication="*",
-            date="*",
-            edition="*",
-            uploaded_by=uploaded_by,
-            duplicates=num_dups,
-            duplicate_ids=sample_ids,
-            duplicates_filter="fast_save_raw_data batch",
+        grouped = (
+            duplicates_df.groupBy(*group_cols)
+            .agg(
+                F.count("*").alias("duplicates"),
+                F.collect_list("entry_id").alias("duplicate_ids"),
+            )
+            .collect()
         )
-        metadata._write_log([entry], "duplicates_log", partitionBy=("publication",))
+
+        rel_source = metadata._resolve_relative_path(source_path)
+        rel_target = metadata._resolve_relative_path(target_path)
+        ts = datetime.datetime.now(datetime.timezone.utc).isoformat()
+        entries = []
+        for row in grouped:
+            pub = (row["publication_name"] or "").lower()
+            year = int(row["publication_date_year"])
+            month = int(row["publication_date_month"])
+            day = int(row["publication_date_day"])
+            edition = (row["publication_edition"] or "").lower()
+            dup_ids = list(row["duplicate_ids"] or [])
+            # Cap ids sent to the driver log; keep a short sample per partition.
+            if len(dup_ids) > 100:
+                dup_ids = dup_ids[:100]
+            dup_filter = (
+                f"lower(publication_name)='{pub}' "
+                f"AND publication_date_year={year} "
+                f"AND publication_date_month={month} "
+                f"AND publication_date_day={day} "
+                f"AND lower(publication_edition)='{edition}'"
+            )
+            entries.append(
+                Row(
+                    log_id=str(uuid.uuid4()),
+                    timestamp=ts,
+                    process=self.transformer_name,
+                    stage=self.current_process_level,
+                    source_path=rel_source,
+                    source_version=source_version,
+                    target_path=rel_target,
+                    target_version=-1,
+                    action=DataLakeMetadataManager.DELETE_DUPLICATES_ACTION,
+                    publication=pub,
+                    date=f"{year:04d}-{month:02d}-{day:02d}",
+                    edition=edition,
+                    uploaded_by=uploaded_by,
+                    duplicates=int(row["duplicates"]),
+                    duplicate_ids=dup_ids,
+                    duplicates_filter=dup_filter,
+                )
+            )
+        if entries:
+            metadata._write_log(entries, "duplicates_log", partitionBy=("publication",))
 
     def _update_state(self, *container_path, df, key_name: str = "entry_id", value: bool = False):
         return super()._update_state(*container_path, df=df, key_name="entry_id",value=False)
