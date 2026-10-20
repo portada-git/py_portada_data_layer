@@ -4,7 +4,9 @@ import json
 import os
 import re
 from collections import defaultdict
-from typing import Any, Dict, Iterator, List, Literal, Optional, Self, Tuple, Union
+from typing import Any, Dict, Iterator, List, Literal, Optional, Tuple, Union
+
+from typing_extensions import Self
 
 from pyspark.sql import DataFrame, SparkSession
 from pyspark.sql import functions as F

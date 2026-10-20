@@ -171,13 +171,13 @@ class BoatFactPatcherDataLayer(PortadaPatcherDataLayer):
 
         fs = FileSystemTaskExecutor(self.get_configuration())
         fs.start_session()
-        base_path = f"{self._resolve_path("known_entities", "original_files", process_level_dir=self._process_level_dirs_[self.RAW_PROCESS_LEVEL])}"
-        ingested_file_path = f"{self._resolve_path("ingested_files", "known_entities", process_level_dir=self._process_level_dirs_[self.RAW_PROCESS_LEVEL])}"
+        base_path = f"{self._resolve_path('known_entities', 'original_files', process_level_dir=self._process_level_dirs_[self.RAW_PROCESS_LEVEL])}"
+        ingested_file_path = f"{self._resolve_path('ingested_files', 'known_entities', process_level_dir=self._process_level_dirs_[self.RAW_PROCESS_LEVEL])}"
         if fs.path_exists(base_path):
             fs.rename(f"{base_path}", f"{ingested_file_path}")
 
         base_path = f"{self._resolve_path(self.__container_path, process_level_dir=self._process_level_dirs_[self.RAW_PROCESS_LEVEL])}"
-        ingested_file_path = f"{self._resolve_path("ingested_files", self.__container_path, process_level_dir=self._process_level_dirs_[self.RAW_PROCESS_LEVEL])}"
+        ingested_file_path = f"{self._resolve_path('ingested_files', self.__container_path, process_level_dir=self._process_level_dirs_[self.RAW_PROCESS_LEVEL])}"
 
         if fs.path_exists(base_path):
             dlist = fs.subdirs_list(base_path)
