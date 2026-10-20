@@ -370,10 +370,30 @@ class PortadaCleaning(DeltaDataLayer):
             raise ValueError("Must call use_schema() before.")
         old_suffix = f"_{BoatFactDataModel.EXTRACTION_SOURCE_METHOD_FIELD}"
         new_suffix = f"_{PortadaCleaning.ORIGINAL_DATA_METHOD_FIELD}"
+        bad_suffix = f":_{BoatFactDataModel.DETAILED_VALUE_FIELD}"
+        good_suffix = f"_{BoatFactDataModel.DETAILED_VALUE_FIELD}"
+        bad_char = "_BAD_CHAR"
+        new_names = []
+        to_rename = []
         for col in list(df.columns):
-            if col.endswith(old_suffix):
-                new_name = col[: -len(old_suffix)] + new_suffix
-                df = df.withColumnRenamed(col, new_name)
+            if col.endswith(":"):
+                new_names.append(col[:-1] + bad_char)
+                to_rename.append(new_names[-1])
+            elif col.endswith(f":{old_suffix}"):
+                new_names.append(col[:-(len(old_suffix) + 1)] + new_suffix + bad_char)
+                to_rename.append(new_names[-1])
+            elif col.endswith(old_suffix):
+                new_names.append(col[:-len(old_suffix)] + new_suffix)
+            elif col.endswith(bad_suffix):
+                new_names.append(col[:-len(bad_suffix)] + good_suffix + bad_char)
+                to_rename.append(new_names[-1])
+            else:
+                new_names.append(col)
+        df = df.toDF(*new_names)
+        for col_to_rename in to_rename:
+            nc = col_to_rename[:-len(bad_char)]
+            df = df.withColumn(nc, F.col(col_to_rename))
+            df = df.drop(col_to_rename)
         allowed = self._collect_list_of_fields(self._schema)
         missing_cols = allowed - set(df.columns)
         if missing_cols:
