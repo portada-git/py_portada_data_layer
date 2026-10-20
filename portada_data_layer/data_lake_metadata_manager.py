@@ -4,7 +4,7 @@ from enum import Enum
 
 from delta import DeltaTable
 from pyspark.sql import Row
-from datetime import datetime, UTC
+from datetime import datetime, timezone
 from typing import Optional, List, Dict
 import uuid
 import logging
@@ -95,7 +95,7 @@ def __is_data_transformer(func, data_layer_key: str=None, dataframe_key: str = "
         dataframe = None
         dataframes = []
 
-    inici = datetime.now(UTC)
+    inici = datetime.now(timezone.utc)
     resultat = None
     num_records = -1
     estat = "OK"
@@ -133,7 +133,7 @@ def __is_data_transformer(func, data_layer_key: str=None, dataframe_key: str = "
                 ]
             else:
                 num_records = len(resultat)
-        final = datetime.now(UTC)
+        final = datetime.now(timezone.utc)
         durada = (final - inici).total_seconds()
 
         # Get additional information from the class attribute
@@ -253,7 +253,7 @@ def __is_data_transformer(func, data_layer_key: str=None, dataframe_key: str = "
 #         data_layer = bound.arguments[data_layer_key]
 #     else:
 #         raise Exception(f"Parameter {data_layer_key} is needed")
-#     inici = datetime.now(UTC)
+#     inici = datetime.now(timezone.utc)
 #     resultat = None
 #     num_records = -1
 #     estat = "OK"
@@ -269,7 +269,7 @@ def __is_data_transformer(func, data_layer_key: str=None, dataframe_key: str = "
 #         estat = f"ERROR: {e}"
 #         raise
 #     finally:
-#         final = datetime.now(UTC)
+#         final = datetime.now(timezone.utc)
 #         durada = (final - inici).total_seconds()
 #         process_name = data_layer.transformer_process_name
 #
@@ -542,7 +542,7 @@ class DataLakeMetadataManager(PathConfigDeltaDataLayer):
         log_id =str(uuid.uuid4())
         entry = Row(
             log_id=log_id,
-            timestamp=datetime.now(UTC).isoformat(),
+            timestamp=datetime.now(timezone.utc).isoformat(),
             process=data_layer.transformer_name,
             stage=data_layer.current_process_level,
             table_name=table_name,
@@ -597,7 +597,7 @@ class DataLakeMetadataManager(PathConfigDeltaDataLayer):
         log_id = str(uuid.uuid4())
         entry = Row(
             log_id=log_id,
-            timestamp=datetime.now(UTC).isoformat(),
+            timestamp=datetime.now(timezone.utc).isoformat(),
             process=data_layer.transformer_name if data_layer else process,
             stage=data_layer.current_process_level if data_layer else -1,
             description=description,
@@ -664,7 +664,7 @@ class DataLakeMetadataManager(PathConfigDeltaDataLayer):
         log_id = str(uuid.uuid4())
         entry = Row(
             log_id=log_id,
-            timestamp=datetime.now(UTC).isoformat(),
+            timestamp=datetime.now(timezone.utc).isoformat(),
             process=data_layer.transformer_name,
             stage=data_layer.current_process_level,
             source_path=self._resolve_relative_path(source_path),
@@ -708,7 +708,7 @@ class DataLakeMetadataManager(PathConfigDeltaDataLayer):
             df_name = dataframe.get_partial_large_name(i)
             entry = Row(
                 log_id= str(uuid.uuid4()),
-                timestamp= datetime.now(UTC).isoformat(),
+                timestamp= datetime.now(timezone.utc).isoformat(),
                 stored_log_id= stored_log_id,
                 transformer_name= dataframe._transformer_name if dataframe._transformer_name else data_layer.transformer_name,
                 transformer_description= dataframe._transformer_description,
@@ -763,7 +763,7 @@ class DataLakeMetadataManager(PathConfigDeltaDataLayer):
         """Record an error or problematic record."""
         entry = Row(
             log_id=str(uuid.uuid4()),
-            timestamp=datetime.now(UTC).isoformat(),
+            timestamp=datetime.now(timezone.utc).isoformat(),
             process=process,
             stage=stage,
             message=message,

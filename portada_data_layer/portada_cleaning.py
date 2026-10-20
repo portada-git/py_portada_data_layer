@@ -28,6 +28,7 @@ FLATTEN_STRINGS_TO = "aaaaaaeeeeiiiiooooouuuuyycn"
 @enable_storage_log_for_class
 @enable_field_lineage_log_for_class
 class PortadaCleaning(DeltaDataLayer):
+    ORIGINAL_DATA_METHOD_FIELD = "original_data_method"
 
     def __init__(self, builder=None, cfg_json: dict = None):
         super().__init__(builder=builder, cfg_json=cfg_json)
@@ -48,7 +49,17 @@ class PortadaCleaning(DeltaDataLayer):
         """
         Fill field content from other columns according to the 'fill_with' specs
         in the JSON schema_path (replace, replace_if_not_exist, add_array_item,
-        add_all_items, add_array_from_list).
+        add_array_from_array, add_array_from_list). ``add_all_items`` is kept as an
+        alias of ``add_array_from_array``.
+
+        Array fill types accept optional ``mode``:
+        ``replace`` (wipe and set), ``replace_null`` (only if current is null),
+        ``append`` (concat). Defaults: ``add_array_from_array`` → ``replace_null``;
+        ``add_array_item`` / ``add_array_from_list`` → ``append``.
+
+        For ``add_array_from_array``, ``to`` may be a list of same-name fields to
+        copy, a dict mapping dest←source field names, or omitted for a full
+        item-by-item copy of ``from``.
 
         Specs with ``"lazy": true`` run in a second pass after all non-lazy specs,
         so a later field can consume a value before another field's lazy rule mutates it.
@@ -246,33 +257,86 @@ class PortadaCleaning(DeltaDataLayer):
         """Delete rows from the Delta table at ``container_path`` whose key is in ``ids``."""
         self.delete_delta_from_ids(*container_path, ids=ids, key_id_name=key_id_name)
 
-    @data_transformer_method()
-    def normalize_field_structure(self, df: TracedDataFrame) -> TracedDataFrame:
+    def _normalize_field_structure(self, df: TracedDataFrame) -> TracedDataFrame:
         """
-        Normalize the structure of a DataFrame according to the schema_path.
+        Normalize DataFrame column structures according to the schema_path.
 
-        This method iterates over the properties of the schema_path and builds an expression
-        to normalize the structure of the corresponding column in the DataFrame.
-
-        For example, if the schema_path defines a struct field "address" with two fields "street"
-        and "city", this method ensures that all rows comply with the structure.
-
-        :param df: The DataFrame to normalize
-        :return: A new DataFrame with the normalized structure
+        Iterates schema properties and builds an expression per column so rows
+        comply with the declared structure (e.g. struct fields street/city).
         """
         if self._schema is None:
             raise ValueError("Must call use_schema() before.")
-        final_expressions = {}
         properties = self._schema.get("properties", {})
         selects = []
         for col in df.columns:
             if col not in properties:
                 selects.append(F.col(col).alias(col))
         for field_name, field_schema in properties.items():
-            # Get the full expression for the column (simple, struct or array)
             expr = self._build_normalize_expr(F.col(field_name), field_schema)
             selects.append(expr.alias(field_name))
         return df.select(*selects)
+
+    def _simplify_field_structure(self, df):
+        """
+        Collapse extraction-metadata columns into ``{field}_original_value``
+        and drop ``*_detailed_value`` / ``*_original_data_method``.
+        """
+        detailed_cols = [c for c in df.columns if c.endswith(BoatFactDataModel.DETAILED_VALUE_FIELD)]
+        base_fields = [c.replace(f"_{BoatFactDataModel.DETAILED_VALUE_FIELD}", "") for c in detailed_cols]
+
+        cleaned_df = df
+
+        for field in base_fields:
+            detailed_col = f"{field}_{BoatFactDataModel.DETAILED_VALUE_FIELD}"
+            source_method_col = f"{field}_{PortadaCleaning.ORIGINAL_DATA_METHOD_FIELD}"
+            original_val_col = f"{field}_original_value"
+
+            detailed_field_type = cleaned_df.schema[detailed_col].dataType
+
+            # If not StructType (e.g. NullType), fallback to the base field value.
+            if not isinstance(detailed_field_type, StructType):
+                cleaned_df = cleaned_df.withColumn(original_val_col, F.col(field))
+                cols_to_drop = [c for c in [detailed_col, source_method_col] if c in cleaned_df.columns]
+                cleaned_df = cleaned_df.drop(*cols_to_drop)
+                continue
+
+            available_subfields = [f.name for f in detailed_field_type.fields]
+            target_schema = cleaned_df.schema[field].dataType
+
+            if source_method_col in cleaned_df.columns:
+                conditions = None
+                for method_type in [BoatFactDataModel.CALCULATED_VALUE_FIELD,
+                                    BoatFactDataModel.ORIGINAL_VALUE_FIELD,
+                                    BoatFactDataModel.DEFAULT_VALUE_FIELD]:
+                    if method_type in available_subfields:
+                        if conditions is None:
+                            conditions = F.when(F.col(source_method_col) == method_type,
+                                                F.col(f"{detailed_col}.{method_type}"))
+                        else:
+                            conditions = conditions.when(F.col(source_method_col) == method_type,
+                                                         F.col(f"{detailed_col}.{method_type}"))
+                json_string_col = conditions if conditions is not None else F.lit(None)
+            else:
+                priority_list = [
+                    F.col(f"{detailed_col}.{m}")
+                    for m in [BoatFactDataModel.CALCULATED_VALUE_FIELD,
+                              BoatFactDataModel.ORIGINAL_VALUE_FIELD,
+                              BoatFactDataModel.DEFAULT_VALUE_FIELD]
+                    if m in available_subfields
+                ]
+                json_string_col = F.coalesce(*priority_list) if priority_list else F.lit(None)
+
+            if isinstance(target_schema, (StructType, ArrayType)):
+                extracted_col = F.from_json(json_string_col, target_schema)
+                final_col = F.coalesce(extracted_col, F.col(field))
+            else:
+                final_col = F.coalesce(json_string_col.cast(target_schema), F.col(field))
+
+            cleaned_df = cleaned_df.withColumn(original_val_col, final_col)
+            cols_to_drop = [c for c in [detailed_col, source_method_col] if c in cleaned_df.columns]
+            cleaned_df = cleaned_df.drop(*cols_to_drop)
+
+        return cleaned_df
 
     @data_transformer_method()
     def clean_field_values_from_schema(self, df: TracedDataFrame) -> TracedDataFrame:
@@ -291,108 +355,53 @@ class PortadaCleaning(DeltaDataLayer):
             df = df.withColumn(field_name, expr)
         return df
 
-    @data_transformer_method(description="add schema_path fields that are missing in the dataframe")
+    @data_transformer_method(
+        description="add missing schema fields and normalize column structures"
+    )
     def complete_accepted_structure(self, df: TracedDataFrame) -> TracedDataFrame:
-        """Add the 'official' fields defined in the schema_path that are missing from the dataframe (with correct structure)."""
+        """
+        Add missing schema_path fields, then normalize each schema column's
+        structure (former ``normalize_field_structure``).
+
+        Renames ingest ``*_extraction_source_method`` columns to
+        ``*_original_data_method`` before collecting the allowed field list.
+        """
         if self._schema is None:
             raise ValueError("Must call use_schema() before.")
+        old_suffix = f"_{BoatFactDataModel.EXTRACTION_SOURCE_METHOD_FIELD}"
+        new_suffix = f"_{PortadaCleaning.ORIGINAL_DATA_METHOD_FIELD}"
+        for col in list(df.columns):
+            if col.endswith(old_suffix):
+                new_name = col[: -len(old_suffix)] + new_suffix
+                df = df.withColumnRenamed(col, new_name)
         allowed = self._collect_list_of_fields(self._schema)
         missing_cols = allowed - set(df.columns)
-        if not missing_cols:
-            return df
-        cols_to_add = {
-            col: self._expr_for_missing_column(col) for col in missing_cols
-        }
-        return df.withColumns(cols_to_add)
+        if missing_cols:
+            cols_to_add = {
+                col: self._expr_for_missing_column(col) for col in missing_cols
+            }
+            df = df.withColumns(cols_to_add)
+        return self._normalize_field_structure(df)
 
-    @data_transformer_method(description="prune unbelonging model fields")
-    def prune_unaccepted_fields(self, df: TracedDataFrame) -> TracedDataFrame:
-        """Remove dataframe columns that are not in the schema_path (extra columns)."""
+    @data_transformer_method(
+        description="prune unbelonging fields and simplify extraction metadata"
+    )
+    def prune_unaccepted_fields(
+        self, df: TracedDataFrame, simplify_meta_fields: bool = True
+    ) -> TracedDataFrame:
+        """
+        Keep only schema_path columns. When ``simplify_meta_fields`` is True
+        (default), also collapse extraction metadata into ``*_original_value``.
+        When False, skip ``_simplify_field_structure``.
+        """
         if self._schema is None:
             raise ValueError("Must call use_schema() before.")
         allowed = self._collect_list_of_fields(self._schema)
         cols_to_keep = [col for col in df.columns if col in allowed]
-        return df.select(cols_to_keep)
-
-    @data_transformer_method()
-    def simplify_field_structure(self, df):
-        """
-        Simplify extraction-metadata columns using get_json_object
-        to handle complex JSON structures dynamically.
-        """
-
-        # 1. Identifiquem els camps base a partir del sufix "_detailed_value"
-        detailed_cols = [c for c in df.columns if c.endswith(BoatFactDataModel.DETAILED_VALUE_FIELD)]
-        base_fields = [c.replace(f"_{BoatFactDataModel.DETAILED_VALUE_FIELD}", "") for c in detailed_cols]
-
-        cleaned_df = df
-
-        for field in base_fields:
-            detailed_col = f"{field}_{BoatFactDataModel.DETAILED_VALUE_FIELD}"
-            source_method_col = f"{field}_{BoatFactDataModel.EXTRACTION_SOURCE_METHOD_FIELD}"
-            original_val_col = f"{field}_original_value"
-
-             # Get the data type of the detailed column
-            detailed_field_type = cleaned_df.schema[detailed_col].dataType
-
-            # VALIDATION: If the column is not StructType (e.g. NullType),
-            # we cannot extract subfields. Go straight to fallback.
-            if not isinstance(detailed_field_type, StructType):
-                cleaned_df = cleaned_df.withColumn(original_val_col, F.col(field))
-                # Optional: drop empty columns to avoid clutter
-                cols_to_drop = [c for c in [detailed_col, source_method_col] if c in cleaned_df.columns]
-                cleaned_df = cleaned_df.drop(*cols_to_drop)
-                continue
-
-            # 3. We have a real StructType. Get the subfields.
-            available_subfields = [f.name for f in detailed_field_type.fields]
-
-            # 1. Get the schema_path (data type) of the original field for from_json
-            target_schema = cleaned_df.schema[field].dataType
-
-            # 2. Choose which STRUCT field to take (the flattened JSON text)
-            # We access the struct with dot notation (col.field)
-            if source_method_col in cleaned_df.columns:
-                # Dynamic selection: use 'when' to pick struct subfield by method value
-                conditions = None
-                for method_type in [BoatFactDataModel.CALCULATED_VALUE_FIELD,
-                                    BoatFactDataModel.ORIGINAL_VALUE_FIELD,
-                                    BoatFactDataModel.DEFAULT_VALUE_FIELD]:
-                    if method_type in available_subfields:
-                        if conditions is None:
-                            conditions = F.when(F.col(source_method_col) == method_type,
-                                                F.col(f"{detailed_col}.{method_type}"))
-                        else:
-                            conditions = conditions.when(F.col(source_method_col) == method_type,
-                                                         F.col(f"{detailed_col}.{method_type}"))
-                json_string_col = conditions if conditions is not None else F.lit(None)
-            else:
-                # Priority selection (coalesce) when no method column is specified
-                priority_list = [
-                    F.col(f"{detailed_col}.{m}")
-                    for m in [BoatFactDataModel.CALCULATED_VALUE_FIELD,
-                              BoatFactDataModel.ORIGINAL_VALUE_FIELD,
-                              BoatFactDataModel.DEFAULT_VALUE_FIELD]
-                    if m in available_subfields
-                ]
-                json_string_col = F.coalesce(*priority_list) if priority_list else F.lit(None)
-
-            # If the base field is complex (Struct or Array), unflatten the JSON string
-            if isinstance(target_schema, (StructType, ArrayType)):
-                # Try to parse JSON; on failure or null, fallback to current field
-                extracted_col = F.from_json(json_string_col, target_schema)
-                final_col = F.coalesce(extracted_col, F.col(field))
-            else:
-                # Simple field (String, Int...): no from_json needed, just cast and fallback
-                final_col = F.coalesce(json_string_col.cast(target_schema), F.col(field))
-
-            cleaned_df = cleaned_df.withColumn(original_val_col, final_col)
-
-            # 4. Drop metadata columns
-            cols_to_drop = [c for c in [detailed_col, source_method_col] if c in cleaned_df.columns]
-            cleaned_df = cleaned_df.drop(*cols_to_drop)
-
-        return cleaned_df
+        df = df.select(cols_to_keep)
+        if simplify_meta_fields:
+            return self._simplify_field_structure(df)
+        return df
 
     @staticmethod
     def _cast_column_to_schema_type(col_expr: F.Column, spark_type):
@@ -478,6 +487,7 @@ class PortadaCleaning(DeltaDataLayer):
         """
         Converteix els camps actuals (sovint string) al tipus indicat al JSON schema_path.
         Només aplica a camps definits a schema_path.properties i presents al DataFrame.
+        Also stores a typed snapshot of each field as ``{field}_cleaned``.
         """
         if self._schema is None:
             raise ValueError("Must call use_schema() before.")
@@ -491,6 +501,7 @@ class PortadaCleaning(DeltaDataLayer):
                 continue
             casted = PortadaCleaning._cast_column_by_json_schema(F.col(field_name), field_schema)
             df = df.withColumn(field_name, casted)
+            df = df.withColumn(f"{field_name}_cleaned", F.col(field_name))
 
         return df
 
@@ -1079,32 +1090,28 @@ class PortadaCleaning(DeltaDataLayer):
         return df
 
     def cleaning_entries(self, df: DataFrame | TracedDataFrame, saving_original_data: bool = True) -> TracedDataFrame:
-        # 1.- Completar la estructura aceptada sin eliminar campos no aceptados
+        # 1.- Complete accepted structure and normalize field structures
         df = self.complete_accepted_structure(df)
-        # 2.- Normalize structure
-        df = self.normalize_field_structure(df)
-        # 3.- save original values
+        # 2.- save original values
         # if saving_original_data:
         #     df = self.save_original_values_of_ship_entries(df)
-        # 4.- For null fields, fill fields from schema_path instructions
+        # 3.- For null fields, fill fields from schema_path instructions
         df = self.fill_with_schema(df)
-        # 4b.- Drop rows matching schema_path delete_if conditions
+        # 3b.- Drop rows matching schema_path delete_if conditions
         df, _deleted_ids = self.delete_if_from_schema(df)
-        # 5.- prune unaccepted fields
+        # 4.- Prune unaccepted fields and simplify extraction metadata
         df = self.prune_unaccepted_fields(df)
-        # 6.- simplify field structure with single values for original fields
-        df = self.simplify_field_structure(df)
-        # 7.- Resolve idem/id/id. with the value of the predecessor record
+        # 5.- Resolve idem/id/id. with the value of the predecessor record
         df = self.resolve_idems(df)
-        # 8.- Normalize values
+        # 6.- Normalize values
         df = self.clean_field_values_from_schema(df)
-        # 9.- If null or error, calculate values from schema_path instructions
+        # 7.- If null or error, calculate values from schema_path instructions
         df = self.calculate_from_schema(df)
-        # 10.- Convert values form string to corrected type
+        # 8.- Convert values form string to corrected type
         df = self.string_to_type_from_schema(df)
-        # 11.- Normalize string types
+        # 9.- Normalize string types
         # df = self.normalize_strings_for_ship_entries(df)
-        # 12.- Save cleaned values
+        # 10.- Save cleaned values
         # df = self.save_ship_entries(df, is_cleaned=True)
         return df
 
@@ -1139,18 +1146,18 @@ class PortadaCleaning(DeltaDataLayer):
         """
         Build a column expression with the correct Spark type for a missing column.
         - Base fields (in schema_path): type from config/schema_path.json via json_schema_to_spark_type.
-        - <nom_camp>_extraction_source_method: String nullable.
+        - <nom_camp>_original_data_method: String nullable.
         - <nom_camp>_detailed_value: struct(default_value, original_value, calculated_value, boat_fact_model), all string nullable.
         """
         props = self._schema_properties(self._schema)
-        suffix_esm = f"_{BoatFactDataModel.EXTRACTION_SOURCE_METHOD_FIELD}"
+        suffix_odm = f"_{PortadaCleaning.ORIGINAL_DATA_METHOD_FIELD}"
         suffix_dv = f"_{BoatFactDataModel.DETAILED_VALUE_FIELD}"
 
         if col in props:
             field_schema = props[col]
             spark_type, _ = PortadaCleaning.json_schema_to_spark_type(field_schema, primitive_types_as_strings=True)
             return F.lit(None).cast(spark_type).alias(col)
-        if col.endswith(suffix_esm):
+        if col.endswith(suffix_odm):
             return F.lit(None).cast(StringType()).alias(col)
         if col.endswith(suffix_dv):
             detailed_struct = StructType([
@@ -1240,7 +1247,7 @@ class PortadaCleaning(DeltaDataLayer):
             props = schema
         for field_name in props:
             fields.add(field_name)
-            fields.add(f"{field_name}_{BoatFactDataModel.EXTRACTION_SOURCE_METHOD_FIELD}")
+            fields.add(f"{field_name}_{PortadaCleaning.ORIGINAL_DATA_METHOD_FIELD}")
             fields.add(f"{field_name}_{BoatFactDataModel.DETAILED_VALUE_FIELD}")
         return fields
 
@@ -1267,7 +1274,7 @@ class PortadaCleaning(DeltaDataLayer):
         return F.when(looks_like_json, parsed).otherwise(F.lit(None))
 
 
-    ### -------------- used by normalize_field_structure -------------------###
+    ### -------------- used by _normalize_field_structure -------------------###
 
     @staticmethod
     def _resolve_column_path(root_col, ref):
@@ -1753,8 +1760,86 @@ class PortadaCleaning(DeltaDataLayer):
             return out
         return out
 
+    @staticmethod
+    def _fill_apply_array_mode(current: F.Column, new_items: F.Column, mode: str, empty_arr: F.Column) -> F.Column:
+        """
+        Combine current array with new_items according to mode:
+        replace | replace_null | append.
+        """
+        if mode == "replace":
+            return new_items
+        if mode == "replace_null":
+            return F.when(current.isNull(), new_items).otherwise(current)
+        if mode != "append":
+            logger.warning("Unknown array fill mode %r; using append", mode)
+        return F.concat(F.coalesce(current, empty_arr), new_items)
+
+    def _fill_project_struct_array_items(
+        self, from_expr: F.Column, parent_schema: dict, to_ref
+    ) -> F.Column:
+        """
+        Project/remap each struct item in from_expr according to to_ref.
+
+        - None / absent: full item copy (return from_expr unchanged).
+        - list: copy same-name fields; other dest item properties → null.
+        - dict: dest_field → source_field; unmapped dest properties → null.
+        """
+        if to_ref is None:
+            return from_expr
+
+        items_schema = parent_schema.get("items", {}) if parent_schema else {}
+        item_props = items_schema.get("properties", {}) if isinstance(items_schema, dict) else {}
+        if not item_props:
+            return from_expr
+
+        dest_to_src = {}
+        if isinstance(to_ref, dict):
+            for dest_name, src_name in to_ref.items():
+                if dest_name not in item_props:
+                    logger.warning(
+                        "add_array_from_array 'to' dest field %r not in item schema",
+                        dest_name,
+                    )
+                    continue
+                if not src_name:
+                    continue
+                dest_to_src[dest_name] = src_name
+        elif isinstance(to_ref, list):
+            for name in to_ref:
+                if not name:
+                    continue
+                if name not in item_props:
+                    logger.warning(
+                        "add_array_from_array 'to' field %r not in item schema",
+                        name,
+                    )
+                    continue
+                dest_to_src[name] = name
+        elif isinstance(to_ref, str) and to_ref.strip():
+            name = to_ref.strip()
+            if name not in item_props:
+                logger.warning(
+                    "add_array_from_array 'to' field %r not in item schema",
+                    name,
+                )
+            else:
+                dest_to_src[name] = name
+        else:
+            return from_expr
+
+        def _project_item(x: F.Column) -> F.Column:
+            fields = []
+            for prop_name in item_props.keys():
+                if prop_name in dest_to_src:
+                    fields.append(x.getField(dest_to_src[prop_name]).alias(prop_name))
+                else:
+                    fields.append(F.lit(None).alias(prop_name))
+            return F.struct(*fields)
+
+        return F.transform(from_expr, _project_item)
+
     def _fill_apply_one(self, df: TracedDataFrame, field_name: str, field_schema: dict, spec: dict) -> TracedDataFrame:
-        """Apply a single fill_with spec (replace, replace_if_not_exist, add_array_item, add_all_items, add_array_from_list)."""
+        """Apply a single fill_with spec (replace, replace_if_not_exist, add_array_item, add_array_from_array, add_array_from_list)."""
         fill_type = spec.get("type", "replace")
         from_ref = spec.get("from")
         to_ref = spec.get("to", field_name)
@@ -1818,23 +1903,35 @@ class PortadaCleaning(DeltaDataLayer):
             new_item = self._fill_build_array_item_expr(field_name, field_schema, spec)
             if new_item is None:
                 return df
+            empty_arr = F.array()
             try:
                 current_dtype = df.schema[field_name].dataType
                 if isinstance(current_dtype, ArrayType):
                     new_item = new_item.cast(current_dtype.elementType)
+                    empty_arr = F.array().cast(current_dtype)
             except Exception:
                 pass
-            # Afegir un sol item al final de l'array (append); flatten preserva l'ordre (array_union podria desordenar/deduplicar).
-            new_array = F.when(current.isNull(), F.array(new_item)).otherwise(
-                F.flatten(F.array(current, F.array(new_item)))
-            )
+            mode = spec.get("mode", "append")
+            new_items = F.array(new_item)
+            new_array = self._fill_apply_array_mode(current, new_items, mode, empty_arr)
             df = df.withColumn(field_name, F.when(cond_expr, new_array).otherwise(current))
 
-        elif fill_type == "add_all_items":
+        elif fill_type in ("add_array_from_array", "add_all_items"):
             from_expr = self._fill_resolve_from(from_ref)
-            new_array = F.when(current.isNull(), from_expr).otherwise(
-                F.coalesce(current, from_expr)
+            # Use spec.get("to") so absent to means full item copy (not field_name default).
+            new_items = self._fill_project_struct_array_items(
+                from_expr, field_schema, spec.get("to")
             )
+            empty_arr = F.array()
+            try:
+                current_dtype = df.schema[field_name].dataType
+                if isinstance(current_dtype, ArrayType):
+                    new_items = new_items.cast(current_dtype)
+                    empty_arr = F.array().cast(current_dtype)
+            except Exception:
+                pass
+            mode = spec.get("mode", "replace_null")
+            new_array = self._fill_apply_array_mode(current, new_items, mode, empty_arr)
             df = df.withColumn(field_name, F.when(cond_expr, new_array).otherwise(current))
 
         elif fill_type == "add_array_from_list":
@@ -1853,7 +1950,8 @@ class PortadaCleaning(DeltaDataLayer):
                     empty_arr = F.array()
             except Exception:
                 empty_arr = F.array()
-            new_array = F.concat(F.coalesce(current, empty_arr), new_items)
+            mode = spec.get("mode", "append")
+            new_array = self._fill_apply_array_mode(current, new_items, mode, empty_arr)
             df = df.withColumn(field_name, F.when(cond_expr, new_array).otherwise(current))
 
         return df
@@ -1943,9 +2041,18 @@ class PortadaCleaning(DeltaDataLayer):
                 # Un sol item per al subarray; fill_with penja del camp pare (cargo_list), així que
                 # l'item sencer (cargo_merchant_name + cargo) s'afegeix a cargo_list, no dins el darrer element.
                 fields.append(F.array(nested_item).alias(to_name))
-            elif isinstance(from_item, dict) and from_item.get("type") == "add_all_items":
+            elif isinstance(from_item, dict) and from_item.get("type") in (
+                "add_array_from_array",
+                "add_all_items",
+            ):
                 from_expr = self._fill_resolve_from(from_item.get("from"))
-                fields.append(from_expr.alias(to_name))
+                nested_parent_schema = item_props.get(to_name) if isinstance(item_props, dict) else {}
+                if not isinstance(nested_parent_schema, dict):
+                    nested_parent_schema = {}
+                projected = self._fill_project_struct_array_items(
+                    from_expr, nested_parent_schema, from_item.get("to")
+                )
+                fields.append(projected.alias(to_name))
             else:
                 fields.append(self._fill_resolve_from(from_item).alias(to_name))
 
@@ -2150,7 +2257,13 @@ class BoatFactCleaning(PortadaCleaning, BoatFactCitationExtractor, BoatFactVoice
 
 
     def normalize_strings_for_ship_entries(self, ship_entries_df: TracedDataFrame) -> TracedDataFrame:
-        return self.flatten_string_characters(ship_entries_df)
+        df = self.flatten_string_characters(ship_entries_df)
+        _, properties = self.get_schema_and_properties(self._schema)
+        for field_name in properties:
+            if field_name not in df.columns:
+                continue
+            df = df.withColumn(f"{field_name}_normalized", F.col(field_name))
+        return df
 
     def normalize_strings_for_reviewed_ship_entries(self, ship_entries_df: TracedDataFrame) -> TracedDataFrame:
         schema = """{
