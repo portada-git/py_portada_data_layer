@@ -1,5 +1,6 @@
 import datetime
 import inspect
+from dataclasses import dataclass
 from enum import Enum
 
 from delta import DeltaTable
@@ -8,7 +9,6 @@ from datetime import datetime, timezone
 from typing import Optional, List, Dict
 import uuid
 import logging
-from pyspark.sql import functions as F
 from pyspark.sql.dataframe import DataFrame
 from pyspark.sql.types import StructField, StringType, StructType, IntegerType, FloatType, LongType, ArrayType, MapType, \
     BooleanType
@@ -18,6 +18,27 @@ from portada_data_layer.delta_data_layer import PathConfigDeltaDataLayer, BaseDe
 from functools import wraps
 
 logger = logging.getLogger("delta_data_layer.data_lake_metadata_manager")
+
+
+@dataclass
+class DataframeOperation:
+    type: str
+    stage: str
+    field: str
+    process: str
+    operation: str
+    detailed_operation: str = ""
+    description: str = ""
+
+DATAFRAME_OPERATION_SCHEMA = StructType([
+    StructField("type", StringType(), False),
+    StructField("stage", StringType(), False),
+    StructField("field", StringType(), True),
+    StructField("process", StringType(), False),
+    StructField("description", StringType(), True),
+    StructField("operation", StringType(), False),
+    StructField("detailed_operation", StringType(), True),
+])
 
 class LineageCheckingType(Enum):
     NO_CHECKING = 0
@@ -748,6 +769,134 @@ class DataLakeMetadataManager(PathConfigDeltaDataLayer):
             StructField("removed_columns", ArrayType(StringType())),
         ])
         self._write_log(entries, "field_lineage_log", schema=schema, partitionBy=("stored_log_id",))
+
+    # ----------------------------------------------------------------------
+    # 🔹 DATAFRAME OPERATIONS (modify / append / delete)
+    # ----------------------------------------------------------------------
+    def _operations_to_dataframe(self, operations: List[DataframeOperation]) -> DataFrame:
+        rows = [
+            Row(
+                type=op.type,
+                stage=op.stage,
+                field=op.field,
+                process=op.process,
+                description=op.description,
+                operation=op.operation,
+                detailed_operation=op.detailed_operation,
+            )
+            for op in operations
+        ]
+        return self.spark.createDataFrame(rows, schema=DATAFRAME_OPERATION_SCHEMA)
+
+    def _dataframe_to_operations(self, df: DataFrame) -> List[DataframeOperation]:
+        return [
+            DataframeOperation(
+                type=row["type"],
+                stage=row["stage"],
+                field=row["field"],
+                process=row["process"],
+                description=row["description"],
+                operation=row["operation"],
+                detailed_operation=row["detailed_operation"],
+            )
+            for row in df.collect()
+        ]
+
+    def _write_typed_operations(
+            self,
+            operations: List[DataframeOperation],
+            op_type: str,
+            merge_keys: List[str],
+    ) -> List[DataframeOperation]:
+        """
+        Persist operations of ``op_type`` under metadata/operations/<op_type>,
+        merging on ``merge_keys``. Returns operations that did not match the type.
+        """
+        matched = [op for op in operations if op.type == op_type]
+        unmatched = [op for op in operations if op.type != op_type]
+        if not matched:
+            return unmatched
+
+        source_df = self._operations_to_dataframe(matched)
+        target_path = self._resolve_path("metadata", "operations", op_type)
+
+        if not DeltaTable.isDeltaTable(self.spark, target_path):
+            source_df.write.mode("overwrite").format("delta").save(target_path)
+        else:
+            condition = " AND ".join(f"current.{key} = new.{key}" for key in merge_keys)
+            (
+                DeltaTable.forPath(self.spark, target_path)
+                .alias("current")
+                .merge(source_df.alias("new"), condition)
+                .whenMatchedUpdateAll()
+                .whenNotMatchedInsertAll()
+                .execute()
+            )
+        return unmatched
+
+    def _read_typed_operations(
+            self, op_type: str, as_list: bool = False
+    ) -> List[DataframeOperation] | DataFrame:
+        target_path = self._resolve_path("metadata", "operations", op_type)
+        if not DeltaTable.isDeltaTable(self.spark, target_path):
+            if as_list:
+                return []
+            return self.spark.createDataFrame([], schema=DATAFRAME_OPERATION_SCHEMA)
+        df = self.spark.read.format("delta").load(target_path)
+        if as_list:
+            return self._dataframe_to_operations(df)
+        return df
+
+    def write_modify_operations(
+            self, operations: List[DataframeOperation]
+    ) -> List[DataframeOperation]:
+        """
+        Merge type==\"modify\" ops into metadata/operations/modify.
+        Primary key: stage, field, process, operation. Returns non-modify ops.
+        """
+        return self._write_typed_operations(
+            operations, "modify", ["stage", "field", "process", "operation"]
+        )
+
+    def read_modify_operations(
+            self, as_list: bool = False
+    ) -> List[DataframeOperation] | DataFrame:
+        """Load all stored modify operations as DataFrame (default) or list."""
+        return self._read_typed_operations("modify", as_list=as_list)
+
+    def write_append_operations(
+            self, operations: List[DataframeOperation]
+    ) -> List[DataframeOperation]:
+        """
+        Merge type==\"append\" ops into metadata/operations/append.
+        Primary key: stage, process, operation. Returns non-append ops.
+        """
+        return self._write_typed_operations(
+            operations, "append", ["stage", "process", "operation"]
+        )
+
+    def read_append_operations(
+            self, as_list: bool = False
+    ) -> List[DataframeOperation] | DataFrame:
+        """Load all stored append operations as DataFrame (default) or list."""
+        return self._read_typed_operations("append", as_list=as_list)
+
+    def write_delete_operations(
+            self, operations: List[DataframeOperation]
+    ) -> List[DataframeOperation]:
+        """
+        Merge type==\"delete\" ops into metadata/operations/delete.
+        Primary key: stage, process, operation. Returns non-delete ops.
+        """
+        return self._write_typed_operations(
+            operations, "delete", ["stage", "process", "operation"]
+        )
+
+    def read_delete_operations(
+            self, as_list: bool = False
+    ) -> List[DataframeOperation] | DataFrame:
+        """Load all stored delete operations as DataFrame (default) or list."""
+        return self._read_typed_operations("delete", as_list=as_list)
 
     # ----------------------------------------------------------------------
     # 🔹 ERROR LOG

@@ -450,6 +450,7 @@ class BaseDeltaDataLayer(ConfigDeltaDataLayer):
     def __init__(self, builder=None, cfg_json: dict = None):
         super().__init__(builder=builder, cfg_json=cfg_json)
         self._a_log_process_info = None
+        self._a_dataframe_operations = None
         self._client_db_sequencer = None
         self.sequencer_params = None
 
@@ -488,6 +489,18 @@ class BaseDeltaDataLayer(ConfigDeltaDataLayer):
             self._a_log_process_info = [{}]
         else:
             self._a_log_process_info.append({})
+
+    @property
+    def dataframe_operations(self) -> list:
+        """
+        Accumulated DataframeOperation entries for the current process.
+        """
+        if getattr(self, "_a_dataframe_operations", None) is None:
+            self._a_dataframe_operations = []
+        return self._a_dataframe_operations
+
+    def clean_dataframe_operations(self):
+        self._a_dataframe_operations = []
 
     def subdirs_list(self, *container_path, process_level_dir=None):
         """Returns subdirectories within an HDFS *container_path (without using os.listdir)."""
@@ -888,40 +901,45 @@ class DeltaDataLayer(BaseDeltaDataLayer):
             version = self.get_delta_metatable(path).history(1).collect()[0]['version']
 
         logger.info(f"Writing Delta → {target_path}")
-        if self.log_storage or self._save_lineage_on_store or df.save_lineage_on_store:
+        if self.dataframe_operations or self.log_storage or self._save_lineage_on_store or df.save_lineage_on_store:
             if hasattr(self, "metadata"):
                 metadata = self.metadata
             else:
                 from portada_data_layer.data_lake_metadata_manager import DataLakeMetadataManager
                 metadata = DataLakeMetadataManager(self.get_configuration())
-            if not self._transformer_process_name:
-                prev_tr_name = self._transformer_process_name
-                self._transformer_process_name = inspect.currentframe().f_back.f_code.co_name
-            else:
-                prev_tr_name = None
 
-            l_id = metadata.log_storage(
-                data_layer=self,
-                num_records=original_df.count(),
-                mode=mode,
-                new=is_new,
-                table_name=tn,
-                df_name=df_name,
-                df_large_name=df_large_name,
-                source_path=source_path,
-                source_version=source_version,
-                target_path=target_path,
-                target_version=version,
-            )
-            if self._save_lineage_on_store or df.save_lineage_on_store:
-                metadata.log_field_lineage(
+            if self.dataframe_operations:
+                self._a_dataframe_operations = metadata.write_modify_operations(self.dataframe_operations)
+
+            if self.log_storage or self._save_lineage_on_store or df.save_lineage_on_store:
+                if not self._transformer_process_name:
+                    prev_tr_name = self._transformer_process_name
+                    self._transformer_process_name = inspect.currentframe().f_back.f_code.co_name
+                else:
+                    prev_tr_name = None
+
+                l_id = metadata.log_storage(
                     data_layer=self,
-                    dataframe=df,
-                    stored_log_id=l_id
+                    num_records=original_df.count(),
+                    mode=mode,
+                    new=is_new,
+                    table_name=tn,
+                    df_name=df_name,
+                    df_large_name=df_large_name,
+                    source_path=source_path,
+                    source_version=source_version,
+                    target_path=target_path,
+                    target_version=version,
                 )
+                if self._save_lineage_on_store or df.save_lineage_on_store:
+                    metadata.log_field_lineage(
+                        data_layer=self,
+                        dataframe=df,
+                        stored_log_id=l_id
+                    )
 
-            if prev_tr_name is not None:
-                self._transformer_process_name = prev_tr_name
+                if prev_tr_name is not None:
+                    self._transformer_process_name = prev_tr_name
 
         return TracedDataFrame(original_df, table_name=tn, df_name=target_path, df_version=version)
 
@@ -970,6 +988,14 @@ class DeltaDataLayer(BaseDeltaDataLayer):
             f"t.{key_id_name} = d.{key_id_name}",
         ).whenMatchedDelete().execute()
         logger.info(f"Deleted matching rows from Delta → {self._resolve_relative_path(self._resolve_path(*table_path))}")
+
+        if self.dataframe_operations:
+            if hasattr(self, "metadata"):
+                metadata = self.metadata
+            else:
+                from portada_data_layer.data_lake_metadata_manager import DataLakeMetadataManager
+                metadata = DataLakeMetadataManager(self.get_configuration())
+            self._a_dataframe_operations = metadata.write_delete_operations(self.dataframe_operations)
 
     def read_json(self, *table_path, process_level_dir=None, has_extension=False) -> TracedDataFrame:
         """

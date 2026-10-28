@@ -6,11 +6,15 @@ import logging
 from pyspark.sql import DataFrame, functions as F
 from pyspark.sql.window import Window
 from pyspark.sql.types import StringType, StructField, DateType, TimestampType, LongType, DoubleType, BooleanType, \
-    StructType, ArrayType
+    StructType, ArrayType, MapType
 from portada_data_layer import DeltaDataLayer, TracedDataFrame
 from portada_data_layer.boat_fact_model import BoatFactDataModel
-from portada_data_layer.data_lake_metadata_manager import data_transformer_method, enable_storage_log_for_class, \
-    enable_field_lineage_log_for_class
+from portada_data_layer.data_lake_metadata_manager import (
+    DataframeOperation,
+    data_transformer_method,
+    enable_storage_log_for_class,
+    enable_field_lineage_log_for_class,
+)
 from portada_data_layer.portada_delta_common import registry_to_portada_builder, BoatFactConstants
 from portada_data_layer.portada_extraction_for_disambiguation import BoatFactCitationExtractor, BoatFactVoicesExtractor
 from portada_data_layer.portada_patcher_data_layer import BoatFactPatcherDataLayer
@@ -28,13 +32,102 @@ FLATTEN_STRINGS_TO = "aaaaaaeeeeiiiiooooouuuuyycn"
 @enable_storage_log_for_class
 @enable_field_lineage_log_for_class
 class PortadaCleaning(DeltaDataLayer):
-    ORIGINAL_DATA_METHOD_FIELD = "original_data_method"
+    HISTORY_FIELD = "history"
+    HISTORY_SEQUENCE_FIELD = "history_sequence"
+    HISTORY_ENTRY_STRUCT = StructType([
+        StructField("obtained_value", StringType(), True),
+        StructField("operations", ArrayType(StringType()), True),
+    ])
+    HISTORY_MAP_TYPE = MapType(StringType(), HISTORY_ENTRY_STRUCT, True)
 
     def __init__(self, builder=None, cfg_json: dict = None):
         super().__init__(builder=builder, cfg_json=cfg_json)
         self._schema = {}
         self._mapping_to_clean_chars = {}
         self._current_process_level = 1
+
+    @staticmethod
+    def _history_spec_id(spec, index: int) -> str:
+        if isinstance(spec, dict) and spec.get("id") is not None:
+            return str(spec["id"])
+        return f"{index:04d}"
+
+    @staticmethod
+    def _history_spec_description(spec) -> str:
+        if isinstance(spec, dict):
+            return str(spec.get("description") or "")
+        return ""
+
+    @staticmethod
+    def _history_spec_detailed(spec) -> str:
+        if isinstance(spec, str):
+            return spec
+        if isinstance(spec, dict):
+            return json.dumps(spec, ensure_ascii=False, sort_keys=True)
+        return str(spec) if spec is not None else ""
+
+    def _register_dataframe_operation(self, op: DataframeOperation) -> None:
+        key = (op.type, op.stage, op.field, op.process, op.operation)
+        existing = {
+            (o.type, o.stage, o.field, o.process, o.operation) for o in self.dataframe_operations
+        }
+        if key not in existing:
+            self.dataframe_operations.append(op)
+
+    def _append_history_process(
+            self,
+            df: TracedDataFrame,
+            field: str,
+            process: str,
+            obtained_value_col: F.Column,
+            operations_col: F.Column,
+            row_condition: F.Column,
+            merge_operations: bool = False,
+    ) -> TracedDataFrame:
+        """
+        Update ``{field}_history`` / ``{field}_history_sequence`` for rows matching
+        ``row_condition``. When ``merge_operations`` and process already exists,
+        concatenate operations and refresh obtained_value without re-appending sequence.
+        """
+        hist_col = f"{field}_{self.HISTORY_FIELD}"
+        seq_col = f"{field}_{self.HISTORY_SEQUENCE_FIELD}"
+        if hist_col not in df.columns:
+            df = df.withColumn(hist_col, F.lit(None).cast(self.HISTORY_MAP_TYPE))
+        if seq_col not in df.columns:
+            df = df.withColumn(seq_col, F.array().cast(ArrayType(StringType())))
+
+        hist = F.coalesce(F.col(hist_col), F.create_map().cast(self.HISTORY_MAP_TYPE))
+        seq = F.coalesce(F.col(seq_col), F.array().cast(ArrayType(StringType())))
+        existing_entry = F.element_at(hist, F.lit(process))
+        new_ops = F.coalesce(operations_col, F.array().cast(ArrayType(StringType())))
+        if merge_operations:
+            merged_ops = F.when(
+                existing_entry.isNotNull(),
+                F.concat(
+                    F.coalesce(existing_entry.getField("operations"), F.array().cast(ArrayType(StringType()))),
+                    new_ops,
+                ),
+            ).otherwise(new_ops)
+        else:
+            merged_ops = new_ops
+        new_entry = F.struct(
+            obtained_value_col.cast("string").alias("obtained_value"),
+            merged_ops.alias("operations"),
+        )
+        # map_concat: later map wins on duplicate keys (no Python UDF)
+        updated_hist = F.map_concat(hist, F.create_map(F.lit(process), new_entry))
+        already_in_seq = F.array_contains(seq, F.lit(process))
+        updated_seq = F.when(already_in_seq, seq).otherwise(F.concat(seq, F.array(F.lit(process))))
+
+        df = df.withColumn(
+            hist_col,
+            F.when(row_condition, updated_hist).otherwise(F.col(hist_col)),
+        )
+        df = df.withColumn(
+            seq_col,
+            F.when(row_condition, updated_seq).otherwise(F.col(seq_col)),
+        )
+        return df
 
     def use_schema(self, json_schema: dict):
         self._schema = json_schema
@@ -48,43 +141,124 @@ class PortadaCleaning(DeltaDataLayer):
     def fill_with_schema(self, df: TracedDataFrame) -> TracedDataFrame:
         """
         Fill field content from other columns according to the 'fill_with' specs
-        in the JSON schema_path (replace, replace_if_not_exist, add_array_item,
-        add_array_from_array, add_array_from_list). ``add_all_items`` is kept as an
-        alias of ``add_array_from_array``.
-
-        Array fill types accept optional ``mode``:
-        ``replace`` (wipe and set), ``replace_null`` (only if current is null),
-        ``append`` (concat). Defaults: ``add_array_from_array`` → ``replace_null``;
-        ``add_array_item`` / ``add_array_from_list`` → ``append``.
-
-        For ``add_array_from_array``, ``to`` may be a list of same-name fields to
-        copy, a dict mapping dest←source field names, or omitted for a full
-        item-by-item copy of ``from``.
-
-        Specs with ``"lazy": true`` run in a second pass after all non-lazy specs,
-        so a later field can consume a value before another field's lazy rule mutates it.
+        in the JSON schema_path. Also records ``fill_gaps`` history and DataframeOperation.
         """
+        return self._apply_schema_fill_attribute(
+            df, attr_name="fill_with", process="fill_gaps"
+        )
+
+    @data_transformer_method(
+        description="fix extraction inconsistencies using schema_path fix_extraction_inconsistencies"
+    )
+    def fix_extraction_inconsistencies_schema(self, df: TracedDataFrame) -> TracedDataFrame:
+        """
+        Same mechanics as ``fill_with_schema`` but driven by
+        ``fix_extraction_inconsistencies`` and history process of that name.
+        """
+        return self._apply_schema_fill_attribute(
+            df,
+            attr_name="fix_extraction_inconsistencies",
+            process="fix_extraction_inconsistencies",
+        )
+
+    def _apply_schema_fill_attribute(
+            self, df: TracedDataFrame, attr_name: str, process: str
+    ) -> TracedDataFrame:
         if self._schema is None:
             raise ValueError("Must call use_schema() before.")
         props = self._schema_properties(self._schema)
         eager_jobs = []
         lazy_jobs = []
+        fields_with_specs = set()
         for field_name, field_schema in props.items():
-            fill_with = field_schema.get("fill_with")
+            fill_with = field_schema.get(attr_name)
             if fill_with is None:
                 continue
             specs = fill_with if isinstance(fill_with, list) else [fill_with]
-            for spec in specs:
+            for index, spec in enumerate(specs):
                 if not isinstance(spec, dict):
                     continue
-                job = (field_name, field_schema, spec)
+                op_id = self._history_spec_id(spec, index)
+                self._register_dataframe_operation(DataframeOperation(
+                    type="modify",
+                    stage="cleaning",
+                    field=field_name,
+                    process=process,
+                    operation=op_id,
+                    detailed_operation=self._history_spec_detailed(spec),
+                    description=self._history_spec_description(spec),
+                ))
+                job = (field_name, field_schema, index, spec)
+                fields_with_specs.add(field_name)
                 if spec.get("lazy"):
                     lazy_jobs.append(job)
                 else:
                     eager_jobs.append(job)
-        for field_name, field_schema, spec in eager_jobs + lazy_jobs:
+
+        for field_name in fields_with_specs:
+            df = df.withColumn(
+                f"__hist_ops_{field_name}",
+                F.array().cast(ArrayType(StringType())),
+            )
+
+        for field_name, field_schema, index, spec in eager_jobs + lazy_jobs:
+            op_id = self._history_spec_id(spec, index)
+            # Materialize fire flag before apply: conditions may reference the
+            # field being filled (e.g. replace_if_not_exist + isNull).
+            fired_tmp = f"__hist_fired_{field_name}_{index}"
+            df = df.withColumn(
+                fired_tmp,
+                self._fill_spec_fires(df, field_name, field_schema, spec),
+            )
             df = self._fill_apply_one(df, field_name, field_schema, spec)
+            ops_tmp = f"__hist_ops_{field_name}"
+            df = df.withColumn(
+                ops_tmp,
+                F.when(
+                    F.col(fired_tmp),
+                    F.concat(F.col(ops_tmp), F.array(F.lit(op_id))),
+                ).otherwise(F.col(ops_tmp)),
+            )
+            df = df.drop(fired_tmp)
+
+        for field_name in fields_with_specs:
+            ops_tmp = f"__hist_ops_{field_name}"
+            row_changed = F.size(F.col(ops_tmp)) > 0
+            obtained = F.col(field_name).cast("string") if field_name in df.columns else F.lit(None)
+            df = self._append_history_process(
+                df,
+                field_name,
+                process,
+                obtained,
+                F.col(ops_tmp),
+                row_changed,
+                merge_operations=False,
+            )
+            df = df.drop(ops_tmp)
         return df
+
+    def _fill_spec_fires(
+            self, df: TracedDataFrame, field_name: str, field_schema: dict, spec: dict
+    ) -> F.Column:
+        """Boolean column: whether this fill spec would apply on the current row state."""
+        fill_type = spec.get("type", "replace")
+        from_ref = spec.get("from")
+        condition = spec.get("condition")
+        existing_columns = set(df.columns)
+        required_columns = self._fill_required_columns(from_ref) | self._fill_required_columns_from_condition(
+            condition
+        )
+        if required_columns and not required_columns.issubset(existing_columns):
+            return F.lit(False)
+        cond_expr = (
+            self._fill_condition_expr(condition)
+            if condition is not None
+            else self._fill_default_from_condition(from_ref)
+        )
+        current = F.col(field_name) if field_name in df.columns else F.lit(None)
+        if fill_type == "replace_if_not_exist":
+            return F.coalesce(cond_expr, F.lit(False)) & current.isNull()
+        return F.coalesce(cond_expr, F.lit(False))
 
     def _empty_entry_ids_df(self) -> DataFrame:
         """Return an empty DataFrame with a single ``entry_id`` string column."""
@@ -117,15 +291,34 @@ class PortadaCleaning(DeltaDataLayer):
         existing_columns = set(df.columns)
         to_delete = F.lit(False)
         any_spec_applied = False
-        for spec in specs:
+        for index, spec in enumerate(specs):
             if spec is None:
                 continue
             if not isinstance(spec, (dict, str)):
                 continue
-            required_columns = self._fill_required_columns_from_condition(spec)
+            condition = spec
+            if isinstance(spec, dict) and "condition" in spec:
+                condition = spec["condition"]
+            op_id = self._history_spec_id(spec if isinstance(spec, dict) else {}, index)
+            if isinstance(spec, dict) and spec.get("id") is not None:
+                op_id = str(spec["id"])
+            elif not isinstance(spec, dict):
+                op_id = f"{index:04d}"
+            self._register_dataframe_operation(DataframeOperation(
+                type="delete",
+                stage="cleaning",
+                field="",
+                process="delete_if",
+                operation=op_id,
+                detailed_operation=self._history_spec_detailed(
+                    condition if not isinstance(spec, dict) or "condition" in spec else spec
+                ),
+                description=self._history_spec_description(spec) if isinstance(spec, dict) else "",
+            ))
+            required_columns = self._fill_required_columns_from_condition(condition)
             if required_columns and not required_columns.issubset(existing_columns):
                 continue
-            cond_expr = self._fill_condition_expr(spec)
+            cond_expr = self._fill_condition_expr(condition)
             to_delete = to_delete | F.coalesce(cond_expr, F.lit(False))
             any_spec_applied = True
 
@@ -164,8 +357,18 @@ class PortadaCleaning(DeltaDataLayer):
                 computed = PortadaCleaning._calc_data_difference(parameters)
             else:
                 continue
+            self._register_dataframe_operation(DataframeOperation(
+                type="modify",
+                stage="cleaning",
+                field=field_name,
+                process="calculation",
+                operation=operation,
+                detailed_operation=self._history_spec_detailed(calc_spec),
+                description=self._history_spec_description(calc_spec),
+            ))
             if field_name not in df.columns:
                 df = df.withColumn(field_name, computed)
+                is_missing = F.lit(True)
             else:
                 col = F.col(field_name)
                 # Empty string is not Spark null; treat blank as missing so calculable_if_null runs
@@ -175,6 +378,15 @@ class PortadaCleaning(DeltaDataLayer):
                     field_name,
                     F.when(is_missing, computed).otherwise(col),
                 )
+            df = self._append_history_process(
+                df,
+                field_name,
+                "calculation",
+                F.col(field_name).cast("string"),
+                F.array(F.lit(operation)),
+                is_missing,
+                merge_operations=False,
+            )
         return df
 
     def read_entries(self, *container_path) -> TracedDataFrame:
@@ -259,100 +471,284 @@ class PortadaCleaning(DeltaDataLayer):
 
     def _normalize_field_structure(self, df: TracedDataFrame) -> TracedDataFrame:
         """
-        Normalize DataFrame column structures according to the schema_path.
-
-        Iterates schema properties and builds an expression per column so rows
-        comply with the declared structure (e.g. struct fields street/city).
+        Normalize DataFrame column structures according to the schema_path,
+        then bootstrap ``*_history`` / ``*_history_sequence`` from ingest
+        ``*_detailed_value`` (+ ``*_extraction_source_method``) and drop them.
         """
         if self._schema is None:
             raise ValueError("Must call use_schema() before.")
-        properties = self._schema.get("properties", {})
+        properties = self._schema_properties(self._schema)
         selects = []
         for col in df.columns:
             if col not in properties:
                 selects.append(F.col(col).alias(col))
         for field_name, field_schema in properties.items():
-            expr = self._build_normalize_expr(F.col(field_name), field_schema)
-            selects.append(expr.alias(field_name))
-        return df.select(*selects)
+            if field_name in df.columns:
+                expr = self._build_normalize_expr(F.col(field_name), field_schema)
+                selects.append(expr.alias(field_name))
+        df = df.select(*selects)
+        return self._init_history_from_extraction(df)
 
-    def _simplify_field_structure(self, df):
-        """
-        Collapse extraction-metadata columns into ``{field}_original_value``
-        and drop ``*_detailed_value`` / ``*_original_data_method``.
-        """
-        detailed_cols = [c for c in df.columns if c.endswith(BoatFactDataModel.DETAILED_VALUE_FIELD)]
-        base_fields = [c.replace(f"_{BoatFactDataModel.DETAILED_VALUE_FIELD}", "") for c in detailed_cols]
+    def _init_history_from_extraction(self, df: TracedDataFrame) -> TracedDataFrame:
+        """Build history maps from ``*_detailed_value`` and register extraction ops."""
+        props = self._schema_properties(self._schema)
+        dv_suffix = f"_{BoatFactDataModel.DETAILED_VALUE_FIELD}"
+        method_suffix = f"_{BoatFactDataModel.EXTRACTION_SOURCE_METHOD_FIELD}"
+        extraction_methods = [
+            BoatFactDataModel.DEFAULT_VALUE_FIELD,
+            BoatFactDataModel.ORIGINAL_VALUE_FIELD,
+            BoatFactDataModel.CALCULATED_VALUE_FIELD,
+        ]
 
-        cleaned_df = df
+        detailed_fields = []
+        for col in df.columns:
+            if col.endswith(dv_suffix):
+                field = col[: -len(dv_suffix)]
+                detailed_fields.append(field)
 
-        for field in base_fields:
+        # Catalog: which extraction ops appear at least once per field
+        agg_exprs = []
+        alias_to_field_method = []
+        for field in detailed_fields:
             detailed_col = f"{field}_{BoatFactDataModel.DETAILED_VALUE_FIELD}"
-            source_method_col = f"{field}_{PortadaCleaning.ORIGINAL_DATA_METHOD_FIELD}"
-            original_val_col = f"{field}_original_value"
+            dtype = df.schema[detailed_col].dataType
+            if not isinstance(dtype, StructType):
+                continue
+            available = {f.name for f in dtype.fields}
+            for method in extraction_methods:
+                if method not in available:
+                    continue
+                alias = f"{field}__{method}"
+                agg_exprs.append(
+                    F.max(F.col(detailed_col).getField(method).isNotNull().cast("int")).alias(alias)
+                )
+                alias_to_field_method.append((alias, field, method))
 
-            detailed_field_type = cleaned_df.schema[detailed_col].dataType
+        if agg_exprs:
+            stats = df.agg(*agg_exprs).collect()[0].asDict()
+            for alias, field, method in alias_to_field_method:
+                if stats.get(alias):
+                    self._register_dataframe_operation(DataframeOperation(
+                        type="modify",
+                        stage="cleaning",
+                        field=field,
+                        process="extraction",
+                        operation=method,
+                    ))
 
-            # If not StructType (e.g. NullType), fallback to the base field value.
-            if not isinstance(detailed_field_type, StructType):
-                cleaned_df = cleaned_df.withColumn(original_val_col, F.col(field))
-                cols_to_drop = [c for c in [detailed_col, source_method_col] if c in cleaned_df.columns]
-                cleaned_df = cleaned_df.drop(*cols_to_drop)
+        if BoatFactDataModel.PUBLICATION_DATE_FIELD in props:
+            self._register_dataframe_operation(DataframeOperation(
+                type="modify",
+                stage="cleaning",
+                field=BoatFactDataModel.PUBLICATION_DATE_FIELD,
+                process="boat_fact_model",
+                operation="datetime to string date",
+            ))
+        if "entry_id" in props:
+            self._register_dataframe_operation(DataframeOperation(
+                type="modify",
+                stage="cleaning",
+                field="entry_id",
+                process="boat_fact_model",
+                operation="create unique ID",
+            ))
+
+        cols_to_drop = []
+        for field in detailed_fields:
+            detailed_col = f"{field}_{BoatFactDataModel.DETAILED_VALUE_FIELD}"
+            method_col = f"{field}_{BoatFactDataModel.EXTRACTION_SOURCE_METHOD_FIELD}"
+            hist_col = f"{field}_{self.HISTORY_FIELD}"
+            seq_col = f"{field}_{self.HISTORY_SEQUENCE_FIELD}"
+            dtype = df.schema[detailed_col].dataType
+            if not isinstance(dtype, StructType):
+                empty_entry = F.struct(
+                    F.col(field).cast("string").alias("obtained_value"),
+                    F.array().cast(ArrayType(StringType())).alias("operations"),
+                )
+                df = df.withColumn(
+                    hist_col,
+                    F.create_map(F.lit("extraction"), empty_entry),
+                )
+                df = df.withColumn(seq_col, F.array(F.lit("extraction")))
+                cols_to_drop.extend([c for c in [detailed_col, method_col] if c in df.columns])
                 continue
 
-            available_subfields = [f.name for f in detailed_field_type.fields]
-            target_schema = cleaned_df.schema[field].dataType
+            available = {f.name for f in dtype.fields}
+            dv = F.col(detailed_col)
+            default_v = dv.getField(BoatFactDataModel.DEFAULT_VALUE_FIELD) if BoatFactDataModel.DEFAULT_VALUE_FIELD in available else F.lit(None)
+            original_v = dv.getField(BoatFactDataModel.ORIGINAL_VALUE_FIELD) if BoatFactDataModel.ORIGINAL_VALUE_FIELD in available else F.lit(None)
+            calculated_v = dv.getField(BoatFactDataModel.CALCULATED_VALUE_FIELD) if BoatFactDataModel.CALCULATED_VALUE_FIELD in available else F.lit(None)
+            boat_v = dv.getField(BoatFactDataModel.BOAT_FACT_MODEL_FIELD) if BoatFactDataModel.BOAT_FACT_MODEL_FIELD in available else F.lit(None)
 
-            if source_method_col in cleaned_df.columns:
-                conditions = None
-                for method_type in [BoatFactDataModel.CALCULATED_VALUE_FIELD,
-                                    BoatFactDataModel.ORIGINAL_VALUE_FIELD,
-                                    BoatFactDataModel.DEFAULT_VALUE_FIELD]:
-                    if method_type in available_subfields:
-                        if conditions is None:
-                            conditions = F.when(F.col(source_method_col) == method_type,
-                                                F.col(f"{detailed_col}.{method_type}"))
-                        else:
-                            conditions = conditions.when(F.col(source_method_col) == method_type,
-                                                         F.col(f"{detailed_col}.{method_type}"))
-                json_string_col = conditions if conditions is not None else F.lit(None)
+            op_parts = []
+            if BoatFactDataModel.DEFAULT_VALUE_FIELD in available:
+                op_parts.append(
+                    F.when(default_v.isNotNull(), F.array(F.lit(BoatFactDataModel.DEFAULT_VALUE_FIELD)))
+                    .otherwise(F.array().cast(ArrayType(StringType())))
+                )
+            if BoatFactDataModel.ORIGINAL_VALUE_FIELD in available:
+                op_parts.append(
+                    F.when(original_v.isNotNull(), F.array(F.lit(BoatFactDataModel.ORIGINAL_VALUE_FIELD)))
+                    .otherwise(F.array().cast(ArrayType(StringType())))
+                )
+            if BoatFactDataModel.CALCULATED_VALUE_FIELD in available:
+                keep_calculated = calculated_v.isNotNull() & (
+                    original_v.isNull()
+                    | (calculated_v.cast("string") != original_v.cast("string"))
+                )
+                op_parts.append(
+                    F.when(keep_calculated, F.array(F.lit(BoatFactDataModel.CALCULATED_VALUE_FIELD)))
+                    .otherwise(F.array().cast(ArrayType(StringType())))
+                )
+            ops = F.concat(*op_parts) if op_parts else F.array().cast(ArrayType(StringType()))
+            last_op = F.element_at(ops, F.lit(-1))
+            obtained = (
+                F.when(last_op == F.lit(BoatFactDataModel.CALCULATED_VALUE_FIELD), calculated_v.cast("string"))
+                .when(last_op == F.lit(BoatFactDataModel.ORIGINAL_VALUE_FIELD), original_v.cast("string"))
+                .when(last_op == F.lit(BoatFactDataModel.DEFAULT_VALUE_FIELD), default_v.cast("string"))
+                .otherwise(F.lit(None).cast(StringType()))
+            )
+            extraction_entry = F.struct(
+                obtained.alias("obtained_value"),
+                ops.alias("operations"),
+            )
+            base_map = F.create_map(F.lit("extraction"), extraction_entry)
+
+            if field == "entry_id":
+                has_boat = F.lit(True)
+                boat_ops = F.array(F.lit("create unique ID"))
+            elif field == BoatFactDataModel.PUBLICATION_DATE_FIELD:
+                has_boat = boat_v.isNotNull()
+                boat_ops = F.array(F.lit("datetime to string date"))
             else:
-                priority_list = [
-                    F.col(f"{detailed_col}.{m}")
-                    for m in [BoatFactDataModel.CALCULATED_VALUE_FIELD,
-                              BoatFactDataModel.ORIGINAL_VALUE_FIELD,
-                              BoatFactDataModel.DEFAULT_VALUE_FIELD]
-                    if m in available_subfields
-                ]
-                json_string_col = F.coalesce(*priority_list) if priority_list else F.lit(None)
+                has_boat = boat_v.isNotNull()
+                boat_ops = F.array(F.lit("boat_fact_model"))
 
-            if isinstance(target_schema, (StructType, ArrayType)):
-                extracted_col = F.from_json(json_string_col, target_schema)
-                final_col = F.coalesce(extracted_col, F.col(field))
-            else:
-                final_col = F.coalesce(json_string_col.cast(target_schema), F.col(field))
+            boat_entry = F.struct(
+                F.col(field).cast("string").alias("obtained_value"),
+                boat_ops.alias("operations"),
+            )
+            full_map = F.when(
+                has_boat,
+                F.map_concat(base_map, F.create_map(F.lit("boat_fact_model"), boat_entry)),
+            ).otherwise(base_map)
+            sequence = F.when(
+                has_boat,
+                F.array(F.lit("extraction"), F.lit("boat_fact_model")),
+            ).otherwise(F.array(F.lit("extraction")))
 
-            cleaned_df = cleaned_df.withColumn(original_val_col, final_col)
-            cols_to_drop = [c for c in [detailed_col, source_method_col] if c in cleaned_df.columns]
-            cleaned_df = cleaned_df.drop(*cols_to_drop)
+            df = df.withColumn(hist_col, full_map.cast(self.HISTORY_MAP_TYPE))
+            df = df.withColumn(seq_col, sequence)
+            cols_to_drop.extend([c for c in [detailed_col, method_col] if c in df.columns])
 
-        return cleaned_df
+        # Ensure history columns for schema fields without detailed_value
+        for field_name in props:
+            hist_col = f"{field_name}_{self.HISTORY_FIELD}"
+            seq_col = f"{field_name}_{self.HISTORY_SEQUENCE_FIELD}"
+            if hist_col not in df.columns:
+                df = df.withColumn(hist_col, F.lit(None).cast(self.HISTORY_MAP_TYPE))
+            if seq_col not in df.columns:
+                df = df.withColumn(seq_col, F.array().cast(ArrayType(StringType())))
+
+        if cols_to_drop:
+            df = df.drop(*cols_to_drop)
+        return df
+
+    @data_transformer_method(description="materialize history snapshots and drop history columns")
+    def simplify_field_structure(self, df: TracedDataFrame) -> TracedDataFrame:
+        """
+        Create ``*_from_extraction``, ``*_from_source_value``, ``*_fixed_value``,
+        ``*_normalized_value`` from history and drop history / history_sequence.
+        """
+        props = self._schema_properties(self._schema)
+        snapshot_keys = [
+            ("from_extraction", "extraction"),
+            ("from_source_value", "fix_extraction_inconsistencies"),
+            ("fixed_value", "cleaned"),
+            ("normalized_value", "normalized"),
+        ]
+        drop_cols = []
+        for field_name in props:
+            hist_col = f"{field_name}_{self.HISTORY_FIELD}"
+            seq_col = f"{field_name}_{self.HISTORY_SEQUENCE_FIELD}"
+            if hist_col in df.columns:
+                hist = F.col(hist_col)
+                for suffix, process in snapshot_keys:
+                    entry = F.element_at(hist, F.lit(process))
+                    df = df.withColumn(
+                        f"{field_name}_{suffix}",
+                        entry.getField("obtained_value"),
+                    )
+                drop_cols.append(hist_col)
+            if seq_col in df.columns:
+                drop_cols.append(seq_col)
+        if drop_cols:
+            df = df.drop(*drop_cols)
+        return df
 
     @data_transformer_method()
     def clean_field_values_from_schema(self, df: TracedDataFrame) -> TracedDataFrame:
         if self._schema is None:
             raise ValueError("Must call use_schema() before.")
-        properties = self._schema.get("properties", {})
+        properties = self._schema_properties(self._schema)
 
         for field_name, field_schema in properties.items():
-            # Get the full expression for the column (simple, struct or array)
-            if field_name in  self._mapping_to_clean_chars:
+            if field_name not in df.columns:
+                continue
+            map_names = []
+            for item in field_schema.get("for_cleaning", []) or []:
+                alg = item if isinstance(item, str) else (
+                    item.get("algorithm") if isinstance(item, dict) else None
+                )
+                if not alg:
+                    continue
+                char_map = None
+                if alg in self._mapping_to_clean_chars and isinstance(
+                    self._mapping_to_clean_chars.get(alg), dict
+                ):
+                    char_map = self._mapping_to_clean_chars[alg]
+                if char_map is not None:
+                    map_names.append(alg)
+                    self._register_dataframe_operation(DataframeOperation(
+                        type="modify",
+                        stage="cleaning",
+                        field=field_name,
+                        process="fixing",
+                        operation=alg,
+                        detailed_operation=json.dumps(char_map, ensure_ascii=False),
+                    ))
+
+            before = F.col(field_name)
+            before_str = before.cast("string")
+            if field_name in self._mapping_to_clean_chars and not isinstance(
+                self._mapping_to_clean_chars.get(field_name), dict
+            ):
+                pass
+            if field_name in self._mapping_to_clean_chars and isinstance(
+                self._mapping_to_clean_chars.get(field_name), dict
+            ):
+                # Per-field OCR map (legacy shape)
                 mapping = self._mapping_to_clean_chars[field_name]
                 expr = self.apply_ocr_corrections(F.col(field_name), mapping)
             else:
                 expr = F.col(field_name)
-            expr = self._json_schema_to_normalize_values(field_schema, self._mapping_to_clean_chars, expr)
+            expr = self._json_schema_to_normalize_values(
+                field_schema, self._mapping_to_clean_chars, expr
+            )
             df = df.withColumn(field_name, expr)
+            if map_names:
+                changed = before_str.isNotNull() & (
+                    before_str != F.col(field_name).cast("string")
+                )
+                df = self._append_history_process(
+                    df,
+                    field_name,
+                    "fixing",
+                    F.col(field_name).cast("string"),
+                    F.array(*[F.lit(m) for m in map_names]),
+                    changed,
+                    merge_operations=True,
+                )
         return df
 
     @data_transformer_method(
@@ -361,15 +757,12 @@ class PortadaCleaning(DeltaDataLayer):
     def complete_accepted_structure(self, df: TracedDataFrame) -> TracedDataFrame:
         """
         Add missing schema_path fields, then normalize each schema column's
-        structure (former ``normalize_field_structure``).
-
-        Renames ingest ``*_extraction_source_method`` columns to
-        ``*_original_data_method`` before collecting the allowed field list.
+        structure and bootstrap ``*_history`` from ingest extraction metadata.
+        Keeps ``*_extraction_source_method`` names (no rename to original_data_method).
         """
         if self._schema is None:
             raise ValueError("Must call use_schema() before.")
-        old_suffix = f"_{BoatFactDataModel.EXTRACTION_SOURCE_METHOD_FIELD}"
-        new_suffix = f"_{PortadaCleaning.ORIGINAL_DATA_METHOD_FIELD}"
+        method_suffix = f"_{BoatFactDataModel.EXTRACTION_SOURCE_METHOD_FIELD}"
         bad_suffix = f":_{BoatFactDataModel.DETAILED_VALUE_FIELD}"
         good_suffix = f"_{BoatFactDataModel.DETAILED_VALUE_FIELD}"
         bad_char = "_BAD_CHAR"
@@ -379,11 +772,9 @@ class PortadaCleaning(DeltaDataLayer):
             if col.endswith(":"):
                 new_names.append(col[:-1] + bad_char)
                 to_rename.append(new_names[-1])
-            elif col.endswith(f":{old_suffix}"):
-                new_names.append(col[:-(len(old_suffix) + 1)] + new_suffix + bad_char)
+            elif col.endswith(f":{method_suffix}"):
+                new_names.append(col[:-(len(method_suffix) + 1)] + method_suffix + bad_char)
                 to_rename.append(new_names[-1])
-            elif col.endswith(old_suffix):
-                new_names.append(col[:-len(old_suffix)] + new_suffix)
             elif col.endswith(bad_suffix):
                 new_names.append(col[:-len(bad_suffix)] + good_suffix + bad_char)
                 to_rename.append(new_names[-1])
@@ -404,24 +795,15 @@ class PortadaCleaning(DeltaDataLayer):
         return self._normalize_field_structure(df)
 
     @data_transformer_method(
-        description="prune unbelonging fields and simplify extraction metadata"
+        description="prune unbelonging fields"
     )
-    def prune_unaccepted_fields(
-        self, df: TracedDataFrame, simplify_meta_fields: bool = True
-    ) -> TracedDataFrame:
-        """
-        Keep only schema_path columns. When ``simplify_meta_fields`` is True
-        (default), also collapse extraction metadata into ``*_original_value``.
-        When False, skip ``_simplify_field_structure``.
-        """
+    def prune_unaccepted_fields(self, df: TracedDataFrame) -> TracedDataFrame:
+        """Keep only schema_path columns (including history / history_sequence)."""
         if self._schema is None:
             raise ValueError("Must call use_schema() before.")
         allowed = self._collect_list_of_fields(self._schema)
         cols_to_keep = [col for col in df.columns if col in allowed]
-        df = df.select(cols_to_keep)
-        if simplify_meta_fields:
-            return self._simplify_field_structure(df)
-        return df
+        return df.select(cols_to_keep)
 
     @staticmethod
     def _cast_column_to_schema_type(col_expr: F.Column, spark_type):
@@ -505,9 +887,8 @@ class PortadaCleaning(DeltaDataLayer):
     @data_transformer_method(description="cast current fields to schema_path types")
     def string_to_type_from_schema(self, df: TracedDataFrame) -> TracedDataFrame:
         """
-        Converteix els camps actuals (sovint string) al tipus indicat al JSON schema_path.
-        Només aplica a camps definits a schema_path.properties i presents al DataFrame.
-        Also stores a typed snapshot of each field as ``{field}_cleaned``.
+        Cast fields to JSON schema types. Records ``cleaned`` history only when the
+        cast nullifies a previously non-null value (impossible conversions).
         """
         if self._schema is None:
             raise ValueError("Must call use_schema() before.")
@@ -519,9 +900,33 @@ class PortadaCleaning(DeltaDataLayer):
         for field_name, field_schema in properties.items():
             if field_name not in df.columns:
                 continue
-            casted = PortadaCleaning._cast_column_by_json_schema(F.col(field_name), field_schema)
+            schema_type = field_schema.get("type")
+            if schema_type == "string":
+                continue
+            data_type_name = schema_type or "unknown"
+            self._register_dataframe_operation(DataframeOperation(
+                type="modify",
+                stage="cleaning",
+                field=field_name,
+                process="cleaned",
+                operation=f"cast_to_{data_type_name}",
+                description=f"cast from string to {data_type_name}",
+            ))
+            before = F.col(field_name)
+            before_str = before.cast("string")
+            was_non_null = before.isNotNull() & (F.trim(before_str) != "")
+            casted = PortadaCleaning._cast_column_by_json_schema(before, field_schema)
             df = df.withColumn(field_name, casted)
-            df = df.withColumn(f"{field_name}_cleaned", F.col(field_name))
+            nullified = was_non_null & F.col(field_name).isNull()
+            df = self._append_history_process(
+                df,
+                field_name,
+                "cleaned",
+                F.lit(None).cast(StringType()),
+                F.array(F.lit(f"cast_to_{data_type_name}")),
+                nullified,
+                merge_operations=False,
+            )
 
         return df
 
@@ -596,7 +1001,7 @@ class PortadaCleaning(DeltaDataLayer):
             Resolves occurrences of 'idem' in top-level fields tagged with accepted_idem in the schema_path.
             Values matching IDEM_REGEX are replaced with the last non-idem value before (forward fill).
             If after forward fill the value would be null (e.g. first row of partition), it is restored
-            from <field_name>_original_value if it exists, so that an idem is never replaced with null.
+            from history[\"extraction\"].obtained_value if present, so that an idem is never replaced with null.
             Order and partitions are read from _schema["order_and_partitions"].
             """
             if self._schema is None:
@@ -632,23 +1037,43 @@ class PortadaCleaning(DeltaDataLayer):
             for field in root_idem_fields:
                 if field not in df.columns:
                     continue
+                self._register_dataframe_operation(DataframeOperation(
+                    type="modify",
+                    stage="cleaning",
+                    field=field,
+                    process="fixing",
+                    operation="resolve_idems",
+                    description="resolve idems with referred previous values",
+                ))
                 # Només quan el valor coincideix amb la regex idem: posar null i omplir amb darrer valor no null
                 is_idem = F.trim(F.col(field).cast("string")).rlike(IDEM_REGEX)
                 original_null = F.col(field).isNull()
                 # On hi ha idem posem null; la resta es manté
                 value_to_fill = F.when(is_idem, F.lit(None)).otherwise(F.col(field))
                 filled = F.last(value_to_fill, ignorenulls=True).over(window_ff)
-                # On era idem: usar filled; si filled és null, restaurar des de <camp>_original_value si existeix
+                # Restore from extraction history when forward-fill is null
+                hist_col = f"{field}_{self.HISTORY_FIELD}"
                 idem_resolved = filled
-                original_value_col = f"{field}_original_value"
-                if original_value_col in df.columns:
-                    idem_resolved = F.coalesce(filled, F.col(original_value_col))
+                if hist_col in df.columns:
+                    from_extraction = F.element_at(F.col(hist_col), F.lit("extraction")).getField(
+                        "obtained_value"
+                    )
+                    idem_resolved = F.coalesce(filled, from_extraction)
                 # Restaurar nulls originals; on era idem posar idem_resolved; altrament valor original
                 df = df.withColumn(
                     field,
                     F.when(original_null, F.lit(None))
                     .when(is_idem, idem_resolved)
                     .otherwise(F.col(field)),
+                )
+                df = self._append_history_process(
+                    df,
+                    field,
+                    "fixing",
+                    F.col(field).cast("string"),
+                    F.array(F.lit("resolve_idems")),
+                    is_idem & ~original_null,
+                    merge_operations=True,
                 )
 
             return df
@@ -1110,29 +1535,27 @@ class PortadaCleaning(DeltaDataLayer):
         return df
 
     def cleaning_entries(self, df: DataFrame | TracedDataFrame, saving_original_data: bool = True) -> TracedDataFrame:
-        # 1.- Complete accepted structure and normalize field structures
+        # 1.- Complete accepted structure, normalize fields, bootstrap history
         df = self.complete_accepted_structure(df)
-        # 2.- save original values
-        # if saving_original_data:
-        #     df = self.save_original_values_of_ship_entries(df)
-        # 3.- For null fields, fill fields from schema_path instructions
+        # 2.- Fix extraction inconsistencies (schema-driven)
+        df = self.fix_extraction_inconsistencies_schema(df)
+        # 3.- Fill gaps from schema_path fill_with
         df = self.fill_with_schema(df)
         # 3b.- Drop rows matching schema_path delete_if conditions
         df, _deleted_ids = self.delete_if_from_schema(df)
-        # 4.- Prune unaccepted fields and simplify extraction metadata
+        # 4.- Prune unaccepted fields (keep history; no simplify)
         df = self.prune_unaccepted_fields(df)
         # 5.- Resolve idem/id/id. with the value of the predecessor record
         df = self.resolve_idems(df)
-        # 6.- Normalize values
+        # 6.- Character-map cleaning
         df = self.clean_field_values_from_schema(df)
         # 7.- If null or error, calculate values from schema_path instructions
         df = self.calculate_from_schema(df)
-        # 8.- Convert values form string to corrected type
+        # 8.- Convert values from string to corrected type
         df = self.string_to_type_from_schema(df)
         # 9.- Normalize string types
-        # df = self.normalize_strings_for_ship_entries(df)
-        # 10.- Save cleaned values
-        # df = self.save_ship_entries(df, is_cleaned=True)
+        df = self.normalize_strings_for_ship_entries(df)
+        # 10.- Optional: simplify_field_structure(df) materializes snapshots
         return df
 
     #### -------------------- Auxiliar methods -------------------------- ###
@@ -1166,27 +1589,21 @@ class PortadaCleaning(DeltaDataLayer):
         """
         Build a column expression with the correct Spark type for a missing column.
         - Base fields (in schema_path): type from config/schema_path.json via json_schema_to_spark_type.
-        - <nom_camp>_original_data_method: String nullable.
-        - <nom_camp>_detailed_value: struct(default_value, original_value, calculated_value, boat_fact_model), all string nullable.
+        - <nom_camp>_history: map process -> {obtained_value, operations}.
+        - <nom_camp>_history_sequence: array of process keys in order.
         """
         props = self._schema_properties(self._schema)
-        suffix_odm = f"_{PortadaCleaning.ORIGINAL_DATA_METHOD_FIELD}"
-        suffix_dv = f"_{BoatFactDataModel.DETAILED_VALUE_FIELD}"
+        suffix_hist = f"_{PortadaCleaning.HISTORY_FIELD}"
+        suffix_seq = f"_{PortadaCleaning.HISTORY_SEQUENCE_FIELD}"
 
         if col in props:
             field_schema = props[col]
             spark_type, _ = PortadaCleaning.json_schema_to_spark_type(field_schema, primitive_types_as_strings=True)
             return F.lit(None).cast(spark_type).alias(col)
-        if col.endswith(suffix_odm):
-            return F.lit(None).cast(StringType()).alias(col)
-        if col.endswith(suffix_dv):
-            detailed_struct = StructType([
-                StructField(BoatFactDataModel.DEFAULT_VALUE_FIELD, StringType(), True),
-                StructField(BoatFactDataModel.ORIGINAL_VALUE_FIELD, StringType(), True),
-                StructField(BoatFactDataModel.CALCULATED_VALUE_FIELD, StringType(), True),
-                StructField(BoatFactDataModel.BOAT_FACT_MODEL_FIELD, StringType(), True),
-            ])
-            return F.lit(None).cast(detailed_struct).alias(col)
+        if col.endswith(suffix_hist):
+            return F.lit(None).cast(PortadaCleaning.HISTORY_MAP_TYPE).alias(col)
+        if col.endswith(suffix_seq):
+            return F.array().cast(ArrayType(StringType())).alias(col)
         return F.lit(None).alias(col)
 
     @staticmethod
@@ -1267,8 +1684,8 @@ class PortadaCleaning(DeltaDataLayer):
             props = schema
         for field_name in props:
             fields.add(field_name)
-            fields.add(f"{field_name}_{PortadaCleaning.ORIGINAL_DATA_METHOD_FIELD}")
-            fields.add(f"{field_name}_{BoatFactDataModel.DETAILED_VALUE_FIELD}")
+            fields.add(f"{field_name}_{PortadaCleaning.HISTORY_FIELD}")
+            fields.add(f"{field_name}_{PortadaCleaning.HISTORY_SEQUENCE_FIELD}")
         return fields
 
     @staticmethod
@@ -2277,12 +2694,38 @@ class BoatFactCleaning(PortadaCleaning, BoatFactCitationExtractor, BoatFactVoice
 
 
     def normalize_strings_for_ship_entries(self, ship_entries_df: TracedDataFrame) -> TracedDataFrame:
-        df = self.flatten_string_characters(ship_entries_df)
         _, properties = self.get_schema_and_properties(self._schema)
-        for field_name in properties:
+        string_fields = []
+        df = ship_entries_df
+        for field_name, field_schema in properties.items():
             if field_name not in df.columns:
                 continue
-            df = df.withColumn(f"{field_name}_normalized", F.col(field_name))
+            if field_schema.get("type") != "string":
+                continue
+            string_fields.append(field_name)
+            self._register_dataframe_operation(DataframeOperation(
+                type="modify",
+                stage="cleaning",
+                field=field_name,
+                process="normalized",
+                operation="normalize_string",
+                description="normalize strings to lowercase, remove accents and special characters",
+            ))
+            df = df.withColumn(f"__before_norm_{field_name}", F.col(field_name).cast("string"))
+        df = self.flatten_string_characters(df)
+        for field_name in string_fields:
+            before = F.col(f"__before_norm_{field_name}")
+            any_string = before.isNotNull()
+            df = self._append_history_process(
+                df,
+                field_name,
+                "normalized",
+                F.col(field_name).cast("string"),
+                F.array(F.lit("normalize_string")),
+                any_string,
+                merge_operations=False,
+            )
+            df = df.drop(f"__before_norm_{field_name}")
         return df
 
     def normalize_strings_for_reviewed_ship_entries(self, ship_entries_df: TracedDataFrame) -> TracedDataFrame:

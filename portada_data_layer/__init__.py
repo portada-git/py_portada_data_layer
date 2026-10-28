@@ -1,4 +1,4 @@
-from .data_lake_metadata_manager import DataLakeMetadataManager, enable_storage_log, disable_storage_log, enable_storage_log_for_method, \
+from .data_lake_metadata_manager import DataLakeMetadataManager, DataframeOperation, enable_storage_log, disable_storage_log, enable_storage_log_for_method, \
     disable_storage_log_for_method, enable_storage_log_for_class, disable_storage_log_for_class, enable_field_lineage_log, disable_field_lineage_log, \
     disable_field_lineage_log_for_method, enable_field_lineage_log_for_method, enable_field_lineage_log_for_class, disable_field_lineage_log_for_class, \
     block_transformer_method, block_transformer
