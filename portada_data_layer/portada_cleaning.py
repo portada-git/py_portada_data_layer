@@ -34,6 +34,7 @@ FLATTEN_STRINGS_TO = "aaaaaaeeeeiiiiooooouuuuyycn"
 class PortadaCleaning(DeltaDataLayer):
     HISTORY_FIELD = "history"
     HISTORY_SEQUENCE_FIELD = "history_sequence"
+    PRESERVED_FIELD = "preserved"
     HISTORY_ENTRY_STRUCT = StructType([
         StructField("obtained_value", StringType(), True),
         StructField("operations", ArrayType(StringType()), True),
@@ -930,6 +931,7 @@ class PortadaCleaning(DeltaDataLayer):
             nc = col_to_rename[:-len(bad_char)]
             df = df.withColumn(nc, F.col(col_to_rename))
             df = df.drop(col_to_rename)
+        df = self.preserve_structure(df)
         allowed = self._collect_list_of_fields(self._schema)
         missing_cols = allowed - set(df.columns)
         if missing_cols:
@@ -939,6 +941,28 @@ class PortadaCleaning(DeltaDataLayer):
             df = df.withColumns(cols_to_add)
         df =  self._normalize_field_structure(df)
         return self._init_history_from_extraction(df)
+
+    def preserve_structure(self, df: TracedDataFrame) -> TracedDataFrame:
+        """
+        Copy columns tagged with ``preserve_structure: true`` to ``<field>_preserved``
+        before structure normalization, so nested values outside the accepted schema
+        remain available for later ``fix_extraction_inconsistencies`` / ``fill_with``.
+        """
+        if self._schema is None:
+            raise ValueError("Must call use_schema() before.")
+        props = self._schema_properties(self._schema)
+        updates = {}
+        for field_name, field_schema in props.items():
+            if not isinstance(field_schema, dict) or not field_schema.get("preserve_structure"):
+                continue
+            preserved_col = f"{field_name}_{self.PRESERVED_FIELD}"
+            if field_name in df.columns:
+                updates[preserved_col] = F.col(field_name)
+            else:
+                updates[preserved_col] = F.lit(None)
+        if updates:
+            df = self._with_columns(df, updates)
+        return df
 
 
     @data_transformer_method(
@@ -1864,7 +1888,7 @@ class PortadaCleaning(DeltaDataLayer):
         """
         if not (isinstance(struct, StructType) or isinstance(struct, ArrayType)):
             return _col.cast(struct)
-        # Always convert to string
+        # Always convert to string (structured fields arrive as JSON strings before normalize)
         s = _col.cast("string")
 
         # Detect JSON

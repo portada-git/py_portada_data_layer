@@ -887,10 +887,12 @@ class DeltaDataLayer(BaseDeltaDataLayer):
                mode = "overwrite"
             else:
                 delta_table = self.get_delta_table(*table_path)
+                # Schema evolution keeps new columns (e.g. *_preserved from preserve_structure)
+                # so a later read_original_values still sees them before prune.
                 delta_table.alias("current").merge(
                     source=df.toSparkDataFrame().alias("new"),
                     condition=f"current.{key_id_name}=new.{key_id_name}"
-                ).whenMatchedUpdateAll().whenNotMatchedInsertAll().execute()
+                ).withSchemaEvolution().whenMatchedUpdateAll().whenNotMatchedInsertAll().execute()
                 version = delta_table.history(1).collect()[0]['version']
         if mode != "merge":
             is_new = not self.path_exists(path)
