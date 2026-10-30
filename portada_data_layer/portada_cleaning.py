@@ -487,7 +487,7 @@ class PortadaCleaning(DeltaDataLayer):
                 expr = self._build_normalize_expr(F.col(field_name), field_schema)
                 selects.append(expr.alias(field_name))
         df = df.select(*selects)
-        return self._init_history_from_extraction(df)
+        return df
 
     def _init_history_from_extraction(self, df: TracedDataFrame) -> TracedDataFrame:
         """Build history maps from ``*_detailed_value`` and register extraction ops."""
@@ -686,6 +686,82 @@ class PortadaCleaning(DeltaDataLayer):
             df = df.drop(*drop_cols)
         return df
 
+    def _cleaning_ops_for_field(
+            self, field_name: str, field_schema: dict
+    ) -> list[tuple[str, str]]:
+        """
+        Operations that ``clean_field_values_from_schema`` will apply for this field,
+        as (operation_name, detailed_operation_json) matching
+        ``_json_schema_to_normalize_values`` / ``apply_cleaning_process``.
+        """
+        mapping = self._mapping_to_clean_chars or {}
+        ops: list[tuple[str, str]] = []
+
+        def _dump_map(key: str) -> tuple[str, str] | None:
+            char_map = mapping.get(key)
+            if isinstance(char_map, dict) and char_map:
+                return key, json.dumps(char_map, ensure_ascii=False)
+            return None
+
+        # Per-field OCR map (legacy keys in mapping_to_clean_chars)
+        if field_name in mapping and isinstance(mapping.get(field_name), dict):
+            ops.append((field_name, json.dumps(mapping[field_name], ensure_ascii=False)))
+
+        t = field_schema.get("type")
+        if t in ("integer", "number", "float") or (
+            t == "string" and field_schema.get("format") == "date"
+        ):
+            dumped = _dump_map("numeric_map")
+            if dumped:
+                ops.append(dumped)
+            elif not ops:
+                ops.append(("numeric_map", ""))
+            return ops
+
+        if t != "string":
+            return ops
+
+        raw_fc = field_schema.get("for_cleaning") or []
+        if not isinstance(raw_fc, list):
+            raw_fc = [raw_fc]
+        algs = []
+        for item in raw_fc:
+            if isinstance(item, str):
+                algs.append(item)
+            elif isinstance(item, dict) and item.get("algorithm"):
+                algs.append(item["algorithm"])
+
+        if "not_cleanable" in algs:
+            return ops
+        if "paragraph" in algs:
+            return ops
+
+        if algs:
+            # apply_cleaning_process: not_paragraph_map unless one_word
+            if "one_word" not in algs:
+                dumped = _dump_map("not_paragraph_map")
+                if dumped:
+                    ops.append(dumped)
+            if "one_word" in algs:
+                dumped = _dump_map("one_word_map")
+                if dumped:
+                    ops.append(dumped)
+            if "not_digits" in algs:
+                dumped = _dump_map("only_text_map")
+                if dumped:
+                    ops.append(dumped)
+            if "not_parenthesis" in algs:
+                dumped = _dump_map("not_parenthesis_map") or _dump_map("not_parenthesis")
+                if dumped:
+                    ops.append(dumped)
+            if "accepted_idem" in algs or "accepted_abbreviations" in algs:
+                ops.append(("trim_punctuation", ""))
+            if not ops:
+                ops.append(("trim_punctuation", ""))
+        else:
+            ops.append(("trim_punctuation", ""))
+        return ops
+
     @data_transformer_method()
     def clean_field_values_from_schema(self, df: TracedDataFrame) -> TracedDataFrame:
         if self._schema is None:
@@ -695,39 +771,25 @@ class PortadaCleaning(DeltaDataLayer):
         for field_name, field_schema in properties.items():
             if field_name not in df.columns:
                 continue
-            map_names = []
-            for item in field_schema.get("for_cleaning", []) or []:
-                alg = item if isinstance(item, str) else (
-                    item.get("algorithm") if isinstance(item, dict) else None
-                )
-                if not alg:
-                    continue
-                char_map = None
-                if alg in self._mapping_to_clean_chars and isinstance(
-                    self._mapping_to_clean_chars.get(alg), dict
-                ):
-                    char_map = self._mapping_to_clean_chars[alg]
-                if char_map is not None:
-                    map_names.append(alg)
-                    self._register_dataframe_operation(DataframeOperation(
-                        type="modify",
-                        stage="cleaning",
-                        field=field_name,
-                        process="fixing",
-                        operation=alg,
-                        detailed_operation=json.dumps(char_map, ensure_ascii=False),
-                    ))
 
-            before = F.col(field_name)
-            before_str = before.cast("string")
-            if field_name in self._mapping_to_clean_chars and not isinstance(
-                self._mapping_to_clean_chars.get(field_name), dict
-            ):
-                pass
+            ops = self._cleaning_ops_for_field(field_name, field_schema)
+            for op_name, detailed in ops:
+                self._register_dataframe_operation(DataframeOperation(
+                    type="modify",
+                    stage="cleaning",
+                    field=field_name,
+                    process="fixing",
+                    operation=op_name,
+                    detailed_operation=detailed,
+                ))
+
+            before_tmp = f"__before_fix_{field_name}"
+            if ops:
+                df = df.withColumn(before_tmp, F.col(field_name).cast("string"))
+
             if field_name in self._mapping_to_clean_chars and isinstance(
                 self._mapping_to_clean_chars.get(field_name), dict
             ):
-                # Per-field OCR map (legacy shape)
                 mapping = self._mapping_to_clean_chars[field_name]
                 expr = self.apply_ocr_corrections(F.col(field_name), mapping)
             else:
@@ -736,19 +798,20 @@ class PortadaCleaning(DeltaDataLayer):
                 field_schema, self._mapping_to_clean_chars, expr
             )
             df = df.withColumn(field_name, expr)
-            if map_names:
-                changed = before_str.isNotNull() & (
-                    before_str != F.col(field_name).cast("string")
-                )
+
+            if ops:
+                after = F.col(field_name).cast("string")
+                changed = ~F.col(before_tmp).eqNullSafe(after)
                 df = self._append_history_process(
                     df,
                     field_name,
                     "fixing",
-                    F.col(field_name).cast("string"),
-                    F.array(*[F.lit(m) for m in map_names]),
+                    after,
+                    F.array(*[F.lit(op_name) for op_name, _ in ops]),
                     changed,
                     merge_operations=True,
                 )
+                df = df.drop(before_tmp)
         return df
 
     @data_transformer_method(
@@ -792,7 +855,9 @@ class PortadaCleaning(DeltaDataLayer):
                 col: self._expr_for_missing_column(col) for col in missing_cols
             }
             df = df.withColumns(cols_to_add)
-        return self._normalize_field_structure(df)
+        df =  self._normalize_field_structure(df)
+        return self._init_history_from_extraction(df)
+
 
     @data_transformer_method(
         description="prune unbelonging fields"
@@ -1045,11 +1110,16 @@ class PortadaCleaning(DeltaDataLayer):
                     operation="resolve_idems",
                     description="resolve idems with referred previous values",
                 ))
+                # Materialize flags before overwrite (Column exprs rebind to new values otherwise).
+                is_idem_tmp = f"__is_idem_{field}"
+                was_null_tmp = f"__was_null_{field}"
+                df = df.withColumn(
+                    is_idem_tmp,
+                    F.trim(F.col(field).cast("string")).rlike(IDEM_REGEX),
+                )
+                df = df.withColumn(was_null_tmp, F.col(field).isNull())
                 # Només quan el valor coincideix amb la regex idem: posar null i omplir amb darrer valor no null
-                is_idem = F.trim(F.col(field).cast("string")).rlike(IDEM_REGEX)
-                original_null = F.col(field).isNull()
-                # On hi ha idem posem null; la resta es manté
-                value_to_fill = F.when(is_idem, F.lit(None)).otherwise(F.col(field))
+                value_to_fill = F.when(F.col(is_idem_tmp), F.lit(None)).otherwise(F.col(field))
                 filled = F.last(value_to_fill, ignorenulls=True).over(window_ff)
                 # Restore from extraction history when forward-fill is null
                 hist_col = f"{field}_{self.HISTORY_FIELD}"
@@ -1062,8 +1132,8 @@ class PortadaCleaning(DeltaDataLayer):
                 # Restaurar nulls originals; on era idem posar idem_resolved; altrament valor original
                 df = df.withColumn(
                     field,
-                    F.when(original_null, F.lit(None))
-                    .when(is_idem, idem_resolved)
+                    F.when(F.col(was_null_tmp), F.lit(None))
+                    .when(F.col(is_idem_tmp), idem_resolved)
                     .otherwise(F.col(field)),
                 )
                 df = self._append_history_process(
@@ -1072,9 +1142,10 @@ class PortadaCleaning(DeltaDataLayer):
                     "fixing",
                     F.col(field).cast("string"),
                     F.array(F.lit("resolve_idems")),
-                    is_idem & ~original_null,
+                    F.col(is_idem_tmp) & ~F.col(was_null_tmp),
                     merge_operations=True,
                 )
+                df = df.drop(is_idem_tmp, was_null_tmp)
 
             return df
 
@@ -2695,12 +2766,15 @@ class BoatFactCleaning(PortadaCleaning, BoatFactCitationExtractor, BoatFactVoice
 
     def normalize_strings_for_ship_entries(self, ship_entries_df: TracedDataFrame) -> TracedDataFrame:
         _, properties = self.get_schema_and_properties(self._schema)
+        # Only fields that flatten_string_characters can actually change (skips not_cleanable).
         string_fields = []
         df = ship_entries_df
         for field_name, field_schema in properties.items():
             if field_name not in df.columns:
                 continue
             if field_schema.get("type") != "string":
+                continue
+            if "not_cleanable" in (field_schema.get("for_cleaning") or []):
                 continue
             string_fields.append(field_name)
             self._register_dataframe_operation(DataframeOperation(
@@ -2715,14 +2789,16 @@ class BoatFactCleaning(PortadaCleaning, BoatFactCitationExtractor, BoatFactVoice
         df = self.flatten_string_characters(df)
         for field_name in string_fields:
             before = F.col(f"__before_norm_{field_name}")
-            any_string = before.isNotNull()
+            after = F.col(field_name).cast("string")
+            # Record history only when normalization changes the value.
+            changed = before.isNotNull() & (before != after)
             df = self._append_history_process(
                 df,
                 field_name,
                 "normalized",
-                F.col(field_name).cast("string"),
+                after,
                 F.array(F.lit("normalize_string")),
-                any_string,
+                changed,
                 merge_operations=False,
             )
             df = df.drop(f"__before_norm_{field_name}")
