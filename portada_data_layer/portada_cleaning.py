@@ -74,28 +74,42 @@ class PortadaCleaning(DeltaDataLayer):
         if key not in existing:
             self.dataframe_operations.append(op)
 
-    def _append_history_process(
+    def _with_columns(self, df: TracedDataFrame, mapping: dict) -> TracedDataFrame:
+        """Apply many column updates in one Project (shallower plans than chained withColumn)."""
+        if not mapping:
+            return df
+        return df.withColumns(mapping)
+
+    def _ensure_history_columns(self, df: TracedDataFrame, fields) -> TracedDataFrame:
+        """Add missing ``*_history`` / ``*_history_sequence`` columns in one Project."""
+        mapping = {}
+        existing = set(df.columns)
+        for field in fields:
+            hist_col = f"{field}_{self.HISTORY_FIELD}"
+            seq_col = f"{field}_{self.HISTORY_SEQUENCE_FIELD}"
+            if hist_col not in existing and hist_col not in mapping:
+                mapping[hist_col] = F.lit(None).cast(self.HISTORY_MAP_TYPE)
+            if seq_col not in existing and seq_col not in mapping:
+                mapping[seq_col] = F.array().cast(ArrayType(StringType()))
+        return self._with_columns(df, mapping)
+
+    def _history_process_column_updates(
             self,
-            df: TracedDataFrame,
             field: str,
             process: str,
             obtained_value_col: F.Column,
             operations_col: F.Column,
             row_condition: F.Column,
             merge_operations: bool = False,
-    ) -> TracedDataFrame:
+    ) -> dict:
         """
-        Update ``{field}_history`` / ``{field}_history_sequence`` for rows matching
-        ``row_condition``. When ``merge_operations`` and process already exists,
-        concatenate operations and refresh obtained_value without re-appending sequence.
+        Build hist/seq Column updates for one process key.
+
+        Removes any existing ``process`` key before ``map_concat`` so Spark does not
+        raise DUPLICATED_MAP_KEY under the default mapKeyDedupPolicy=EXCEPTION.
         """
         hist_col = f"{field}_{self.HISTORY_FIELD}"
         seq_col = f"{field}_{self.HISTORY_SEQUENCE_FIELD}"
-        if hist_col not in df.columns:
-            df = df.withColumn(hist_col, F.lit(None).cast(self.HISTORY_MAP_TYPE))
-        if seq_col not in df.columns:
-            df = df.withColumn(seq_col, F.array().cast(ArrayType(StringType())))
-
         hist = F.coalesce(F.col(hist_col), F.create_map().cast(self.HISTORY_MAP_TYPE))
         seq = F.coalesce(F.col(seq_col), F.array().cast(ArrayType(StringType())))
         existing_entry = F.element_at(hist, F.lit(process))
@@ -114,20 +128,67 @@ class PortadaCleaning(DeltaDataLayer):
             obtained_value_col.cast("string").alias("obtained_value"),
             merged_ops.alias("operations"),
         )
-        # map_concat: later map wins on duplicate keys (no Python UDF)
-        updated_hist = F.map_concat(hist, F.create_map(F.lit(process), new_entry))
+        hist_without = F.map_filter(hist, lambda k, _v: k != F.lit(process))
+        updated_hist = F.map_concat(hist_without, F.create_map(F.lit(process), new_entry))
         already_in_seq = F.array_contains(seq, F.lit(process))
         updated_seq = F.when(already_in_seq, seq).otherwise(F.concat(seq, F.array(F.lit(process))))
+        return {
+            hist_col: F.when(row_condition, updated_hist).otherwise(F.col(hist_col)),
+            seq_col: F.when(row_condition, updated_seq).otherwise(F.col(seq_col)),
+        }
 
-        df = df.withColumn(
-            hist_col,
-            F.when(row_condition, updated_hist).otherwise(F.col(hist_col)),
+    def _append_history_process(
+            self,
+            df: TracedDataFrame,
+            field: str,
+            process: str,
+            obtained_value_col: F.Column,
+            operations_col: F.Column,
+            row_condition: F.Column,
+            merge_operations: bool = False,
+    ) -> TracedDataFrame:
+        """
+        Update ``{field}_history`` / ``{field}_history_sequence`` for rows matching
+        ``row_condition``. When ``merge_operations`` and process already exists,
+        concatenate operations and refresh obtained_value without re-appending sequence.
+        """
+        df = self._ensure_history_columns(df, [field])
+        return self._with_columns(
+            df,
+            self._history_process_column_updates(
+                field,
+                process,
+                obtained_value_col,
+                operations_col,
+                row_condition,
+                merge_operations=merge_operations,
+            ),
         )
-        df = df.withColumn(
-            seq_col,
-            F.when(row_condition, updated_seq).otherwise(F.col(seq_col)),
-        )
-        return df
+
+    def _append_history_batch(self, df: TracedDataFrame, updates: list) -> TracedDataFrame:
+        """
+        Apply many history updates in one Project.
+
+        Each item is a dict with keys: field, process, obtained_value_col,
+        operations_col, row_condition, and optional merge_operations.
+        At most one update per field is expected in a single batch.
+        """
+        if not updates:
+            return df
+        df = self._ensure_history_columns(df, [u["field"] for u in updates])
+        mapping = {}
+        for u in updates:
+            mapping.update(
+                self._history_process_column_updates(
+                    u["field"],
+                    u["process"],
+                    u["obtained_value_col"],
+                    u["operations_col"],
+                    u["row_condition"],
+                    merge_operations=u.get("merge_operations", False),
+                )
+            )
+        return self._with_columns(df, mapping)
 
     def use_schema(self, json_schema: dict):
         self._schema = json_schema
@@ -195,46 +256,55 @@ class PortadaCleaning(DeltaDataLayer):
                 else:
                     eager_jobs.append(job)
 
-        for field_name in fields_with_specs:
-            df = df.withColumn(
-                f"__hist_ops_{field_name}",
-                F.array().cast(ArrayType(StringType())),
-            )
+        ops_tmps = [f"__hist_ops_{field_name}" for field_name in fields_with_specs]
+        df = self._with_columns(
+            df,
+            {
+                ops_tmp: F.array().cast(ArrayType(StringType()))
+                for ops_tmp in ops_tmps
+            },
+        )
 
         for field_name, field_schema, index, spec in eager_jobs + lazy_jobs:
             op_id = self._history_spec_id(spec, index)
-            # Materialize fire flag before apply: conditions may reference the
-            # field being filled (e.g. replace_if_not_exist + isNull).
-            fired_tmp = f"__hist_fired_{field_name}_{index}"
-            df = df.withColumn(
-                fired_tmp,
-                self._fill_spec_fires(df, field_name, field_schema, spec),
+            # Evaluate fire flag and new value against the same parent row in one
+            # Project (avoids a separate fired_tmp column that would deepen the plan).
+            fired = self._fill_spec_fires(df, field_name, field_schema, spec)
+            new_val, drop_origin_col = self._fill_new_value_expr(
+                df, field_name, field_schema, spec
             )
-            df = self._fill_apply_one(df, field_name, field_schema, spec)
+            if new_val is None:
+                continue
             ops_tmp = f"__hist_ops_{field_name}"
-            df = df.withColumn(
-                ops_tmp,
-                F.when(
-                    F.col(fired_tmp),
-                    F.concat(F.col(ops_tmp), F.array(F.lit(op_id))),
-                ).otherwise(F.col(ops_tmp)),
+            df = self._with_columns(
+                df,
+                {
+                    field_name: new_val,
+                    ops_tmp: F.when(
+                        fired,
+                        F.concat(F.col(ops_tmp), F.array(F.lit(op_id))),
+                    ).otherwise(F.col(ops_tmp)),
+                },
             )
-            df = df.drop(fired_tmp)
+            if drop_origin_col and drop_origin_col in df.columns:
+                df = df.drop(drop_origin_col)
 
+        history_updates = []
         for field_name in fields_with_specs:
             ops_tmp = f"__hist_ops_{field_name}"
-            row_changed = F.size(F.col(ops_tmp)) > 0
-            obtained = F.col(field_name).cast("string") if field_name in df.columns else F.lit(None)
-            df = self._append_history_process(
-                df,
-                field_name,
-                process,
-                obtained,
-                F.col(ops_tmp),
-                row_changed,
-                merge_operations=False,
-            )
-            df = df.drop(ops_tmp)
+            history_updates.append({
+                "field": field_name,
+                "process": process,
+                "obtained_value_col": (
+                    F.col(field_name).cast("string") if field_name in df.columns else F.lit(None)
+                ),
+                "operations_col": F.col(ops_tmp),
+                "row_condition": F.size(F.col(ops_tmp)) > 0,
+                "merge_operations": False,
+            })
+        df = self._append_history_batch(df, history_updates)
+        if ops_tmps:
+            df = df.drop(*ops_tmps)
         return df
 
     def _fill_spec_fires(
@@ -343,6 +413,9 @@ class PortadaCleaning(DeltaDataLayer):
         if self._schema is None:
             raise ValueError("Must call use_schema() before.")
         props = self._schema_properties(self._schema)
+        value_updates = {}
+        missing_tmps = []
+        history_updates = []
         for field_name, field_schema in props.items():
             calc_spec = field_schema.get("calculable_if_null")
             if not isinstance(calc_spec, dict):
@@ -366,27 +439,30 @@ class PortadaCleaning(DeltaDataLayer):
                 detailed_operation=self._history_spec_detailed(calc_spec),
                 description=self._history_spec_description(calc_spec),
             ))
+            missing_tmp = f"__calc_missing_{field_name}"
+            missing_tmps.append(missing_tmp)
             if field_name not in df.columns:
-                df = df.withColumn(field_name, computed)
-                is_missing = F.lit(True)
+                value_updates[field_name] = computed
+                value_updates[missing_tmp] = F.lit(True)
             else:
                 col = F.col(field_name)
                 # Empty string is not Spark null; treat blank as missing so calculable_if_null runs
                 # after fill_with that clears invalid values with LIT('').
                 is_missing = col.isNull() | (F.trim(col.cast("string")) == "")
-                df = df.withColumn(
-                    field_name,
-                    F.when(is_missing, computed).otherwise(col),
-                )
-            df = self._append_history_process(
-                df,
-                field_name,
-                "calculation",
-                F.col(field_name).cast("string"),
-                F.array(F.lit(operation)),
-                is_missing,
-                merge_operations=False,
-            )
+                value_updates[missing_tmp] = is_missing
+                value_updates[field_name] = F.when(is_missing, computed).otherwise(col)
+            history_updates.append({
+                "field": field_name,
+                "process": "calculation",
+                "obtained_value_col": F.col(field_name).cast("string"),
+                "operations_col": F.array(F.lit(operation)),
+                "row_condition": F.col(missing_tmp),
+                "merge_operations": False,
+            })
+        df = self._with_columns(df, value_updates)
+        df = self._append_history_batch(df, history_updates)
+        if missing_tmps:
+            df = df.drop(*missing_tmps)
         return df
 
     def read_entries(self, *container_path) -> TracedDataFrame:
@@ -554,6 +630,7 @@ class PortadaCleaning(DeltaDataLayer):
             ))
 
         cols_to_drop = []
+        history_updates = {}
         for field in detailed_fields:
             detailed_col = f"{field}_{BoatFactDataModel.DETAILED_VALUE_FIELD}"
             method_col = f"{field}_{BoatFactDataModel.EXTRACTION_SOURCE_METHOD_FIELD}"
@@ -565,11 +642,8 @@ class PortadaCleaning(DeltaDataLayer):
                     F.col(field).cast("string").alias("obtained_value"),
                     F.array().cast(ArrayType(StringType())).alias("operations"),
                 )
-                df = df.withColumn(
-                    hist_col,
-                    F.create_map(F.lit("extraction"), empty_entry),
-                )
-                df = df.withColumn(seq_col, F.array(F.lit("extraction")))
+                history_updates[hist_col] = F.create_map(F.lit("extraction"), empty_entry)
+                history_updates[seq_col] = F.array(F.lit("extraction"))
                 cols_to_drop.extend([c for c in [detailed_col, method_col] if c in df.columns])
                 continue
 
@@ -637,19 +711,20 @@ class PortadaCleaning(DeltaDataLayer):
                 F.array(F.lit("extraction"), F.lit("boat_fact_model")),
             ).otherwise(F.array(F.lit("extraction")))
 
-            df = df.withColumn(hist_col, full_map.cast(self.HISTORY_MAP_TYPE))
-            df = df.withColumn(seq_col, sequence)
+            history_updates[hist_col] = full_map.cast(self.HISTORY_MAP_TYPE)
+            history_updates[seq_col] = sequence
             cols_to_drop.extend([c for c in [detailed_col, method_col] if c in df.columns])
 
         # Ensure history columns for schema fields without detailed_value
         for field_name in props:
             hist_col = f"{field_name}_{self.HISTORY_FIELD}"
             seq_col = f"{field_name}_{self.HISTORY_SEQUENCE_FIELD}"
-            if hist_col not in df.columns:
-                df = df.withColumn(hist_col, F.lit(None).cast(self.HISTORY_MAP_TYPE))
-            if seq_col not in df.columns:
-                df = df.withColumn(seq_col, F.array().cast(ArrayType(StringType())))
+            if hist_col not in history_updates and hist_col not in df.columns:
+                history_updates[hist_col] = F.lit(None).cast(self.HISTORY_MAP_TYPE)
+            if seq_col not in history_updates and seq_col not in df.columns:
+                history_updates[seq_col] = F.array().cast(ArrayType(StringType()))
 
+        df = self._with_columns(df, history_updates)
         if cols_to_drop:
             df = df.drop(*cols_to_drop)
         return df
@@ -768,6 +843,9 @@ class PortadaCleaning(DeltaDataLayer):
             raise ValueError("Must call use_schema() before.")
         properties = self._schema_properties(self._schema)
 
+        column_updates = {}
+        before_tmps = []
+        history_meta = []
         for field_name, field_schema in properties.items():
             if field_name not in df.columns:
                 continue
@@ -783,9 +861,11 @@ class PortadaCleaning(DeltaDataLayer):
                     detailed_operation=detailed,
                 ))
 
-            before_tmp = f"__before_fix_{field_name}"
             if ops:
-                df = df.withColumn(before_tmp, F.col(field_name).cast("string"))
+                before_tmp = f"__before_fix_{field_name}"
+                before_tmps.append(before_tmp)
+                column_updates[before_tmp] = F.col(field_name).cast("string")
+                history_meta.append((field_name, before_tmp, ops))
 
             if field_name in self._mapping_to_clean_chars and isinstance(
                 self._mapping_to_clean_chars.get(field_name), dict
@@ -797,21 +877,23 @@ class PortadaCleaning(DeltaDataLayer):
             expr = self._json_schema_to_normalize_values(
                 field_schema, self._mapping_to_clean_chars, expr
             )
-            df = df.withColumn(field_name, expr)
+            column_updates[field_name] = expr
 
-            if ops:
-                after = F.col(field_name).cast("string")
-                changed = ~F.col(before_tmp).eqNullSafe(after)
-                df = self._append_history_process(
-                    df,
-                    field_name,
-                    "fixing",
-                    after,
-                    F.array(*[F.lit(op_name) for op_name, _ in ops]),
-                    changed,
-                    merge_operations=True,
-                )
-                df = df.drop(before_tmp)
+        df = self._with_columns(df, column_updates)
+        history_updates = []
+        for field_name, before_tmp, ops in history_meta:
+            after = F.col(field_name).cast("string")
+            history_updates.append({
+                "field": field_name,
+                "process": "fixing",
+                "obtained_value_col": after,
+                "operations_col": F.array(*[F.lit(op_name) for op_name, _ in ops]),
+                "row_condition": ~F.col(before_tmp).eqNullSafe(after),
+                "merge_operations": True,
+            })
+        df = self._append_history_batch(df, history_updates)
+        if before_tmps:
+            df = df.drop(*before_tmps)
         return df
 
     @data_transformer_method(
@@ -962,6 +1044,9 @@ class PortadaCleaning(DeltaDataLayer):
         if not properties:
             return df
 
+        column_updates = {}
+        nullified_tmps = []
+        history_updates = []
         for field_name, field_schema in properties.items():
             if field_name not in df.columns:
                 continue
@@ -981,18 +1066,24 @@ class PortadaCleaning(DeltaDataLayer):
             before_str = before.cast("string")
             was_non_null = before.isNotNull() & (F.trim(before_str) != "")
             casted = PortadaCleaning._cast_column_by_json_schema(before, field_schema)
-            df = df.withColumn(field_name, casted)
-            nullified = was_non_null & F.col(field_name).isNull()
-            df = self._append_history_process(
-                df,
-                field_name,
-                "cleaned",
-                F.lit(None).cast(StringType()),
-                F.array(F.lit(f"cast_to_{data_type_name}")),
-                nullified,
-                merge_operations=False,
-            )
+            nullified_tmp = f"__cast_nullified_{field_name}"
+            nullified_tmps.append(nullified_tmp)
+            # Evaluate nullified against pre-update values in the same Project as the cast.
+            column_updates[nullified_tmp] = was_non_null & casted.isNull()
+            column_updates[field_name] = casted
+            history_updates.append({
+                "field": field_name,
+                "process": "cleaned",
+                "obtained_value_col": F.lit(None).cast(StringType()),
+                "operations_col": F.array(F.lit(f"cast_to_{data_type_name}")),
+                "row_condition": F.col(nullified_tmp),
+                "merge_operations": False,
+            })
 
+        df = self._with_columns(df, column_updates)
+        df = self._append_history_batch(df, history_updates)
+        if nullified_tmps:
+            df = df.drop(*nullified_tmps)
         return df
 
     @staticmethod
@@ -1048,12 +1139,14 @@ class PortadaCleaning(DeltaDataLayer):
         if not properties:
             return df
 
+        column_updates = {}
         for field_name, field_schema in properties.items():
             if field_name not in df.columns:
                 continue
-            flattened = PortadaCleaning._flatten_strings_by_schema(F.col(field_name), field_schema)
-            df = df.withColumn(field_name, flattened)
-        return df
+            column_updates[field_name] = PortadaCleaning._flatten_strings_by_schema(
+                F.col(field_name), field_schema
+            )
+        return self._with_columns(df, column_updates)
 
     @data_transformer_method()
     def resolve_idems(self, df: TracedDataFrame) -> TracedDataFrame:
@@ -2346,8 +2439,16 @@ class PortadaCleaning(DeltaDataLayer):
 
         return F.transform(from_expr, _project_item)
 
-    def _fill_apply_one(self, df: TracedDataFrame, field_name: str, field_schema: dict, spec: dict) -> TracedDataFrame:
-        """Apply a single fill_with spec (replace, replace_if_not_exist, add_array_item, add_array_from_array, add_array_from_list)."""
+    def _fill_new_value_expr(
+            self, df: TracedDataFrame, field_name: str, field_schema: dict, spec: dict
+    ):
+        """
+        Build the Column expression for applying one fill spec.
+
+        Returns ``(new_value_col, drop_origin_col)`` where ``new_value_col`` is None
+        when the spec cannot be applied, and ``drop_origin_col`` is an optional
+        column name to drop after the update (``drop_origin``).
+        """
         fill_type = spec.get("type", "replace")
         from_ref = spec.get("from")
         to_ref = spec.get("to", field_name)
@@ -2355,14 +2456,13 @@ class PortadaCleaning(DeltaDataLayer):
         drop_origin = spec.get("drop_origin", False)
         current = F.col(field_name)
 
-        # Skip if any column referenced by "from" or "condition" does not exist in the dataframe
         existing_columns = set(df.columns)
         required_columns = self._fill_required_columns(from_ref) | self._fill_required_columns_from_condition(condition)
         if required_columns and not required_columns.issubset(existing_columns):
-            return df
+            return None, None
 
-        # Condition: default "from exists and is not null" when not specified
         cond_expr = self._fill_condition_expr(condition) if condition is not None else self._fill_default_from_condition(from_ref)
+        drop_origin_col = None
 
         if fill_type == "replace":
             if isinstance(from_ref, list) and isinstance(to_ref, list):
@@ -2371,7 +2471,6 @@ class PortadaCleaning(DeltaDataLayer):
                     for i in range(min(len(from_ref), len(to_ref)))
                 ]
                 new_val = F.struct(*struct_fields) if struct_fields else current
-                df = df.withColumn(field_name, F.when(cond_expr, new_val).otherwise(current))
             else:
                 from_expr = self._fill_resolve_from(from_ref)
                 if isinstance(to_ref, str) and "." in to_ref and to_ref.split(".")[0] == field_name:
@@ -2381,19 +2480,18 @@ class PortadaCleaning(DeltaDataLayer):
                     new_val = self._fill_resolve_from(from_ref)
                 else:
                     new_val = from_expr
-                df = df.withColumn(field_name, F.when(cond_expr, new_val).otherwise(current))
+            return F.when(cond_expr, new_val).otherwise(current), None
 
-        elif fill_type == "replace_if_not_exist":
+        if fill_type == "replace_if_not_exist":
             if isinstance(from_ref, list) and isinstance(to_ref, list):
-                # Object: multiple from -> to (e.g. from ["observations.ai","observations.human"], to ["obs.automatic","obs.manual"])
                 struct_fields = []
                 for i, to_name in enumerate(to_ref):
                     if i < len(from_ref):
                         struct_fields.append(self._fill_resolve_from(from_ref[i]).alias(to_name))
-                if struct_fields:
-                    new_struct = F.struct(*struct_fields)
-                    new_val = F.when(current.isNull(), new_struct).otherwise(current)
-                    df = df.withColumn(field_name, F.when(cond_expr, new_val).otherwise(current))
+                if not struct_fields:
+                    return None, None
+                new_struct = F.struct(*struct_fields)
+                new_val = F.when(current.isNull(), new_struct).otherwise(current)
             else:
                 from_expr = self._fill_resolve_from(from_ref)
                 if isinstance(to_ref, str) and "." in to_ref and to_ref.split(".")[0] == field_name:
@@ -2403,14 +2501,14 @@ class PortadaCleaning(DeltaDataLayer):
                     new_val = current.withField(path_inside, new_branch)
                 else:
                     new_val = F.when(current.isNull(), from_expr).otherwise(current)
-                df = df.withColumn(field_name, F.when(cond_expr, new_val).otherwise(current))
                 if drop_origin and isinstance(from_ref, str) and from_ref.strip() and from_ref in df.columns:
-                    df = df.drop(from_ref)
+                    drop_origin_col = from_ref
+            return F.when(cond_expr, new_val).otherwise(current), drop_origin_col
 
-        elif fill_type == "add_array_item":
+        if fill_type == "add_array_item":
             new_item = self._fill_build_array_item_expr(field_name, field_schema, spec)
             if new_item is None:
-                return df
+                return None, None
             empty_arr = F.array()
             try:
                 current_dtype = df.schema[field_name].dataType
@@ -2420,13 +2518,11 @@ class PortadaCleaning(DeltaDataLayer):
             except Exception:
                 pass
             mode = spec.get("mode", "append")
-            new_items = F.array(new_item)
-            new_array = self._fill_apply_array_mode(current, new_items, mode, empty_arr)
-            df = df.withColumn(field_name, F.when(cond_expr, new_array).otherwise(current))
+            new_array = self._fill_apply_array_mode(current, F.array(new_item), mode, empty_arr)
+            return F.when(cond_expr, new_array).otherwise(current), None
 
-        elif fill_type in ("add_array_from_array", "add_all_items"):
+        if fill_type in ("add_array_from_array", "add_all_items"):
             from_expr = self._fill_resolve_from(from_ref)
-            # Use spec.get("to") so absent to means full item copy (not field_name default).
             new_items = self._fill_project_struct_array_items(
                 from_expr, field_schema, spec.get("to")
             )
@@ -2440,15 +2536,15 @@ class PortadaCleaning(DeltaDataLayer):
                 pass
             mode = spec.get("mode", "replace_null")
             new_array = self._fill_apply_array_mode(current, new_items, mode, empty_arr)
-            df = df.withColumn(field_name, F.when(cond_expr, new_array).otherwise(current))
+            return F.when(cond_expr, new_array).otherwise(current), None
 
-        elif fill_type == "add_array_from_list":
+        if fill_type == "add_array_from_list":
             list_col = self._fill_resolve_from(from_ref)
             new_items = self._fill_build_items_from_scalar_list(
                 field_schema, list_col, spec.get("to")
             )
             if new_items is None:
-                return df
+                return None, None
             try:
                 current_dtype = df.schema[field_name].dataType
                 if isinstance(current_dtype, ArrayType):
@@ -2460,8 +2556,18 @@ class PortadaCleaning(DeltaDataLayer):
                 empty_arr = F.array()
             mode = spec.get("mode", "append")
             new_array = self._fill_apply_array_mode(current, new_items, mode, empty_arr)
-            df = df.withColumn(field_name, F.when(cond_expr, new_array).otherwise(current))
+            return F.when(cond_expr, new_array).otherwise(current), None
 
+        return None, None
+
+    def _fill_apply_one(self, df: TracedDataFrame, field_name: str, field_schema: dict, spec: dict) -> TracedDataFrame:
+        """Apply a single fill_with spec (replace, replace_if_not_exist, add_array_item, add_array_from_array, add_array_from_list)."""
+        new_val, drop_origin_col = self._fill_new_value_expr(df, field_name, field_schema, spec)
+        if new_val is None:
+            return df
+        df = self._with_columns(df, {field_name: new_val})
+        if drop_origin_col and drop_origin_col in df.columns:
+            df = df.drop(drop_origin_col)
         return df
 
     def _fill_build_items_from_scalar_list(
@@ -2769,6 +2875,8 @@ class BoatFactCleaning(PortadaCleaning, BoatFactCitationExtractor, BoatFactVoice
         # Only fields that flatten_string_characters can actually change (skips not_cleanable).
         string_fields = []
         df = ship_entries_df
+        before_updates = {}
+        before_tmps = []
         for field_name, field_schema in properties.items():
             if field_name not in df.columns:
                 continue
@@ -2785,23 +2893,27 @@ class BoatFactCleaning(PortadaCleaning, BoatFactCitationExtractor, BoatFactVoice
                 operation="normalize_string",
                 description="normalize strings to lowercase, remove accents and special characters",
             ))
-            df = df.withColumn(f"__before_norm_{field_name}", F.col(field_name).cast("string"))
+            before_tmp = f"__before_norm_{field_name}"
+            before_tmps.append(before_tmp)
+            before_updates[before_tmp] = F.col(field_name).cast("string")
+        df = self._with_columns(df, before_updates)
         df = self.flatten_string_characters(df)
+        history_updates = []
         for field_name in string_fields:
             before = F.col(f"__before_norm_{field_name}")
             after = F.col(field_name).cast("string")
             # Record history only when normalization changes the value.
-            changed = before.isNotNull() & (before != after)
-            df = self._append_history_process(
-                df,
-                field_name,
-                "normalized",
-                after,
-                F.array(F.lit("normalize_string")),
-                changed,
-                merge_operations=False,
-            )
-            df = df.drop(f"__before_norm_{field_name}")
+            history_updates.append({
+                "field": field_name,
+                "process": "normalized",
+                "obtained_value_col": after,
+                "operations_col": F.array(F.lit("normalize_string")),
+                "row_condition": before.isNotNull() & (before != after),
+                "merge_operations": False,
+            })
+        df = self._append_history_batch(df, history_updates)
+        if before_tmps:
+            df = df.drop(*before_tmps)
         return df
 
     def normalize_strings_for_reviewed_ship_entries(self, ship_entries_df: TracedDataFrame) -> TracedDataFrame:

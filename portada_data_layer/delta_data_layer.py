@@ -841,11 +841,6 @@ class DeltaDataLayer(BaseDeltaDataLayer):
 
         return TracedDataFrame(original_df, table_name=tn, df_name=target_path, df_version=-1)
 
-    @staticmethod
-    def _truncate_spark_lineage(df: DataFrame) -> DataFrame:
-        """Truncate deep Spark logical plans that can StackOverflow on Delta merge."""
-        return df.localCheckpoint(eager=True)
-
     def write_delta(self, *table_path, df: DataFrame | TracedDataFrame, mode: str = "overwrite",
                     partition_by:list = None, key_id_name: str = "entry_id") -> DataFrame | TracedDataFrame:
         """
@@ -873,14 +868,6 @@ class DeltaDataLayer(BaseDeltaDataLayer):
             source_version = df.df_version
             df_name = df.name
             df_large_name = df.large_name
-            traced_meta = dict(
-                save_lineage_on_store=df.save_lineage_on_store,
-                name=df._name,
-                large_name=df._large_name,
-                transformations=df.transformations,
-                transformer_name=df._transformer_name,
-                transformer_description=df._transformer_description,
-            )
             original_df = df.toSparkDataFrame()
         else:
             tn = self._flatten_table_name(*table_path)
@@ -889,18 +876,7 @@ class DeltaDataLayer(BaseDeltaDataLayer):
             original_df = df
             df_name = "UNKNOWN"
             df_large_name = "UNKNOWN"
-            traced_meta = {}
-
-        # Truncate deep withColumn lineages (history/cleaning) that cause
-        # StackOverflowError during Delta merge plan analysis.
-        original_df = self._truncate_spark_lineage(original_df)
-        df = TracedDataFrame(
-            original_df,
-            table_name=tn,
-            df_name=source_path,
-            df_version=source_version,
-            **traced_meta,
-        )
+            df = TracedDataFrame(df, table_name=tn, df_name=source_path, df_version=source_version)
 
         is_new = False
         path = self._resolve_path(*table_path)
@@ -912,7 +888,7 @@ class DeltaDataLayer(BaseDeltaDataLayer):
             else:
                 delta_table = self.get_delta_table(*table_path)
                 delta_table.alias("current").merge(
-                    source=original_df.alias("new"),
+                    source=df.toSparkDataFrame().alias("new"),
                     condition=f"current.{key_id_name}=new.{key_id_name}"
                 ).whenMatchedUpdateAll().whenNotMatchedInsertAll().execute()
                 version = delta_table.history(1).collect()[0]['version']
